@@ -1,5 +1,4 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-#![allow(dead_code)]
 
 mod aa;
 mod cache;
@@ -12,12 +11,12 @@ mod ui;
 mod update;
 
 #[used]
-static VERSION_TAG: &str = concat!("AITIERLIST_VERSION=", env!("CARGO_PKG_VERSION"));
+static VERSION_TAG: &str = concat!("AITIERLIST_VERSION=", env!("CARGO_PKG_VERSION"), "\0");
 
 fn main() -> eframe::Result<()> {
     if std::env::args().any(|argument| argument == "--dump-table") {
         let outcome = (|| -> anyhow::Result<()> {
-            let mut settings = settings::Settings::default();
+            let mut settings = settings::load_settings();
             let mut cache_path = None;
             for argument in std::env::args().skip(1) {
                 if let Some((key, value)) = argument.split_once('=') {
@@ -60,7 +59,7 @@ fn main() -> eframe::Result<()> {
                 rows.sort_by_key(|row| row.display_name().to_lowercase());
                 for row in rows {
                     println!(
-                        "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                        "{}|{}|{}|{}|{}|{}|{}|{}",
                         row.harness,
                         row.model,
                         row.effort.as_deref().unwrap_or(""),
@@ -68,8 +67,7 @@ fn main() -> eframe::Result<()> {
                         row.wait_seconds,
                         row.attempt_usd,
                         row.qna.map(|value| value.to_string()).unwrap_or_default(),
-                        row.vendor,
-                        row.estimated
+                        row.vendor
                     );
                 }
                 return Ok(());
@@ -85,6 +83,10 @@ fn main() -> eframe::Result<()> {
     }
 
     std::hint::black_box(VERSION_TAG);
+    std::hint::black_box(update::COMMIT_TAG);
+    std::hint::black_box(update::TREE_TAG);
+
+    update::cleanup_previous_update();
 
     let viewport = eframe::egui::ViewportBuilder::default()
         .with_title("aitierlist")

@@ -16,7 +16,7 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, HANDLE,
+    ERROR_ALREADY_EXISTS, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, HANDLE,
 };
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
@@ -30,9 +30,9 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 #[cfg(windows)]
 use windows_sys::Wdk::Storage::FileSystem::{
-    FILE_INFORMATION_CLASS, FILE_RENAME_INFORMATION, FILE_RENAME_POSIX_SEMANTICS,
-    FILE_RENAME_REPLACE_IF_EXISTS, FileRenameInformation, FileRenameInformationEx,
-    NtSetInformationFile,
+    FILE_INFORMATION_CLASS, FILE_LINK_INFORMATION, FILE_RENAME_INFORMATION,
+    FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS, FileLinkInformation,
+    FileRenameInformation, FileRenameInformationEx, NtSetInformationFile,
 };
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{
@@ -41,11 +41,6 @@ use windows_sys::Win32::Foundation::{
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
-
-pub fn is_indirect(path: &Path) -> std::io::Result<bool> {
-    use std::os::windows::fs::MetadataExt;
-    Ok(std::fs::symlink_metadata(path)?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FileIdentity {
@@ -70,53 +65,6 @@ impl FileIdentity {
             volume,
             id: u128::from_str_radix(id_hex, 16).ok()?,
         })
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct SourceFingerprint {
-    identity: FileIdentity,
-    size: u64,
-    written_at_nanos: u128,
-}
-
-impl SourceFingerprint {
-    pub fn identity(&self) -> FileIdentity {
-        self.identity
-    }
-
-    pub fn size(&self) -> u64 {
-        self.size
-    }
-}
-
-#[derive(Debug)]
-pub struct SourceLease {
-    file: File,
-    path: PathBuf,
-    resolved: PathBuf,
-    fingerprint: SourceFingerprint,
-}
-
-impl SourceLease {
-    pub fn fingerprint(&self) -> SourceFingerprint {
-        self.fingerprint
-    }
-
-    pub fn identity(&self) -> FileIdentity {
-        self.fingerprint.identity
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    pub fn resolved_path(&self) -> &Path {
-        &self.resolved
-    }
-
-    pub fn file(&self) -> &File {
-        &self.file
     }
 }
 
@@ -164,10 +112,6 @@ pub struct DirectoryLease {
 }
 
 impl DirectoryLease {
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     pub fn resolved_path(&self) -> &Path {
         &self.resolved
     }
@@ -274,22 +218,7 @@ pub fn identity_of(file: &File) -> Result<FileIdentity> {
     })
 }
 
-fn fingerprint_of(file: &File) -> Result<SourceFingerprint> {
-    let metadata = file.metadata().context("reading source file metadata")?;
-    let written_at_nanos = metadata
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
-    Ok(SourceFingerprint {
-        identity: identity_of(file)?,
-        size: metadata.len(),
-        written_at_nanos,
-    })
-}
-
-fn open_no_follow(path: &Path, share_mode: u32) -> std::io::Result<File> {
+pub fn open_no_follow(path: &Path, share_mode: u32) -> std::io::Result<File> {
     open_no_follow_access(
         path,
         FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
@@ -306,27 +235,6 @@ fn open_no_follow_access(path: &Path, access: u32, share_mode: u32) -> std::io::
         .open(path)
 }
 
-const SHARE_READERS_ONLY: u32 = FILE_SHARE_READ;
-
-pub fn open_source(path: &Path) -> Result<SourceLease> {
-    let file = open_no_follow(path, SHARE_READERS_ONLY)
-        .with_context(|| format!("opening the source file {}", path.display()))?;
-    reject_indirection(&file, path)?;
-    let fingerprint = fingerprint_of(&file)?;
-    let resolved = resolved_path_of(&file).with_context(|| {
-        format!(
-            "resolving {} to a name a child process can open without walking the path again",
-            path.display()
-        )
-    })?;
-    Ok(SourceLease {
-        file,
-        path: path.to_path_buf(),
-        resolved,
-        fingerprint,
-    })
-}
-
 fn reject_indirection(file: &File, path: &Path) -> Result<()> {
     let information = handle_information(file)?;
     if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
@@ -336,24 +244,6 @@ fn reject_indirection(file: &File, path: &Path) -> Result<()> {
         bail!("{} is a directory, not a file", path.display());
     }
     Ok(())
-}
-
-pub fn probe_source(path: &Path) -> Result<SourceFingerprint> {
-    Ok(open_source(path)?.fingerprint())
-}
-
-pub fn reacquire_source(path: &Path, expected: Option<SourceFingerprint>) -> Result<SourceLease> {
-    let lease = open_source(path)?;
-    if let Some(expected) = expected
-        && lease.fingerprint != expected
-    {
-        bail!(
-            "{} is no longer the file that was inspected - it was replaced, \
-             overwritten or moved since it was added; remove it and add it again",
-            path.display()
-        );
-    }
-    Ok(lease)
 }
 
 pub fn open_pinned(path: &Path) -> Result<File> {
@@ -378,8 +268,49 @@ pub fn open_launch_image(path: &Path) -> Result<File> {
     Ok(file)
 }
 
-pub fn rename_pinned(file: &File, directory: &DirectoryLease, leaf: &OsStr) -> Result<()> {
-    rename_relative(file, directory.file(), leaf).map_err(Into::into)
+pub fn rename_pinned_replace(file: &File, directory: &DirectoryLease, leaf: &OsStr) -> Result<()> {
+    rename_relative_with(file, directory.file(), leaf, RenameMode::Replace).map_err(Into::into)
+}
+
+pub fn link_pinned(source: &File, directory: &DirectoryLease, leaf: &OsStr) -> Result<()> {
+    let name: Vec<u16> = leaf.encode_wide().collect();
+    if name.is_empty() || name.contains(&0) {
+        bail!("a hard link name must be nonempty and contain no embedded NUL");
+    }
+    let name_bytes = name
+        .len()
+        .checked_mul(2)
+        .context("hard link name is too long")?;
+    let total = size_of::<FILE_LINK_INFORMATION>().max(
+        offset_of!(FILE_LINK_INFORMATION, FileName)
+            .checked_add(name_bytes)
+            .context("hard link name is too long")?,
+    );
+    let length = u32::try_from(total).context("hard link name is too long")?;
+    let name_length = u32::try_from(name_bytes).context("hard link name is too long")?;
+    let mut storage = vec![0_u64; total.div_ceil(size_of::<u64>())];
+    let information = storage.as_mut_ptr().cast::<FILE_LINK_INFORMATION>();
+    unsafe {
+        (*information).Anonymous.ReplaceIfExists = false;
+        (*information).RootDirectory = directory.file().as_raw_handle() as HANDLE;
+        (*information).FileNameLength = name_length;
+        let destination = (&raw mut (*information).FileName).cast::<u16>();
+        std::ptr::copy_nonoverlapping(name.as_ptr(), destination, name.len());
+    }
+    let mut iosb = IO_STATUS_BLOCK::default();
+    let status = unsafe {
+        NtSetInformationFile(
+            source.as_raw_handle() as HANDLE,
+            &raw mut iosb,
+            storage.as_ptr().cast(),
+            length,
+            FileLinkInformation,
+        )
+    };
+    if status < 0 {
+        return Err(error_from_status(status)).context("linking the pinned file");
+    }
+    Ok(())
 }
 
 pub fn existing_identity(path: &Path) -> Result<Option<FileIdentity>> {
@@ -389,27 +320,6 @@ pub fn existing_identity(path: &Path) -> Result<Option<FileIdentity>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("inspecting {}", path.display())),
     }
-}
-
-pub fn identity_pair(path: &Path) -> Option<(u64, u128)> {
-    existing_identity(path)
-        .ok()
-        .flatten()
-        .map(|identity| (identity.volume, identity.id))
-}
-
-pub fn output_blocker(output: &Path, source: Option<FileIdentity>) -> Option<String> {
-    let existing = existing_identity(output).ok().flatten()?;
-    if Some(existing) == source {
-        return Some(format!(
-            "the output path \"{}\" is the source file itself - encoding it would destroy the input; choose another name",
-            output.display()
-        ));
-    }
-    Some(format!(
-        "\"{}\" already exists - AITIERLIST never overwrites an existing file; choose another name",
-        output.display()
-    ))
 }
 
 fn open_directory(path: &Path) -> Result<File> {
@@ -446,165 +356,25 @@ pub fn stage_leaf_name(destination: &Path) -> OsString {
     unique_leaf_name(".aitierlist-stage-", destination)
 }
 
-#[derive(Debug)]
-pub struct OutputTransaction {
-    parent: DirectoryLease,
-    stage_path: PathBuf,
-    stage: Option<File>,
-    final_path: PathBuf,
-    final_leaf: OsString,
-    committed: bool,
-    preserve_stage: bool,
-}
-
-impl OutputTransaction {
-    pub fn begin(final_path: &Path, forbidden: &[FileIdentity]) -> Result<Self> {
-        let directory = final_path.parent().filter(|p| !p.as_os_str().is_empty());
-        let directory = directory.unwrap_or_else(|| Path::new("."));
-        let final_leaf = final_path
-            .file_name()
-            .with_context(|| format!("{} has no file name", final_path.display()))?
-            .to_os_string();
-
-        let parent = lease_directory(directory)?;
-        let final_child = parent.resolved.join(&final_leaf);
-
-        if let Some(existing) = existing_identity(&final_child)? {
-            if forbidden.contains(&existing) {
-                bail!(
-                    "the output path {} is the source file itself; encoding it would destroy the input",
-                    final_path.display()
-                );
-            }
-            bail!(
-                "{} already exists; AITIERLIST never overwrites an existing file",
-                final_path.display()
-            );
-        }
-
-        for _ in 0..256 {
-            let stage_path = parent.resolved.join(stage_leaf_name(final_path));
-            match create_owned_stage(&stage_path) {
-                Ok(stage) => {
-                    let stage = identify_owned_stage(stage)?.0;
-                    return Ok(OutputTransaction {
-                        parent,
-                        stage_path,
-                        stage: Some(stage),
-                        final_path: final_path.to_path_buf(),
-                        final_leaf,
-                        committed: false,
-                        preserve_stage: false,
-                    });
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => {
-                    return Err(e).with_context(|| {
-                        format!("creating a staging file in {}", parent.path.display())
-                    });
-                }
-            }
-        }
-        bail!(
-            "could not reserve a staging file beside {}",
-            final_path.display()
-        )
-    }
-
-    pub fn stage_path(&self) -> &Path {
-        &self.stage_path
-    }
-
-    pub fn stage_len(&self) -> Result<u64> {
-        let stage = self.stage.as_ref().context("the staging file is closed")?;
-        Ok(stage
-            .metadata()
-            .context("measuring the staged output")?
-            .len())
-    }
-
-    pub fn sync(&self) -> Result<()> {
-        let stage = self.stage.as_ref().context("the staging file is closed")?;
-        stage.sync_all().context("syncing the staged output")
-    }
-
-    pub fn commit(mut self) -> Result<PathBuf> {
-        self.sync()?;
-        self.publish()?;
-        self.committed = true;
-        Ok(self.final_path.clone())
-    }
-
-    fn publish(&mut self) -> Result<()> {
-        let stage = self.stage.as_ref().context("the staging file is closed")?;
-        match rename_relative(stage, &self.parent.file, &self.final_leaf) {
-            Ok(()) => {}
-            Err(e) if is_collision(&e) => {
-                return Err(e).with_context(|| {
-                    format!(
-                        "{} appeared while the encode was running and was left untouched",
-                        self.final_path.display()
-                    )
-                });
-            }
-            Err(e) => {
-                self.preserve_stage = true;
-                return Err(e).context(PreservedStage {
-                    path: self.stage_path.clone(),
-                });
-            }
-        }
-        self.committed = true;
-        Ok(())
-    }
-
-    fn remove_owned_stage(&mut self) {
-        if let Some(stage) = self.stage.take() {
-            let _ = delete_by_handle(&stage);
-        }
-    }
-}
-
-impl Drop for OutputTransaction {
-    fn drop(&mut self) {
-        if self.committed || self.preserve_stage {
-            return;
-        }
-        self.remove_owned_stage();
-    }
-}
-
-#[derive(Debug)]
-pub struct PreservedStage {
-    pub path: PathBuf,
-}
-
-impl std::fmt::Display for PreservedStage {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "publishing the encode's output failed (the encoded file is still at {} and nothing at the destination was touched)",
-            self.path.display()
-        )
-    }
-}
-
-impl std::error::Error for PreservedStage {}
-
-fn is_collision(error: &std::io::Error) -> bool {
-    if error.kind() == std::io::ErrorKind::AlreadyExists {
-        return true;
-    }
-    matches!(
-        error.raw_os_error().map(|code| code as u32),
-        Some(ERROR_ALREADY_EXISTS) | Some(ERROR_FILE_EXISTS)
-    )
-}
-
 fn create_owned_stage(path: &Path) -> std::io::Result<File> {
     OpenOptions::new()
         .write(true)
         .create_new(true)
+        .access_mode(
+            DELETE
+                | SYNCHRONIZE
+                | FILE_READ_DATA
+                | FILE_WRITE_DATA
+                | FILE_READ_ATTRIBUTES
+                | FILE_WRITE_ATTRIBUTES,
+        )
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(path)
+}
+
+fn reopen_owned_stage(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .write(true)
         .access_mode(
             DELETE
                 | SYNCHRONIZE
@@ -905,6 +675,15 @@ impl OwnedStagingFile {
     }
 
     pub fn file(&mut self) -> Result<&mut File> {
+        if self.file.is_none() {
+            let file = reopen_owned_stage(&self.path)
+                .with_context(|| format!("reopening staging file {}", self.path.display()))?;
+            let identity = identity_of(&file)?;
+            if identity != self.identity {
+                bail!("staging file identity changed while handle was closed");
+            }
+            self.file = Some(file);
+        }
         self.file
             .as_mut()
             .context("the staging file handle is already closed")
@@ -931,6 +710,8 @@ impl Drop for OwnedStagingFile {
         }
         if let Some(file) = self.file.take() {
             let _ = delete_by_handle(&file);
+        } else {
+            let _ = remove_recorded_object(&self.path, self.identity);
         }
     }
 }
@@ -942,14 +723,6 @@ fn open_for_disposal(path: &Path) -> std::io::Result<File> {
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
-}
-
-#[cfg(windows)]
-pub fn open_for_rename(path: &Path) -> Result<File> {
-    let file =
-        open_for_move(path).with_context(|| format!("opening {} to rename it", path.display()))?;
-    reject_indirection(&file, path)?;
-    Ok(file)
 }
 
 #[cfg(windows)]

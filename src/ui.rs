@@ -25,7 +25,11 @@ pub struct App {
     selected_seat_tier: Option<(Seat, Tier)>,
     side_panel_open: bool,
     update_status: String,
+    handoff_status: String,
     update_rx: Option<Receiver<Result<crate::update::Checked, String>>>,
+    available_update: Option<crate::update::Available>,
+    staged_update: Option<crate::update::StagedUpdate>,
+    install_rx: Option<Receiver<(String, Option<crate::update::StagedUpdate>)>>,
 }
 
 impl App {
@@ -94,11 +98,26 @@ impl App {
             settings_open: false,
             selected_seat_tier: None,
             side_panel_open: false,
-            update_status: "Checking for updates…".to_string(),
+            update_status: String::new(),
+            handoff_status: crate::update::last_handoff_status()
+                .map(|status| {
+                    format!(
+                        "Update {}: {} — {}",
+                        status.version, status.outcome, status.detail
+                    )
+                })
+                .unwrap_or_default(),
             update_rx: None,
+            available_update: None,
+            staged_update: None,
+            install_rx: None,
         };
 
-        app.trigger_update_check();
+        if crate::update::due_for_check() {
+            app.trigger_update_check(cc.egui_ctx.clone());
+        } else if let Some(version) = crate::update::cached_published_version() {
+            app.update_status = format!("Last seen: {version}");
+        }
         app
     }
 
@@ -201,10 +220,6 @@ impl App {
 
                         ui.label("Read USD");
                         ui.label(format!("${:.3}", r.read_usd));
-                        ui.end_row();
-
-                        ui.label("Estimated");
-                        ui.label(if r.estimated { "Yes (~)" } else { "No" });
                         ui.end_row();
                     });
             }
@@ -316,14 +331,48 @@ impl App {
         }
     }
 
-    pub fn trigger_update_check(&mut self) {
+    fn trigger_update_check(&mut self, context: egui::Context) {
         let (tx, rx) = channel();
         self.update_rx = Some(rx);
-        self.update_status = "Checking for updates…".to_string();
+        if self.install_rx.is_none() {
+            self.update_status = "Checking for updates…".to_string();
+        }
         std::thread::spawn(move || {
             let outcome =
                 crate::update::check(env!("CARGO_PKG_VERSION")).map_err(|e| format!("{e:#}"));
             let _ = tx.send(outcome);
+            context.request_repaint();
+        });
+    }
+
+    fn start_install(&mut self, context: egui::Context) {
+        let staged = self.staged_update.take();
+        let available = self.available_update.clone();
+        let (tx, rx) = channel();
+        self.install_rx = Some(rx);
+        self.update_status = if staged.is_some() {
+            "Installing…"
+        } else {
+            "Downloading…"
+        }
+        .to_string();
+        self.handoff_status.clear();
+        std::thread::spawn(move || {
+            let downloaded = match staged {
+                Some(staged) => Ok(staged),
+                None => available
+                    .ok_or_else(|| anyhow::anyhow!("No update is available"))
+                    .and_then(|available| crate::update::download(&available, |_, _| {})),
+            };
+            let failure = match downloaded {
+                Ok(mut staged) => match crate::update::install(&mut staged) {
+                    Ok(never) => match never {},
+                    Err(error) => (format!("{error:#}"), Some(staged)),
+                },
+                Err(error) => (format!("{error:#}"), None),
+            };
+            let _ = tx.send(failure);
+            context.request_repaint();
         });
     }
 
@@ -368,22 +417,31 @@ impl App {
             && let Ok(res) = rx.try_recv()
         {
             self.update_rx = None;
-            match res {
+            let status = match res {
                 Ok(checked) => match checked.outcome {
                     crate::update::Outcome::Available(av) => {
-                        self.update_status = format!("Update {} available", av.version);
-                        crate::update::record_check(Some(&av.version));
+                        let status =
+                            format!("Update {} available via {}", av.version, checked.transport);
+                        self.available_update = Some(av);
+                        status
                     }
                     crate::update::Outcome::UpToDate { latest } => {
-                        self.update_status = format!("Up to date ({latest})");
-                        crate::update::record_check(Some(&latest));
+                        self.available_update = None;
+                        format!("Up to date ({latest}) via {}", checked.transport)
                     }
                 },
-                Err(e) => {
-                    self.update_status = format!("Update check: {e}");
-                    crate::update::record_check(None);
-                }
+                Err(error) => error,
+            };
+            if self.install_rx.is_none() {
+                self.update_status = status;
             }
+        }
+        if let Some(rx) = &self.install_rx
+            && let Ok((error, staged)) = rx.try_recv()
+        {
+            self.install_rx = None;
+            self.staged_update = staged;
+            self.update_status = error;
         }
     }
 }
@@ -392,6 +450,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.pump_channels();
         let ctx = ui.ctx().clone();
+        let mut install_clicked = false;
         if !self.refresh_in_flight
             && self.source_expired()
             && self
@@ -465,11 +524,6 @@ impl eframe::App for App {
                     }
                 }
                 ui.separator();
-                ui.label(format!("v{}", env!("CARGO_PKG_VERSION")));
-                if ui.button("Check for updates").clicked() {
-                    self.trigger_update_check();
-                }
-                ui.separator();
                 ui.hyperlink_to(
                     "Source: Artificial Analysis (artificialanalysis.ai)",
                     "https://artificialanalysis.ai",
@@ -479,11 +533,28 @@ impl eframe::App for App {
                     if ui.button("⚙").clicked() {
                         self.settings_open = !self.settings_open;
                     }
-                    if !self.update_status.is_empty() {
-                        ui.add(egui::Label::new(&self.update_status).truncate())
-                            .on_hover_text(&self.update_status);
-                    }
                 });
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("v{}", env!("CARGO_PKG_VERSION")));
+                if ui.button("Check for updates").clicked() {
+                    self.handoff_status.clear();
+                    self.trigger_update_check(ctx.clone());
+                }
+                if self.staged_update.is_some() || self.available_update.is_some() {
+                    let label = if self.staged_update.is_some() {
+                        "Retry install"
+                    } else {
+                        "Install"
+                    };
+                    install_clicked = ui
+                        .add_enabled(self.install_rx.is_none(), egui::Button::new(label))
+                        .clicked();
+                }
+                if !self.handoff_status.is_empty() {
+                    ui.label(&self.handoff_status);
+                }
+                ui.label(&self.update_status);
             });
         });
 
@@ -761,7 +832,10 @@ impl eframe::App for App {
                             })
                             .min_by(|left, right| left.1.total_cmp(&right.1))
                         {
-                            let agent = self.table.rows[enough.2.row_index].display_name();
+                            let Some(row) = self.table.rows.get(enough.2.row_index) else {
+                                continue;
+                            };
+                            let agent = row.display_name();
                             ui.label(if enough.0 == best.0 {
                                 format!(
                                     "{}: {} - {} at {:.1}/wk",
@@ -998,13 +1072,16 @@ impl eframe::App for App {
 
                     ui.separator();
                     ui.heading("Per-Vendor Allowance Overrides (USD/wk)");
-                    ui.label("Leave blank for model default estimation");
+                    ui.label("Leave blank for the default plan allowance");
                     egui::ScrollArea::vertical()
                         .max_height(200.0)
                         .show(ui, |ui| {
                             for (vendor, val) in self.settings.vendor_overrides.iter_mut() {
                                 ui.horizontal(|ui| {
                                     ui.label(format!("{vendor}:"));
+                                    if crate::engine::plan_for(vendor, f64::INFINITY).is_none() {
+                                        ui.label("API only unless overridden");
+                                    }
                                     let mut text = val.map(|v| v.to_string()).unwrap_or_default();
                                     if ui.text_edit_singleline(&mut text).changed() {
                                         let trimmed = text.trim();
@@ -1026,6 +1103,9 @@ impl eframe::App for App {
                     }
                 });
             self.settings_open = open;
+        }
+        if install_clicked {
+            self.start_install(ctx);
         }
     }
 }

@@ -45,7 +45,7 @@ impl Tier {
 
     pub fn name(self) -> &'static str {
         match self {
-            Tier::Api => "API",
+            Tier::Api => "API (spend unbounded)",
             Tier::T200 => "$200",
             Tier::T100 => "$100",
             Tier::T20 => "$20",
@@ -90,40 +90,20 @@ pub struct Row {
     pub read_seconds: f64,
     pub attempt_usd: f64,
     pub read_usd: f64,
-    pub estimated: bool,
     pub model_key: String,
     pub family: String,
     #[serde(rename = "name")]
     pub display_name: String,
-    pub raw_name: String,
     pub pass: f64,
     pub term: Option<f64>,
     pub gpqa: Option<f64>,
-    pub hle: Option<f64>,
-    pub intelligence_index: Option<f64>,
-    pub orch_quality: Option<f64>,
     pub band: std::collections::BTreeMap<String, Option<f64>>,
-    pub benches: Vec<Benchmark>,
     pub wait_seconds_band: f64,
     pub read_seconds_band: f64,
     pub attempt_usd_band: f64,
     pub read_usd_band: f64,
-    pub time_extrapolation_rel: f64,
-    pub cost_extrapolation_rel: f64,
     pub usd_per_step: Option<f64>,
-    pub extrapolation_band: Option<std::collections::BTreeMap<String, f64>>,
     pub speed: Option<f64>,
-    pub rankable: bool,
-    pub source_mean: serde_json::Value,
-    pub source_evaluations: serde_json::Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Benchmark {
-    pub benchmark: String,
-    pub tasks: f64,
-    pub attempts: f64,
-    pub pass: f64,
 }
 
 impl Row {
@@ -139,6 +119,7 @@ impl Row {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CandidatePick {
     pub row_index: usize,
     pub win_rate: f64,
@@ -153,6 +134,7 @@ pub struct CandidatePick {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Pick {
     pub row_index: usize,
     pub win_rate: f64,
@@ -168,6 +150,7 @@ pub struct Pick {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SeatTierPick {
     pub seat: Seat,
     pub tier: Tier,
@@ -175,6 +158,7 @@ pub struct SeatTierPick {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Table {
     pub picks: Vec<SeatTierPick>,
     pub rows: Vec<Row>,

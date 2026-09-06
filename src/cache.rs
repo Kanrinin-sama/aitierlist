@@ -2,6 +2,7 @@ use crate::types::CacheState;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::path::PathBuf;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const BAKED_SNAPSHOT: &[u8] = include_bytes!("../assets/aa-snapshot.json");
 
@@ -11,13 +12,16 @@ pub fn disk_cache_path() -> Result<PathBuf> {
     Ok(dir.join("aa-cache.json"))
 }
 
+pub fn baked_payloads() -> Result<Value> {
+    serde_json::from_slice(BAKED_SNAPSHOT).context("parsing baked aa-snapshot.json")
+}
+
 pub fn load_payloads() -> Result<(Value, CacheState)> {
-    let baked_val: Value =
-        serde_json::from_slice(BAKED_SNAPSHOT).context("parsing baked aa-snapshot.json")?;
+    let baked_val = baked_payloads()?;
     let baked_time = baked_val
         .get("fetchedAt")
         .and_then(Value::as_str)
-        .unwrap_or("");
+        .and_then(|stamp| OffsetDateTime::parse(stamp, &Rfc3339).ok());
 
     if let Ok(disk_path) = disk_cache_path()
         && let Ok(bytes) = std::fs::read(&disk_path)
@@ -29,8 +33,8 @@ pub fn load_payloads() -> Result<(Value, CacheState)> {
         let disk_time = disk_val
             .get("fetchedAt")
             .and_then(Value::as_str)
-            .unwrap_or("");
-        if disk_time >= baked_time && !disk_time.is_empty() {
+            .and_then(|stamp| OffsetDateTime::parse(stamp, &Rfc3339).ok());
+        if disk_time.is_some_and(|disk| baked_time.is_none_or(|baked| disk >= baked)) {
             return Ok((disk_val, CacheState::Disk));
         }
     }
@@ -60,6 +64,6 @@ pub fn fetch_live() -> Result<(Value, CacheState)> {
     if rows.is_empty() {
         anyhow::bail!("live payload produced zero rows");
     }
-    save(&payloads)?;
+    let _ = save(&payloads);
     Ok((payloads, CacheState::Live))
 }

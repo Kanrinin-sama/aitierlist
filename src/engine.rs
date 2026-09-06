@@ -2,7 +2,6 @@ use crate::settings::Settings;
 use crate::types::{CacheState, CandidatePick, Pick, Row, Seat, SeatTierPick, Table, Tier};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-const K_MAX: u32 = 8;
 const VENDORS: [&str; 14] = [
     "openai",
     "anthropic",
@@ -21,14 +20,13 @@ const VENDORS: [&str; 14] = [
 ];
 
 #[derive(Clone, Copy)]
-enum Allowance {
+pub enum Allowance {
     Usd(f64, f64),
-    Estimate(f64),
     Calls(f64),
 }
 
-fn plan_for(vendor: &str, budget: f64) -> Option<Allowance> {
-    use Allowance::{Calls, Estimate, Usd};
+pub fn plan_for(vendor: &str, budget: f64) -> Option<Allowance> {
+    use Allowance::{Calls, Usd};
     let plans: &[(f64, Allowance)] = match vendor {
         "openai" => &[
             (200.0, Usd(1538.0, 2272.0)),
@@ -41,18 +39,18 @@ fn plan_for(vendor: &str, budget: f64) -> Option<Allowance> {
             (20.0, Usd(100.0, 130.0)),
         ],
         "google" => &[
-            (199.99, Estimate(19.99 * 20.0)),
-            (99.99, Estimate(19.99 * 5.0)),
-            (19.99, Estimate(19.99)),
+            (199.99, Usd(19.99 * 20.0, 19.99 * 20.0)),
+            (99.99, Usd(19.99 * 5.0, 19.99 * 5.0)),
+            (19.99, Usd(19.99, 19.99)),
         ],
         "muse" => &[
-            (50.0, Estimate(5.0 * 10.0)),
-            (15.0, Estimate(5.0 * 3.0)),
-            (5.0, Estimate(5.0)),
+            (50.0, Usd(50.0, 50.0)),
+            (15.0, Usd(15.0, 15.0)),
+            (5.0, Usd(5.0, 5.0)),
         ],
         "xai" => &[
-            (300.0, Estimate(300.0)),
-            (100.0, Estimate(100.0)),
+            (300.0, Usd(300.0, 300.0)),
+            (100.0, Usd(100.0, 100.0)),
             (30.0, Usd(19.0, 115.0)),
         ],
         "cursor" => &[
@@ -71,19 +69,19 @@ fn plan_for(vendor: &str, budget: f64) -> Option<Allowance> {
             (39.0, Usd(33.0, 33.0)),
             (19.0, Usd(6.7, 6.7)),
         ],
-        "alibaba" => &[(50.0, Calls(90000.0 * 12.0 / 52.0))],
+        "alibaba" => &[(50.0, Calls(90000.0))],
         "zai" => &[
             (168.0, Usd(428.0, 568.0)),
             (80.0, Usd(184.0, 243.0)),
             (18.0, Usd(31.0, 41.0)),
         ],
         "minimax" => &[
-            (132.0, Estimate(132.0)),
-            (55.0, Estimate(55.0)),
-            (22.0, Estimate(22.0)),
+            (132.0, Usd(132.0, 132.0)),
+            (55.0, Usd(55.0, 55.0)),
+            (22.0, Usd(22.0, 22.0)),
         ],
-        "opencode" => &[(10.0, Usd(60.0 * 12.0 / 52.0, 60.0 * 12.0 / 52.0))],
-        "cognition" => &[(200.0, Estimate(200.0)), (20.0, Estimate(20.0))],
+        "opencode" => &[(10.0, Usd(60.0, 60.0))],
+        "cognition" => &[(200.0, Usd(200.0, 200.0)), (20.0, Usd(20.0, 20.0))],
         _ => &[],
     };
     plans
@@ -156,7 +154,7 @@ fn quality(row: &Row, seat: Seat) -> Option<(f64, f64)> {
         Seat::Implementer => pass,
         Seat::Debugger => average(pass, logic),
         Seat::Reviewer => average(qna, logic),
-        Seat::Orchestrator => average(row.smart.zip(band("index")), logic),
+        Seat::Orchestrator => average(row.smart.zip(band("index")), row.gpqa.zip(band("gpqa"))),
         Seat::Sanity => qna,
         Seat::Comprehension => average(row.lcr.zip(band("lcr")), qna),
     }
@@ -169,7 +167,7 @@ fn basis(row: &Row, seat: Seat) -> (f64, f64, f64, f64) {
             row.wait_seconds,
             row.wait_seconds_band,
             row.attempt_usd,
-            row.cost_extrapolation_rel * row.attempt_usd,
+            row.attempt_usd_band,
         )
     } else {
         (
@@ -184,8 +182,6 @@ fn basis(row: &Row, seat: Seat) -> (f64, f64, f64, f64) {
 pub struct Cycle {
     pub wall: f64,
     pub spend: f64,
-    pub verified: f64,
-    pub unfinished: f64,
 }
 
 pub fn cycle(
@@ -201,7 +197,7 @@ pub fn cycle(
     let mut reached = 1.0;
     let mut attempts = 0.0;
     let mut escaped = 0.0;
-    for attempt in 1..=K_MAX {
+    for attempt in 1..=64 {
         attempts += reached;
         let failed = reached * (1.0 - quality / (1.0 + f64::from(attempt - 1) * rho_ratio));
         escaped += failed * hallucination;
@@ -214,8 +210,6 @@ pub fn cycle(
     Cycle {
         wall: attempts * f64::from(seconds) + unfinished * escalation,
         spend: attempts * cost + unfinished * settings.escalation_usd,
-        verified: 1.0,
-        unfinished,
     }
 }
 
@@ -250,25 +244,25 @@ fn simulate_pick(rows: &[Row], seat: Seat, tier: Tier, settings: &Settings) -> O
                 .flatten();
             let (seconds, seconds_band, cost, cost_band) = basis(row, seat);
             let (mean, deviation) = quality(row, seat)?;
-            (!row.estimated
-                && row.harness != "model"
+            (row.harness != "model"
                 && (tier == Tier::Api
                     || plan_eligible(row, plan)
                     || (plan.is_none() && override_amount.is_some()))
                 && seconds.is_finite()
                 && seconds > 0.0
-                && cost.is_finite())
-            .then_some((
-                index,
-                vendor,
-                override_amount,
-                mean,
-                deviation,
-                seconds,
-                seconds_band,
-                cost,
-                cost_band,
-            ))
+                && cost.is_finite()
+                && cost > 0.0)
+                .then_some((
+                    index,
+                    vendor,
+                    override_amount,
+                    mean,
+                    deviation,
+                    seconds,
+                    seconds_band,
+                    cost,
+                    cost_band,
+                ))
         })
         .collect();
     if candidates.is_empty() {
@@ -278,11 +272,15 @@ fn simulate_pick(rows: &[Row], seat: Seat, tier: Tier, settings: &Settings) -> O
     let mut random = Mulberry32(0x5eed);
     let draws = settings.draws.max(1);
     for _ in 0..draws {
-        let allowance = plans.map(|plan| match plan {
-            Some(Allowance::Usd(low, high)) if low != high => low + random.random() * (high - low),
-            Some(Allowance::Usd(amount, _)) | Some(Allowance::Calls(amount)) => amount,
-            Some(Allowance::Estimate(base)) => base * (1.14 + 0.72 * random.normal()).exp(),
-            None => 0.0,
+        let allowance = plans.map(|plan| {
+            (match plan {
+                Some(Allowance::Usd(low, high)) if low != high => {
+                    low + random.random() * (high - low)
+                }
+                Some(Allowance::Usd(amount, _)) | Some(Allowance::Calls(amount)) => amount,
+                None => 0.0,
+            }) * 12.0
+                / 52.0
         });
         let mut winner = 0;
         let mut best_tasks = f64::NEG_INFINITY;
@@ -308,11 +306,11 @@ fn simulate_pick(rows: &[Row], seat: Seat, tier: Tier, settings: &Settings) -> O
                 .sample(seconds, seconds_band, |value| value > 0.0)
                 .round()
                 .max(1.0) as u32;
-            let sampled_cost = random.sample(cost, cost_band, |value| value >= 0.0);
+            let sampled_cost = random.sample(cost, cost_band, |value| value > 0.0);
             let hallucination = if seat == Seat::Implementer {
                 0.0
             } else {
-                row.halluc.unwrap_or(1.0)
+                row.halluc.unwrap_or(0.0)
             };
             let result = cycle(
                 sampled_quality,
@@ -333,7 +331,7 @@ fn simulate_pick(rows: &[Row], seat: Seat, tier: Tier, settings: &Settings) -> O
                     })
                     .unwrap_or(0.0)
             });
-            let quota = if tier == Tier::Api || result.spend == 0.0 {
+            let quota = if tier == Tier::Api {
                 f64::INFINITY
             } else {
                 amount / result.spend
@@ -384,7 +382,16 @@ fn simulate_pick(rows: &[Row], seat: Seat, tier: Tier, settings: &Settings) -> O
             }
         })
         .collect();
-    top.sort_by(|left, right| right.tasks_per_week.total_cmp(&left.tasks_per_week));
+    top.sort_by(|left, right| {
+        if tier == Tier::Api {
+            right.tasks_per_week.total_cmp(&left.tasks_per_week)
+        } else {
+            right
+                .win_rate
+                .total_cmp(&left.win_rate)
+                .then_with(|| right.tasks_per_week.total_cmp(&left.tasks_per_week))
+        }
+    });
     let first = &top[0];
     Some(Pick {
         row_index: first.row_index,

@@ -55,7 +55,8 @@ param(
     [string] $RemoteHost = 'kanrinin',
     [string] $WebRoot = '/opt/homebrew/var/www/files/aitierlist',
     [switch] $Force,
-    [switch] $WhatIf
+    [switch] $WhatIf,
+    [switch] $AllowUnbound
 )
 
 $ErrorActionPreference = 'Stop'
@@ -270,7 +271,8 @@ function Assert-HeadBinding {
         [Parameter(Mandatory)][AllowEmptyString()][string] $Image,
         [Parameter(Mandatory)][string] $Commit,
         [Parameter(Mandatory)][string] $Tree,
-        [string] $Path = 'the release binary'
+        [string] $Path = 'the release binary',
+        [switch] $AllowUnbound
     )
 
     Assert-GitObjectId -Value $Commit -What 'HEAD commit' | Out-Null
@@ -285,11 +287,18 @@ function Assert-HeadBinding {
         $what = if ($trees.Count -eq 0) { 'no tree stamp found' } else { "found $($trees -join ', ')" }
         throw "$Path does not carry exactly one tree stamp ($what). Rebuild from a tree that embeds AITIERLIST_TREE."
     }
-    if ($commits[0] -cne $Commit) {
-        throw "$Path was not built from HEAD $Commit (it is $($commits[0])). Rebuild from the current tree."
-    }
-    if ($trees[0] -cne $Tree) {
-        throw "$Path was not built from tree $Tree (it is $($trees[0])). Rebuild from the current tree."
+    $allZeros = '0' * 40
+    if ($commits[0] -ceq $allZeros -and $trees[0] -ceq $allZeros) {
+        if (-not $AllowUnbound) {
+            throw "$Path carries unbound (all-zero) commit and tree stamps. Pass -AllowUnbound to allow publishing unbound binaries."
+        }
+    } else {
+        if ($commits[0] -cne $Commit) {
+            throw "$Path was not built from HEAD $Commit (it is $($commits[0])). Rebuild from the current tree."
+        }
+        if ($trees[0] -cne $Tree) {
+            throw "$Path was not built from tree $Tree (it is $($trees[0])). Rebuild from the current tree."
+        }
     }
     return [pscustomobject]@{
         Commit = $commits[0]
@@ -2115,8 +2124,13 @@ try {
     $bytes = $reader.ReadToEnd()
     $reader.Dispose()
     Assert-VersionStamp -Image $bytes -Version $Version -Path $exe | Out-Null
-    $head = Get-HeadIdentity -Root $root
-    Assert-HeadBinding -Image $bytes -Commit $head.Commit -Tree $head.Tree -Path $exe | Out-Null
+    $head = if ($AllowUnbound) {
+        try { Get-HeadIdentity -Root $root }
+        catch { [pscustomobject]@{ Commit = ('0' * 40); Tree = ('0' * 40) } }
+    } else {
+        Get-HeadIdentity -Root $root
+    }
+    Assert-HeadBinding -Image $bytes -Commit $head.Commit -Tree $head.Tree -Path $exe -AllowUnbound:$AllowUnbound | Out-Null
     $bytes = $null
     Write-Host "  stamp    : $Version confirmed in binary" -ForegroundColor Green
     Write-Host "  built    : $($head.Commit) tree $($head.Tree)" -ForegroundColor Green

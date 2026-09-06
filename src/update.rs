@@ -8,6 +8,12 @@ pub const ALLOWED_HOST: &str = "files.blockitall.us";
 pub const ARTIFACT_PREFIX: &str = "/aitierlist/releases/";
 const MANIFEST_URL: &str = "https://files.blockitall.us/aitierlist/update.json";
 
+#[used]
+pub static COMMIT_TAG: &str = concat!("AITIERLIST_COMMIT=", env!("AITIERLIST_COMMIT"), "\0");
+
+#[used]
+pub static TREE_TAG: &str = concat!("AITIERLIST_TREE=", env!("AITIERLIST_TREE"), "\0");
+
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 pub const MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(20);
@@ -256,6 +262,18 @@ pub struct Checked {
 }
 
 pub fn check(current_version: &str) -> Result<Checked> {
+    let outcome = check_direct(current_version);
+    match &outcome {
+        Ok(checked) => match &checked.outcome {
+            Outcome::Available(av) => record_check(Some(&av.version)),
+            Outcome::UpToDate { latest } => record_check(Some(latest)),
+        },
+        Err(_) => record_check(None),
+    }
+    outcome
+}
+
+fn check_direct(current_version: &str) -> Result<Checked> {
     let budget = Budget::new(CHECK_BUDGET, "the update check");
     let (manifest_bytes, transport) =
         get_bounded(MANIFEST_URL, false, MAX_MANIFEST_BYTES, &budget)?;
@@ -416,7 +434,7 @@ fn stamp_path() -> Option<PathBuf> {
     data_dir().ok().map(|dir| dir.join("last-update-check"))
 }
 
-pub const CHECK_INTERVAL: Duration = Duration::from_secs(4 * 60 * 60);
+pub const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 pub fn due_for_check() -> bool {
     let Some(p) = stamp_path() else { return false };
@@ -456,14 +474,6 @@ pub struct StagedUpdate {
 }
 
 impl StagedUpdate {
-    pub fn version(&self) -> &str {
-        &self.version
-    }
-
-    pub fn size(&self) -> u64 {
-        self.size
-    }
-
     fn authenticate(&mut self) -> Result<()> {
         let identity = self.stage.identity();
         let file = self.stage.file()?;
@@ -577,6 +587,11 @@ pub fn hand_off(staged: &mut StagedUpdate, relaunch: bool) -> Result<()> {
         },
         relaunch,
     )
+}
+
+pub fn install(staged: &mut StagedUpdate) -> Result<std::convert::Infallible> {
+    hand_off(staged, true)?;
+    std::process::exit(0);
 }
 
 pub fn cleanup_previous_update() {

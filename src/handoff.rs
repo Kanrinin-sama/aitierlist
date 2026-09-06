@@ -25,8 +25,7 @@ pub fn state_dir() -> Result<PathBuf> {
 }
 
 pub struct UpdateLock {
-    #[allow(dead_code)]
-    file: File,
+    _file: File,
 }
 
 fn canonical_token(canonical: &Path) -> String {
@@ -66,7 +65,7 @@ impl UpdateLock {
             .context(
                 "another AITIERLIST process is already applying an update to this executable; wait for it to finish and try again",
             )?;
-        Ok(UpdateLock { file })
+        Ok(UpdateLock { _file: file })
     }
 }
 
@@ -80,8 +79,6 @@ pub struct ExpectedImage {
 
 #[derive(Debug, Clone)]
 pub struct ImageFacts {
-    pub size: u64,
-    pub sha256: String,
     pub identity: FileIdentity,
 }
 
@@ -248,11 +245,7 @@ pub fn authenticate_image(file: &mut File, expect: &ExpectedImage) -> Result<Ima
         ),
     }
 
-    Ok(ImageFacts {
-        size: measured,
-        sha256,
-        identity,
-    })
+    Ok(ImageFacts { identity })
 }
 
 pub fn verify_pe_shape(head: &[u8]) -> Result<()> {
@@ -335,11 +328,31 @@ pub struct Status {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct RecordedBackup {
-    pub path: String,
-    pub volume: u64,
-    pub id: String,
+    pub staged_path: String,
+    pub staged_volume: u64,
+    pub staged_id: String,
+    pub canonical_path: String,
+    pub canonical_volume: u64,
+    pub canonical_id: String,
+    pub backup_path: String,
+    pub backup_volume: u64,
+    pub backup_id: String,
     pub version: String,
     pub phase: BackupPhase,
+}
+
+impl RecordedBackup {
+    pub fn staged_identity(&self) -> Option<FileIdentity> {
+        FileIdentity::from_recorded(self.staged_volume, &self.staged_id)
+    }
+
+    pub fn canonical_identity(&self) -> Option<FileIdentity> {
+        FileIdentity::from_recorded(self.canonical_volume, &self.canonical_id)
+    }
+
+    pub fn backup_identity(&self) -> Option<FileIdentity> {
+        FileIdentity::from_recorded(self.backup_volume, &self.backup_id)
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -402,10 +415,12 @@ fn cleanup_replaced_image_for(canonical: &Path) {
             }
         }
         BackupPhase::Confirmed => {
-            let Some(identity) = FileIdentity::from_recorded(record.volume, &record.id) else {
+            let Some(identity) = record.backup_identity() else {
                 return;
             };
-            if file_tx::remove_recorded_object(Path::new(&record.path), identity).unwrap_or(false) {
+            if file_tx::remove_recorded_object(Path::new(&record.backup_path), identity)
+                .unwrap_or(false)
+            {
                 let _ = std::fs::remove_file(&record_path);
             }
         }
@@ -594,7 +609,9 @@ mod windows_handoff {
         WAIT_OBJECT_0,
     };
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
-    use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_SHARE_DELETE, FILE_SHARE_READ, SYNCHRONIZE,
+    };
     use windows_sys::Win32::System::Threading::{
         CREATE_NO_WINDOW, CreateEventW, CreateProcessW, DETACHED_PROCESS,
         DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
@@ -1258,49 +1275,18 @@ mod windows_handoff {
         Ok(())
     }
 
-    fn replace_with_handle(
-        replacement: &File,
-        target: &Path,
-        backup: &Path,
-        previous: FileIdentity,
-    ) -> Result<()> {
-        let directory = target
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let target_leaf = target
-            .file_name()
-            .context("the executable to replace has no file name")?;
-        let backup_leaf = backup
-            .file_name()
-            .context("the backup path has no file name")?;
-        let parent = file_tx::lease_directory(directory)?;
-        let target_file = file_tx::open_for_rename(target)?;
-        if file_tx::identity_of(&target_file)? != previous {
-            bail!("the executable to replace is not the object this update was aimed at");
-        }
-        file_tx::rename_pinned(&target_file, &parent, backup_leaf).with_context(|| {
-            format!("moving {} aside to {}", target.display(), backup.display())
-        })?;
-        if let Err(error) = file_tx::rename_pinned(replacement, &parent, target_leaf) {
-            match file_tx::rename_pinned(&target_file, &parent, target_leaf) {
-                Ok(()) => {}
-                Err(_) => {
-                    let _ = file_tx::move_recorded_object_no_replace(backup, previous, target);
-                }
-            }
-            return Err(error).context("replacing the executable");
-        }
-        Ok(())
-    }
+    pub(super) fn verify_or_recover_failed_replace(record: &RecordedBackup) -> Result<()> {
+        let canonical = Path::new(&record.canonical_path);
+        let expected = record
+            .canonical_identity()
+            .context("the recorded canonical identity is malformed")?;
+        let staged = record
+            .staged_identity()
+            .context("the recorded staged identity is malformed")?;
+        let backup = Path::new(&record.backup_path);
 
-    pub(super) fn verify_or_recover_failed_replace(
-        canonical: &Path,
-        recovery_source: &Path,
-        expected: FileIdentity,
-    ) -> Result<()> {
         match file_tx::existing_identity(canonical) {
-            Ok(Some(identity)) if identity == expected => return Ok(()),
+            Ok(Some(identity)) if identity == expected || identity == staged => return Ok(()),
             Ok(Some(_)) => {
                 bail!("the canonical executable changed identity during a failed replacement")
             }
@@ -1312,7 +1298,7 @@ mod windows_handoff {
             }
         }
 
-        match file_tx::move_recorded_object_no_replace(recovery_source, expected, canonical) {
+        match file_tx::move_recorded_object_no_replace(backup, expected, canonical) {
             Ok(true) => {}
             Ok(false) => {
                 bail!(
@@ -1423,23 +1409,65 @@ mod windows_handoff {
             }
         };
         let backup = PathBuf::from(&control.backup);
+        let staged_identity = file_tx::identity_of(&stage)?;
+        let directory = canonical
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let target_leaf = canonical
+            .file_name()
+            .context("the executable to replace has no file name")?;
+        let backup_leaf = backup.file_name().context("the backup has no file name")?;
+        let parent = file_tx::lease_directory(directory)?;
 
-        if let Err(error) = replace_with_handle(&stage, &canonical, &backup, previous) {
-            let (outcome, error) =
-                match verify_or_recover_failed_replace(&canonical, &backup, previous) {
-                    Ok(()) => ("not-installed", error),
-                    Err(recovery) => (
-                        "install-unusable",
-                        error.context(format!(
-                            "the failed install could not restore its pre-call state: {recovery:#}"
-                        )),
-                    ),
-                };
-            report(status_path, control, outcome, &error, false);
+        let record = match record_backup(control, previous, staged_identity) {
+            Ok(r) => r,
+            Err(error) => {
+                report(status_path, control, "backup-record-failed", &error, false);
+                return Err(error);
+            }
+        };
+
+        let canonical_handle = match (|| -> Result<File> {
+            let handle = file_tx::open_no_follow(&canonical, FILE_SHARE_READ | FILE_SHARE_DELETE)?;
+            if file_tx::identity_of(&handle)? != previous
+                || previous != control.canonical_identity()?
+            {
+                bail!("the canonical does not identify the executable authorized for replacement");
+            }
+            Ok(handle)
+        })() {
+            Ok(handle) => handle,
+            Err(error) => {
+                std::fs::remove_file(backup_record_path(&canonical)?).with_context(|| {
+                    format!("removing the pending backup record after: {error:#}")
+                })?;
+                report(status_path, control, "target-unverified", &error, false);
+                return Err(error);
+            }
+        };
+        if let Err(error) = file_tx::link_pinned(&canonical_handle, &parent, backup_leaf) {
+            std::fs::remove_file(backup_record_path(&canonical)?)
+                .with_context(|| format!("removing the pending backup record after: {error:#}"))?;
+            report(status_path, control, "link-failed", &error, false);
             return Err(error);
         }
 
-        record_backup(control, previous);
+        let replacement = file_tx::rename_pinned_replace(&stage, &parent, target_leaf);
+        drop(canonical_handle);
+        if let Err(error) = replacement {
+            let (outcome, error) = match verify_or_recover_failed_replace(&record) {
+                Ok(()) => ("not-installed", error),
+                Err(recovery) => (
+                    "install-unusable",
+                    error.context(format!(
+                        "the failed install could not restore its pre-call state: {recovery:#}"
+                    )),
+                ),
+            };
+            report(status_path, control, outcome, &error, false);
+            return Err(error);
+        }
 
         if !control.relaunch {
             write_status(
@@ -1505,16 +1533,57 @@ mod windows_handoff {
         if file_tx::identity_of(&backup_file)? != previous {
             bail!("the recorded backup is not the image this update displaced");
         }
-        let failed = canonical
+        let directory = canonical
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(file_tx::backup_leaf_name(canonical));
+            .unwrap_or_else(|| Path::new("."));
+        let target_leaf = canonical
+            .file_name()
+            .context("the executable to restore has no file name")?;
+        let parent = file_tx::lease_directory(directory)?;
         let displaced = file_tx::existing_identity(canonical)?
             .context("the executable to roll back is no longer there")?;
-        if let Err(error) = replace_with_handle(&backup_file, canonical, &failed, displaced) {
-            return match verify_or_recover_failed_replace(canonical, &failed, displaced) {
+
+        let failed_leaf = file_tx::backup_leaf_name(canonical);
+        let failed = directory.join(&failed_leaf);
+        let record = RecordedBackup {
+            staged_path: backup.to_string_lossy().into_owned(),
+            staged_volume: previous.volume_serial(),
+            staged_id: previous.file_id_hex(),
+            canonical_path: canonical.to_string_lossy().into_owned(),
+            canonical_volume: displaced.volume_serial(),
+            canonical_id: displaced.file_id_hex(),
+            backup_path: failed.to_string_lossy().into_owned(),
+            backup_volume: displaced.volume_serial(),
+            backup_id: displaced.file_id_hex(),
+            version: "rollback".to_string(),
+            phase: BackupPhase::Pending,
+        };
+        let text =
+            serde_json::to_string_pretty(&record).context("serializing the backup record")?;
+        let record_path = backup_record_path(canonical)?;
+        file_tx::replace_file_contents(&record_path, text.as_bytes())
+            .context("writing the backup record")?;
+        let canonical_handle = match (|| -> Result<File> {
+            let handle = file_tx::open_no_follow(canonical, FILE_SHARE_READ | FILE_SHARE_DELETE)?;
+            if Some(file_tx::identity_of(&handle)?) != record.canonical_identity() {
+                bail!("the canonical does not identify the executable authorized for rollback");
+            }
+            file_tx::link_pinned(&handle, &parent, &failed_leaf)?;
+            Ok(handle)
+        })() {
+            Ok(handle) => handle,
+            Err(error) => {
+                std::fs::remove_file(&record_path).with_context(|| {
+                    format!("removing the pending backup record after: {error:#}")
+                })?;
+                return Err(error);
+            }
+        };
+        let replacement = file_tx::rename_pinned_replace(&backup_file, &parent, target_leaf);
+        drop(canonical_handle);
+        if let Err(error) = replacement {
+            return match verify_or_recover_failed_replace(&record) {
                 Ok(()) => Err(error),
                 Err(recovery) => Err(error.context(format!(
                     "the failed rollback could not restore its pre-call state: {recovery:#}"
@@ -1527,20 +1596,30 @@ mod windows_handoff {
         Ok(())
     }
 
-    fn record_backup(control: &Control, previous: FileIdentity) {
-        let Ok(path) = backup_record_path(Path::new(&control.canonical)) else {
-            return;
-        };
+    fn record_backup(
+        control: &Control,
+        previous: FileIdentity,
+        staged: FileIdentity,
+    ) -> Result<RecordedBackup> {
+        let path = backup_record_path(Path::new(&control.canonical))?;
         let record = RecordedBackup {
-            path: control.backup.clone(),
-            volume: previous.volume_serial(),
-            id: previous.file_id_hex(),
+            staged_path: control.stage.clone(),
+            staged_volume: staged.volume_serial(),
+            staged_id: staged.file_id_hex(),
+            canonical_path: control.canonical.clone(),
+            canonical_volume: previous.volume_serial(),
+            canonical_id: previous.file_id_hex(),
+            backup_path: control.backup.clone(),
+            backup_volume: previous.volume_serial(),
+            backup_id: previous.file_id_hex(),
             version: control.version.clone(),
             phase: BackupPhase::Pending,
         };
-        if let Ok(text) = serde_json::to_string_pretty(&record) {
-            let _ = file_tx::replace_file_contents(&path, text.as_bytes());
-        }
+        let text =
+            serde_json::to_string_pretty(&record).context("serializing the backup record")?;
+        file_tx::replace_file_contents(&path, text.as_bytes())
+            .context("writing the backup record")?;
+        Ok(record)
     }
 
     fn report(

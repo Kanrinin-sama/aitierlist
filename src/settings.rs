@@ -93,7 +93,10 @@ pub fn load_settings() -> Settings {
             {
                 value["agent_hours"] = serde_json::json!(streams * 56.0);
             }
-            if let Ok(settings) = serde_json::from_value::<Settings>(value.clone()) {
+            if let Ok(mut settings) = serde_json::from_value::<Settings>(value.clone()) {
+                for vendor in Settings::default().vendor_overrides.into_keys() {
+                    settings.vendor_overrides.entry(vendor).or_insert(None);
+                }
                 return settings;
             }
             let mut settings = Settings::default();
