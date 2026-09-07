@@ -382,16 +382,7 @@ fn simulate_pick(rows: &[Row], seat: Seat, tier: Tier, settings: &Settings) -> O
             }
         })
         .collect();
-    top.sort_by(|left, right| {
-        if tier == Tier::Api {
-            right.tasks_per_week.total_cmp(&left.tasks_per_week)
-        } else {
-            right
-                .win_rate
-                .total_cmp(&left.win_rate)
-                .then_with(|| right.tasks_per_week.total_cmp(&left.tasks_per_week))
-        }
-    });
+    top.sort_by(|left, right| right.tasks_per_week.total_cmp(&left.tasks_per_week));
     let first = &top[0];
     Some(Pick {
         row_index: first.row_index,

@@ -125,29 +125,37 @@ impl App {
         if let Some(pick) = self.table.get_pick(seat, tier) {
             let selected_row = self.table.rows.get(pick.row_index);
 
-            ui.heading("Top Pick");
+            ui.heading("Top pick");
             if let Some(r) = selected_row {
                 ui.label(egui::RichText::new(r.display_name()).strong().size(15.0));
                 ui.label(format!("Vendor: {} | Harness: {}", r.vendor, r.harness));
             }
             ui.add_space(4.0);
             ui.label(format!(
-                "Win Rate: {:.1}% | Family Win: {:.1}% (N={})",
+                "Leads simulations: {:.1}% | Family leads simulations: {:.1}% (N={})",
                 pick.win_rate * 100.0,
                 pick.family_win_rate * 100.0,
                 pick.n
-            ));
+            ))
+            .on_hover_text(
+                "How often this configuration, or its harness/model family, leads the simulation samples. This measures uncertainty under the model assumptions; it is not a task success rate or the ranking objective. N is the number of eligible configurations in the same harness/model family.",
+            );
             ui.label(format!(
                 "Speed: {:.2} min/task | Cost: ${:.2}/task",
                 pick.minutes_per_task, pick.cost_per_task
             ));
-            ui.label(format!("Throughput: {:.1} tasks/wk", pick.tasks_per_week));
+            ui.label(format!(
+                "Estimated completed tasks/week: {:.1}",
+                pick.tasks_per_week
+            ));
             if let Some(s) = pick.streams_star {
-                ui.label(format!("Streams*: {:.2}", s));
+                ui.label(format!("Capacity multiple: {:.2}x", s)).on_hover_text(
+                    "How many times the current weekly workload the estimated plan allowance can fund.",
+                );
             }
 
             ui.add_space(10.0);
-            ui.heading("Quality Breakdown");
+            ui.heading("Quality details");
             if let Some(r) = selected_row {
                 egui::Grid::new("quality_grid")
                     .striped(true)
@@ -156,15 +164,19 @@ impl App {
                         ui.strong("Value");
                         ui.end_row();
 
-                        ui.label("Smart");
+                        ui.label("Intelligence index").on_hover_text(
+                            "A normalized intelligence index, not a calibrated task success rate.",
+                        );
                         ui.label(
                             r.smart
-                                .map(|v| format!("{:.1}%", v * 100.0))
+                                .map(|v| format!("{:.1}", v * 100.0))
                                 .unwrap_or_else(|| "-".into()),
                         );
                         ui.end_row();
 
-                        ui.label("Logic");
+                        ui.label("Reasoning score").on_hover_text(
+                            "A combined score from the GPQA and Humanity's Last Exam benchmarks.",
+                        );
                         ui.label(
                             r.logic
                                 .map(|v| format!("{:.1}%", v * 100.0))
@@ -172,7 +184,8 @@ impl App {
                         );
                         ui.end_row();
 
-                        ui.label("SWE");
+                        ui.label("Software engineering (SWE)")
+                            .on_hover_text("Performance on a software engineering benchmark.");
                         ui.label(
                             r.swe
                                 .map(|v| format!("{:.1}%", v * 100.0))
@@ -180,7 +193,8 @@ impl App {
                         );
                         ui.end_row();
 
-                        ui.label("QnA");
+                        ui.label("Codebase questions (QnA)")
+                            .on_hover_text("Performance on questions about a codebase.");
                         ui.label(
                             r.qna
                                 .map(|v| format!("{:.1}%", v * 100.0))
@@ -188,7 +202,8 @@ impl App {
                         );
                         ui.end_row();
 
-                        ui.label("LCR");
+                        ui.label("Long-context reasoning (LCR)")
+                            .on_hover_text("Performance on long-context reasoning tasks.");
                         ui.label(
                             r.lcr
                                 .map(|v| format!("{:.1}%", v * 100.0))
@@ -225,7 +240,8 @@ impl App {
             }
 
             ui.add_space(10.0);
-            ui.heading(format!("Top-{} Candidates", pick.top.len().min(4)));
+            ui.heading(format!("Top-{} candidates", pick.top.len().min(4)));
+            ui.label("Ordered by estimated completed tasks/week.");
             for (idx, cand) in pick.top.iter().take(4).enumerate() {
                 ui.group(|ui| {
                     let cand_row = self.table.rows.get(cand.row_index);
@@ -234,7 +250,7 @@ impl App {
                         .unwrap_or_else(|| format!("Row #{}", cand.row_index));
                     ui.strong(format!("#{}: {}", idx + 1, name));
                     ui.label(format!(
-                        "Win: {:.1}% | Fam Win: {:.1}% | N: {}",
+                        "Leads simulations: {:.1}% | Family leads: {:.1}% | N: {}",
                         cand.win_rate * 100.0,
                         cand.family_win_rate * 100.0,
                         cand.n
@@ -244,17 +260,17 @@ impl App {
                         cand.tasks_per_week, cand.minutes_per_task, cand.cost_per_task
                     ));
                     ui.label(format!(
-                        "Streams*: {}",
+                        "Capacity multiple: {}",
                         cand.streams_star
-                            .map(|s| format!("{:.2}", s))
+                            .map(|s| format!("{:.2}x", s))
                             .unwrap_or_else(|| "-".into())
                     ));
                     if let Some(cr) = cand_row {
                         ui.horizontal_wrapped(|ui| {
                             ui.small(format!(
-                                "Smart: {} | SWE: {} | QnA: {}",
+                                "Index: {} | SWE: {} | QnA: {}",
                                 cr.smart
-                                    .map(|v| format!("{:.1}%", v * 100.0))
+                                    .map(|v| format!("{:.1}", v * 100.0))
                                     .unwrap_or_else(|| "-".into()),
                                 cr.swe
                                     .map(|v| format!("{:.1}%", v * 100.0))
@@ -608,7 +624,7 @@ impl eframe::App for App {
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("Hours per week");
+                ui.heading("Total agent hours per week");
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.agent_hours_text).desired_width(80.0),
                 );
@@ -636,7 +652,7 @@ impl eframe::App for App {
                     ui.colored_label(egui::Color32::YELLOW, "Enter a number from 1 to 1680.");
                 }
             });
-            ui.label("hours you work x agents running in parallel");
+            ui.label("Example: 10 hours with 3 agents running in parallel = 30 total agent hours.");
             ui.add_space(8.0);
             egui::ScrollArea::both()
                 .id_salt("roles_table_scroll")
@@ -645,6 +661,29 @@ impl eframe::App for App {
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                 .show(ui, |ui| {
                     ui.strong("Coding Agent Tier List");
+                    ui.add(
+                        egui::Label::new(
+                            "Picks maximize estimated completed tasks per week within your available agent hours and plan allowance.",
+                        )
+                        .wrap(),
+                    )
+                    .on_hover_text(
+                        "Estimates include retries and assume unfinished tasks are completed through modeled escalation.",
+                    );
+                    egui::CollapsingHeader::new("How estimates work")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            for explanation in [
+                                "Benchmark scores are proxies for success in each role.",
+                                "Role proxies: Implementer uses coding benchmarks; Debugger uses coding and reasoning; Reviewer uses code Q&A and reasoning; Orchestrator uses the intelligence index and GPQA; Sanity uses Q&A; Comprehension uses long-context reasoning and Q&A.",
+                                "Budgeted plans use built-in allowance estimates unless you override them. The API budget has no spending cap.",
+                                "Simulation spread shows uncertainty conditional on these assumptions; its lead percentage is not a task success rate and does not determine the ranking.",
+                                "Role weights, retry failure correlation, and plan allowances are not automatically fitted to your task history.",
+                                "Unfinished tasks are assumed completed through escalation at the configured fixed extra time and cost. These values apply to every role; the default $0 escalation cost is an explicit assumption.",
+                            ] {
+                                ui.add(egui::Label::new(explanation).wrap());
+                            }
+                        });
                     if !self.refresh_warning.is_empty() {
                         ui.colored_label(egui::Color32::YELLOW, &self.refresh_warning);
                     }
@@ -661,18 +700,33 @@ impl eframe::App for App {
                         .spacing([12.0, 3.0])
                         .min_col_width(50.0)
                         .show(ui, |ui| {
-                            ui.strong("Seat / Tier");
+                            ui.strong("Role / budget");
                             ui.strong("Agent");
-                            ui.strong("Win");
-                            ui.strong("Streams*");
+                            ui.strong("Simulation lead").on_hover_text(
+                                "Share of simulation samples this configuration leads. This is an uncertainty statistic, not a task success rate or the ranking objective.",
+                            );
+                            ui.strong("Capacity").on_hover_text(
+                                "Multiple of the current weekly workload the estimated allowance can fund.",
+                            );
                             ui.strong("Min/task");
                             ui.strong("$/task");
-                            ui.strong("Tasks/wk");
-                            for heading in ["Util%", "A*h"] {
+                            ui.strong("Tasks/week").on_hover_text(
+                                "Estimated completed tasks per week, including retries and modeled escalation.",
+                            );
+                            for (heading, explanation) in [
+                                (
+                                    "Allowance used",
+                                    "Configured total agent hours divided by the estimated hours needed to exhaust the allowance, capped at 100%.",
+                                ),
+                                (
+                                    "Hours to use allowance",
+                                    "Estimated agent hours needed to exhaust the plan allowance.",
+                                ),
+                            ] {
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        ui.strong(heading);
+                                        ui.strong(heading).on_hover_text(explanation);
                                     },
                                 );
                             }
@@ -722,7 +776,7 @@ impl eframe::App for App {
                                         let win = format!("{:.0}%", pick.win_rate * 100.0);
                                         let streams_star = pick
                                             .streams_star
-                                            .map(|s| format!("{:.2}", s))
+                                            .map(|s| format!("{:.2}x", s))
                                             .unwrap_or_else(|| "-".into());
                                         let min_task = format!("{:.2}", pick.minutes_per_task);
                                         let cost_task = format!("${:.2}", pick.cost_per_task);
@@ -784,7 +838,7 @@ impl eframe::App for App {
                                             ui.label(
                                                 maybe_pick
                                                     .and_then(|pick| pick.util_pct)
-                                                    .map(|value| format!("{value:.1}"))
+                                                    .map(|value| format!("{value:.1}%"))
                                                     .unwrap_or_else(|| "-".into()),
                                             );
                                         },
@@ -890,7 +944,18 @@ impl eframe::App for App {
                                         egui::Layout::right_to_left(egui::Align::Center)
                                     };
                                     ui.with_layout(direction, |ui| {
-                                        ui.strong(*heading);
+                                        let explanation = match *heading {
+                                            "SWE" => Some("DeepSWE software engineering benchmark."),
+                                            "Term" => Some("Terminal-Bench terminal task benchmark."),
+                                            "QnA" => Some("Codebase question-answering benchmark."),
+                                            "Logic" => Some("Combined GPQA and Humanity's Last Exam reasoning score."),
+                                            "Tok/s" => Some("Output tokens generated per second."),
+                                            _ => None,
+                                        };
+                                        let response = ui.strong(*heading);
+                                        if let Some(explanation) = explanation {
+                                            response.on_hover_text(explanation);
+                                        }
                                     });
                                 }
                                 ui.end_row();
@@ -965,9 +1030,11 @@ impl eframe::App for App {
                 .default_width(450.0)
                 .show(&ctx, |ui| {
                     let mut changed = false;
-                    ui.heading("Engine & Cache Configuration");
+                    ui.heading("Engine & cache configuration");
                     ui.horizontal(|ui| {
-                        ui.label("Escalation minutes:");
+                        ui.label("Escalation time (minutes):").on_hover_text(
+                            "Unfinished tasks are modeled as completed through escalation with this fixed additional time. This setting applies to every role.",
+                        );
                         changed |= ui
                             .add(
                                 egui::DragValue::new(&mut self.settings.escalation_minutes)
@@ -976,7 +1043,9 @@ impl eframe::App for App {
                             .changed();
                     });
                     ui.horizontal(|ui| {
-                        ui.label("Escalation USD:");
+                        ui.label("Escalation cost (USD):").on_hover_text(
+                            "Unfinished tasks are modeled as completed through escalation with this fixed additional cost. This setting applies to every role.",
+                        );
                         changed |= ui
                             .add(
                                 egui::DragValue::new(&mut self.settings.escalation_usd)
@@ -985,7 +1054,9 @@ impl eframe::App for App {
                             .changed();
                     });
                     ui.horizontal(|ui| {
-                        ui.label("Rho:");
+                        ui.label("Retry failure correlation:").on_hover_text(
+                            "0 treats attempts as independent. Larger values make repeat failures more likely by reducing conditional success after failures.",
+                        );
                         changed |= ui
                             .add(
                                 egui::DragValue::new(&mut self.settings.rho)
@@ -996,7 +1067,9 @@ impl eframe::App for App {
                     });
 
                     ui.horizontal(|ui| {
-                        ui.label("Monte Carlo Draws (1000..20000):");
+                        ui.label("Simulation samples (1,000–20,000):").on_hover_text(
+                            "More samples stabilize uncertainty estimates under the same assumptions.",
+                        );
                         if ui
                             .add(
                                 egui::Slider::new(&mut self.settings.draws, 1000..=20000)
