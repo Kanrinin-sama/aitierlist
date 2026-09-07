@@ -127,7 +127,9 @@ fn main() -> eframe::Result<()> {
                         row.harness,
                         row.model,
                         row.effort.as_deref().unwrap_or(""),
-                        row.pass,
+                        row.pass
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "Unknown".to_string()),
                         row.wait_seconds,
                         row.attempt_usd,
                         row.qna.map(|value| value.to_string()).unwrap_or_default(),

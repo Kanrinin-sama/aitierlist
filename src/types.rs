@@ -132,7 +132,7 @@ pub struct Row {
     pub family: String,
     #[serde(rename = "name")]
     pub display_name: String,
-    pub pass: f64,
+    pub pass: Option<f64>,
     pub term: Option<f64>,
     pub gpqa: Option<f64>,
     pub hle: Option<f64>,
@@ -157,12 +157,9 @@ impl Row {
 #[serde(rename_all = "camelCase")]
 pub struct CandidatePick {
     pub row_index: usize,
-    pub competence: f64,
+    pub competence: Option<f64>,
     pub competence_floor: Option<f64>,
-    pub worst_shortfall: f64,
-    pub competence_shortfall: f64,
     pub capacity_shortfall: f64,
-    pub best_competence: f64,
     pub minutes_per_task: f64,
     pub cost_per_task: f64,
     pub attempt_limit: usize,
@@ -197,12 +194,9 @@ pub struct ScenarioPick {
 #[serde(rename_all = "camelCase")]
 pub struct Pick {
     pub row_index: usize,
-    pub competence: f64,
+    pub competence: Option<f64>,
     pub competence_floor: Option<f64>,
-    pub worst_shortfall: f64,
-    pub competence_shortfall: f64,
     pub capacity_shortfall: f64,
-    pub best_competence: f64,
     pub minutes_per_task: f64,
     pub cost_per_task: f64,
     pub attempt_limit: usize,
@@ -237,17 +231,14 @@ pub struct SeatTierPick {
 pub struct FrontierPoint {
     pub competence_floor: f64,
     pub row_index: usize,
-    pub competence: f64,
+    pub competence: Option<f64>,
     pub attempt_limit: usize,
     pub tasks_per_week: f64,
     pub assisted_tasks_per_week: f64,
     pub escalation_hours_per_week: f64,
     pub tasks_low: f64,
     pub tasks_high: f64,
-    pub worst_shortfall: f64,
-    pub competence_shortfall: f64,
     pub capacity_shortfall: f64,
-    pub best_competence: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

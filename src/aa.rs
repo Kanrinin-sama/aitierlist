@@ -452,7 +452,7 @@ pub fn agent_row(raw: &Value, item: Option<&Value>, hosts: &[&Value]) -> Option<
         return None;
     }
     if [swe, term, qna].iter().any(|evaluation| {
-        ["reward", "inputTokens", "outputTokens"]
+        ["inputTokens", "outputTokens"]
             .iter()
             .any(|key| finite_number(&evaluation[key]).is_none_or(|value| value < 0.0))
             || evaluation["cacheWriteTokens"]
@@ -479,10 +479,10 @@ pub fn agent_row(raw: &Value, item: Option<&Value>, hosts: &[&Value]) -> Option<
         (number(&swe[key]) * SWE_TASKS + number(&term[key]) * TERMINAL_TASKS)
             / (SWE_TASKS + TERMINAL_TASKS)
     };
-    let pass = implementation_mean("reward");
-    if pass <= 0.0 {
-        return None;
-    }
+    let pass = finite_number(&swe["reward"])
+        .zip(finite_number(&term["reward"]))
+        .filter(|(swe, term)| (0.0..=1.0).contains(swe) && (0.0..=1.0).contains(term))
+        .map(|_| implementation_mean("reward"));
     let pooled_seconds = number(&mean["agentWallTimeSec"]);
     let pooled_usd = number(&mean["costUsd"]);
     let weighted_mean_output = (number(&swe["outputTokens"]) * SWE_TASKS
@@ -574,6 +574,9 @@ pub fn agent_row(raw: &Value, item: Option<&Value>, hosts: &[&Value]) -> Option<
             cost_basis,
         ),
     ];
+    metrics.retain(|metric| {
+        finite_number(&metric["pass"]).is_some_and(|value| (0.0..=1.0).contains(&value))
+    });
     for metric in &mut metrics {
         metric["pooledSeconds"] = json!(pooled_seconds);
     }

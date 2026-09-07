@@ -7,6 +7,12 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const REFRESH_COOLDOWN_SECONDS: u64 = 16;
 
+fn competence_text(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.3}"))
+        .unwrap_or_else(|| "Unknown".to_string())
+}
+
 type ComparisonResponse = (
     u64,
     Seat,
@@ -158,7 +164,7 @@ impl App {
         egui::CollapsingHeader::new("Optional competence minimums")
             .default_open(false)
             .show(ui, |ui| {
-        ui.label("Add a hard qualification requirement only when the seat needs one. The automatic pick already balances competence and capacity.");
+        ui.label("Add a hard qualification requirement only when the seat needs one. The automatic pick maximizes nominal verified reference tasks per week, with the scenario band shown.");
         if let Some(frontier) = frontier {
             egui::ScrollArea::both()
                 .id_salt(("frontier_scroll", seat, tier))
@@ -169,7 +175,7 @@ impl App {
                         .show(ui, |ui| {
                             for heading in [
                                 "", "Minimum", "Agent", "Score", "MAX", "Agent/wk", "Range",
-                                "Quality loss", "Capacity loss", "Worst loss",
+                                "Worst capacity shortfall",
                             ] {
                                 ui.strong(heading);
                             }
@@ -189,16 +195,11 @@ impl App {
                                     [190.0, ui.spacing().interact_size.y],
                                     egui::Label::new(name).wrap(),
                                 );
-                                ui.label(format!("{:.3}", point.competence));
+                                ui.label(competence_text(point.competence));
                                 ui.label(point.attempt_limit.to_string());
                                 ui.label(format!("{:.1}", point.tasks_per_week));
                                 ui.label(format!("{:.1}–{:.1}", point.tasks_low, point.tasks_high));
-                                ui.label(format!(
-                                    "{:.1}%",
-                                    point.competence_shortfall * 100.0
-                                ));
                                 ui.label(format!("{:.1}%", point.capacity_shortfall * 100.0));
-                                ui.label(format!("{:.1}%", point.worst_shortfall * 100.0));
                                 ui.end_row();
                             }
                         });
@@ -220,7 +221,7 @@ impl App {
                 }
             });
         } else {
-            ui.label("No competence–capacity choices are available.");
+            ui.label("No competence-minimum choices are available.");
         }
             });
         selected_floor
@@ -237,22 +238,17 @@ impl App {
                 ui.label(format!("Vendor: {} | Harness: {}", row.vendor, row.harness));
             }
             ui.add_space(4.0);
-            ui.label(format!("Role competence: {:.3} of {:.3} best available", pick.competence, pick.best_competence)).on_hover_text(
-                "Fixed role-weighted benchmark utility on a 0–1 scale. It contributes to automatic selection and any optional minimum; it is not a retry success probability.",
+            ui.label(format!("Role competence: {}", competence_text(pick.competence))).on_hover_text(
+                "Fixed role-weighted benchmark utility on a 0–1 scale. It is displayed and enforces any optional minimum; it breaks ties after nominal capacity and worst scenario capacity shortfall. It is not a retry success probability.",
             );
             if let Some(floor) = pick.competence_floor {
                 ui.label(format!("Required competence minimum: {floor:.3}"));
             } else {
-                ui.label("Automatic competence–capacity balance");
+                ui.label("Most nominal verified reference tasks per week; scenario band shown");
             }
             ui.label(format!(
-                "Worst proportional loss: {:.1}%",
-                pick.worst_shortfall * 100.0
-            ));
-            ui.label(format!(
-                "Competence retained: {:.1}% · worst-case capacity retained: {:.1}%",
-                (1.0 - pick.competence_shortfall) * 100.0,
-                (1.0 - pick.capacity_shortfall) * 100.0,
+                "Worst scenario capacity shortfall: {:.1}%",
+                pick.capacity_shortfall * 100.0
             ));
             ui.label(format!(
                 "Estimated {:.2} min/cycle | ${:.2}/cycle total",
@@ -297,7 +293,10 @@ impl App {
                 "Role competence and operating capacity are separate. The competence profile expresses the seat's capability judgment. Retry success, time, and cost come only from the reference workload.",
             ).wrap());
             if let Some(row) = selected_row {
-                ui.label(format!("Fixed role competence: {:.3}", pick.competence));
+                ui.label(format!(
+                    "Fixed role competence: {}",
+                    competence_text(pick.competence)
+                ));
                 if let Some(components) = crate::engine::competence_components(row, seat) {
                     egui::Grid::new(("competence_grid", seat, tier))
                         .striped(true)
@@ -419,9 +418,12 @@ impl App {
                 });
 
             ui.add_space(10.0);
-            ui.heading(format!("Top-{} robust policies", pick.top.len().min(4)));
+            ui.heading(format!(
+                "Top-{} nominal throughput policies",
+                pick.top.len().min(4)
+            ));
             ui.label(
-                "Ordered by automatic worst proportional loss across competence and capacity.",
+                "Ordered by most nominal verified reference tasks per week, with the scenario band shown.",
             );
             for (idx, cand) in pick.top.iter().take(4).enumerate() {
                 ui.group(|ui| {
@@ -431,12 +433,9 @@ impl App {
                         .unwrap_or_else(|| format!("Row #{}", cand.row_index));
                     ui.strong(format!("#{}: {}", idx + 1, name));
                     ui.label(format!(
-                        "Competence {:.3}/{:.3} ({:.1}% loss) | Capacity loss {:.1}% | Worst loss {:.1}%",
-                        cand.competence,
-                        cand.best_competence,
-                        cand.competence_shortfall * 100.0,
+                        "Competence {} | Worst scenario capacity shortfall {:.1}%",
+                        competence_text(cand.competence),
                         cand.capacity_shortfall * 100.0,
-                        cand.worst_shortfall * 100.0,
                     ));
                     ui.label(format!(
                         "{:.1} agent completions/wk ({:.1}–{:.1}) | {:.2} min/cycle | ${:.2}/cycle | MAX {} attempts",
@@ -464,7 +463,18 @@ impl App {
         } else {
             ui.colored_label(
                 egui::Color32::YELLOW,
-                "No candidate meets the configured competence minimum for this seat and tier.",
+                if self
+                    .settings
+                    .competence_floors
+                    .get(seat.name())
+                    .copied()
+                    .flatten()
+                    .is_some()
+                {
+                    "No candidate meets the configured competence minimum for this seat and tier."
+                } else {
+                    "No eligible candidate has this seat's reference workload data."
+                },
             );
             selected_floor = self.frontier_content(ui, seat, tier);
         }
@@ -502,7 +512,7 @@ impl App {
 
         ui.add_space(10.0);
         ui.heading("What would change this pick?");
-        ui.label("Each estimate changes only this configuration. Competitors stay unchanged while ideal points and retry caps are recomputed across 24 bounded sampled changes.");
+        ui.label("Each estimate changes only this configuration. Competitors stay unchanged while nominal throughput, scenario bands, and retry caps are recomputed across 24 bounded sampled changes.");
         let selected_name = self
             .table
             .rows
@@ -558,8 +568,10 @@ impl App {
         {
             if let Some(target) = &report.target {
                 ui.label(format!(
-                    "Current alternative: competence {:.3}, {:.1} agent completions/week, MAX {}",
-                    target.competence, target.autonomous_tasks_per_week, target.attempt_limit
+                    "Current alternative: competence {}, {:.1} agent completions/week, MAX {}",
+                    competence_text(target.competence),
+                    target.autonomous_tasks_per_week,
+                    target.attempt_limit
                 ));
             }
             for (label, threshold) in [
@@ -992,7 +1004,7 @@ impl eframe::App for App {
                     ui.strong("Coding Agent Tier List");
                     ui.add(
                         egui::Label::new(
-                            "Picks automatically balance proportional competence loss with worst-case proportional capacity loss. Optional competence minimums remain available for hard requirements.",
+                            "Picks maximize nominal verified reference tasks per week, with the scenario band shown. Optional competence minimums enforce hard requirements.",
                         )
                         .wrap(),
                     )
@@ -1006,7 +1018,7 @@ impl eframe::App for App {
                                 "Role competence is a fixed weighted utility of benchmark capabilities. It is a qualification measure, not a task success probability.",
                                 "Implementer and Debugger capacity uses the coding reference workload. Other seats use Repository Q&A as the reference workload. These are reference units, not observed real-role output.",
                                 "The engine chooses a candidate and maximum retry count before the scenario is known. Attempts stop on success; unfinished cycles use the configured rescue time and cost without crediting that completion to the agent.",
-                                "The automatic choice minimizes its largest percentage loss: competence versus the best available competence, or capacity versus each scenario's capacity leader.",
+                                "The automatic choice maximizes nominal verified reference tasks per week. Exact ties prefer smaller worst scenario capacity shortfall, higher known competence, then shorter retry caps.",
                                 "Scenarios combine the configured stress distance, allowance endpoints, and both resource-time bases. The distance is an assumption, not measured uncertainty or a confidence interval.",
                                 "Hallucination is an optional reliability indicator only. It is not a retry-transition probability, and missing values are not imputed as perfect reliability.",
                             ] {
@@ -1034,8 +1046,8 @@ impl eframe::App for App {
                             ui.strong("Competence").on_hover_text(
                                 "Fixed role-weighted benchmark utility on a 0–1 scale. It is not a task success probability.",
                             );
-                            ui.strong("Worst loss").on_hover_text(
-                                "Largest proportional shortfall across competence and capacity scenarios. Smaller is better.",
+                            ui.strong("Capacity shortfall").on_hover_text(
+                                "Worst proportional capacity shortfall across the scenario band. Breaks exact nominal-throughput ties; per-scenario values are diagnostics.",
                             );
                             ui.strong("Min/cycle");
                             ui.strong("$/cycle");
@@ -1090,7 +1102,7 @@ impl eframe::App for App {
                                     let (
                                         agent_name,
                                         competence,
-                                        worst_shortfall,
+                                        capacity_shortfall,
                                         min_task,
                                         cost_task,
                                         tasks_wk,
@@ -1105,12 +1117,12 @@ impl eframe::App for App {
                                         if pick.competence_floor.is_none() {
                                             name.push_str(" · Automatic");
                                         }
-                                        let competence = format!("{:.3}", pick.competence);
-                                        let worst_shortfall =
-                                            format!("{:.1}%", pick.worst_shortfall * 100.0);
+                                        let competence = competence_text(pick.competence);
+                                        let capacity_shortfall =
+                                            format!("{:.1}%", pick.capacity_shortfall * 100.0);
                                         let min_task = format!("{:.2}", pick.minutes_per_task);
                                         let cost_task = format!("${:.2}", pick.cost_per_task);
-                                        let tasks_wk = format!("{:.1}", pick.tasks_per_week);
+                                        let tasks_wk = format!("{:.1} ({:.1}–{:.1})", pick.tasks_per_week, pick.tasks_low, pick.tasks_high);
                                         let a_star_hours = if tier == Tier::Api {
                                             "-".to_string()
                                         } else {
@@ -1121,7 +1133,7 @@ impl eframe::App for App {
                                         (
                                             name,
                                             competence,
-                                            worst_shortfall,
+                                            capacity_shortfall,
                                             min_task,
                                             cost_task,
                                             tasks_wk,
@@ -1150,7 +1162,7 @@ impl eframe::App for App {
                                     if ui.selectable_label(is_selected, &competence).clicked() {
                                         clicked = true;
                                     }
-                                    if ui.selectable_label(is_selected, &worst_shortfall).clicked() {
+                                    if ui.selectable_label(is_selected, &capacity_shortfall).clicked() {
                                         clicked = true;
                                     }
                                     if ui.selectable_label(is_selected, &min_task).clicked() {
@@ -1220,10 +1232,10 @@ impl eframe::App for App {
                                             ui.label(format!("{left} vs {right}: selected policies are equivalent on competence and autonomous production."));
                                         } else {
                                             ui.label(format!(
-                                                "{left}: competence {:.3}, {:.1}/wk; {right}: competence {:.3}, {:.1}/wk. Scenario production difference ranges {:+.1} to {:+.1}/wk (right minus left).",
-                                                comparison.left_competence,
+                                                "{left}: competence {}, {:.1}/wk; {right}: competence {}, {:.1}/wk. Scenario production difference ranges {:+.1} to {:+.1}/wk (right minus left).",
+                                                competence_text(comparison.left_competence),
                                                 comparison.left_autonomous_tasks_per_week,
-                                                comparison.right_competence,
+                                                competence_text(comparison.right_competence),
                                                 comparison.right_autonomous_tasks_per_week,
                                                 comparison.worst_capacity_delta,
                                                 comparison.best_capacity_delta,
@@ -1399,7 +1411,7 @@ impl eframe::App for App {
                         .default_open(false)
                         .show(ui, |ui| {
                             ui.add(egui::Label::new(
-                                "The automatic choice already balances competence and capacity. Enable a minimum only to enforce a hard qualification requirement.",
+                                "The automatic choice maximizes nominal verified reference tasks per week, with the scenario band shown. Enable a minimum to enforce a hard qualification requirement.",
                             ).wrap());
                             for seat in Seat::ALL {
                                 let floor = self

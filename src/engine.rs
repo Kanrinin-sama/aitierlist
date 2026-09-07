@@ -446,7 +446,7 @@ fn cycle_capacity(cycle: Cycle, tier: Tier, settings: &Settings, range: (f64, f6
 
 struct Policy {
     row_index: usize,
-    competence: f64,
+    competence: Option<f64>,
     range: (f64, f64),
     calls: bool,
     limit: usize,
@@ -456,10 +456,7 @@ struct Policy {
 
 struct Evaluation {
     selected: usize,
-    combined: Vec<f64>,
-    quality: Vec<f64>,
     capacity: Vec<f64>,
-    best_competence: f64,
     best_capacity: Vec<f64>,
 }
 
@@ -467,21 +464,18 @@ fn policy_order(
     left: usize,
     right: usize,
     policies: &[Policy],
-    combined: &[f64],
-    quality: &[f64],
     capacity: &[f64],
     rows: &[Row],
 ) -> std::cmp::Ordering {
-    combined[left]
-        .total_cmp(&combined[right])
-        .then_with(|| {
-            (quality[left] + capacity[left]).total_cmp(&(quality[right] + capacity[right]))
-        })
-        .then_with(|| policies[right].nominal.total_cmp(&policies[left].nominal))
+    policies[right]
+        .nominal
+        .total_cmp(&policies[left].nominal)
+        .then_with(|| capacity[left].total_cmp(&capacity[right]))
         .then_with(|| {
             policies[right]
                 .competence
-                .total_cmp(&policies[left].competence)
+                .partial_cmp(&policies[left].competence)
+                .unwrap_or(std::cmp::Ordering::Equal)
         })
         .then_with(|| policies[left].limit.cmp(&policies[right].limit))
         .then_with(|| {
@@ -527,13 +521,16 @@ fn analyze(
             });
             continue;
         }
-        let Some(competence) = competence(row, seat) else {
+        let competence = competence(row, seat);
+        if matches!(seat, Seat::Implementer | Seat::Debugger)
+            && !self::competence(row, Seat::Implementer).is_some_and(|value| value > 0.0)
+        {
             excluded.push(ExcludedCandidate {
                 row_index,
-                reason: "missing required competence evidence".to_string(),
+                reason: "missing or zero coding pass".to_string(),
             });
             continue;
-        };
+        }
         let vendor = VENDORS.iter().position(|vendor| *vendor == row.vendor);
         let plan = vendor.and_then(|index| plans[index]);
         let override_amount = settings
@@ -599,7 +596,7 @@ fn analyze(
         }
         let policy_start = policies.len();
         for (index, cycle) in cycles.into_iter().enumerate() {
-            let nominal = tasks(cycle, tier, settings, range, None);
+            let nominal = cycle_capacity(cycle, tier, settings, range) * (1.0 - cycle.unfinished);
             if tier == Tier::Api || nominal > 0.0 || cycle.model_spend == 0.0 {
                 policies.push(Policy {
                     row_index,
@@ -668,11 +665,14 @@ fn analyze(
         })
         .collect();
 
-    let choose = |floor: f64| -> Option<Evaluation> {
+    let meets_floor = |policy: &Policy, floor: Option<f64>| {
+        floor.is_none_or(|floor| policy.competence.is_some_and(|value| value >= floor))
+    };
+    let choose = |floor: Option<f64>| -> Option<Evaluation> {
         let feasible: Vec<usize> = policies
             .iter()
             .enumerate()
-            .filter_map(|(index, policy)| (policy.competence >= floor).then_some(index))
+            .filter_map(|(index, policy)| (meets_floor(policy, floor)).then_some(index))
             .collect();
         if feasible.is_empty() {
             return None;
@@ -687,26 +687,11 @@ fn analyze(
                     .unwrap_or(0.0)
             })
             .collect();
-        let best_competence = feasible
-            .iter()
-            .map(|index| policies[*index].competence)
-            .max_by(f64::total_cmp)
-            .unwrap_or(0.0);
-        let quality: Vec<f64> = policies
-            .iter()
-            .map(|policy| {
-                if best_competence == 0.0 {
-                    0.0
-                } else {
-                    1.0 - policy.competence / best_competence
-                }
-            })
-            .collect();
         let capacity: Vec<f64> = policies
             .iter()
             .enumerate()
             .map(|(index, policy)| {
-                if policy.competence < floor {
+                if !meets_floor(policy, floor) {
                     return f64::INFINITY;
                 }
                 values
@@ -722,22 +707,12 @@ fn analyze(
                     .fold(0.0, f64::max)
             })
             .collect();
-        let combined: Vec<f64> = quality
-            .iter()
-            .zip(&capacity)
-            .map(|(quality, capacity)| quality.max(*capacity))
-            .collect();
-        let selected = feasible.into_iter().min_by(|left, right| {
-            policy_order(
-                *left, *right, &policies, &combined, &quality, &capacity, rows,
-            )
-        })?;
+        let selected = feasible
+            .into_iter()
+            .min_by(|left, right| policy_order(*left, *right, &policies, &capacity, rows))?;
         Some(Evaluation {
             selected,
-            combined,
-            quality,
             capacity,
-            best_competence,
             best_capacity,
         })
     };
@@ -748,7 +723,7 @@ fn analyze(
         Vec::new()
     };
     if include_frontier {
-        thresholds.extend(policies.iter().map(|policy| policy.competence));
+        thresholds.extend(policies.iter().filter_map(|policy| policy.competence));
         thresholds.sort_by(f64::total_cmp);
         thresholds.dedup_by(|left, right| left.total_cmp(right).is_eq());
     }
@@ -756,13 +731,8 @@ fn analyze(
         .into_iter()
         .filter_map(|floor| {
             let Evaluation {
-                selected,
-                combined,
-                quality,
-                capacity,
-                best_competence,
-                ..
-            } = choose(floor)?;
+                selected, capacity, ..
+            } = choose(Some(floor))?;
             let policy = &policies[selected];
             let low = values
                 .iter()
@@ -783,10 +753,7 @@ fn analyze(
                 escalation_hours_per_week: cycles * policy.cycle.escalation_seconds / 3600.0,
                 tasks_low: low,
                 tasks_high: high,
-                worst_shortfall: combined[selected],
-                competence_shortfall: quality[selected],
                 capacity_shortfall: capacity[selected],
-                best_competence,
             })
         })
         .collect();
@@ -795,17 +762,22 @@ fn analyze(
         .get(seat.name())
         .copied()
         .flatten();
-    let floor = configured_floor.unwrap_or(0.0);
+    let floor = configured_floor;
     if configured_floor.is_some() {
         for row_index in policies
             .iter()
-            .filter(|policy| policy.competence < floor)
+            .filter(|policy| !meets_floor(policy, floor))
             .map(|policy| policy.row_index)
             .collect::<BTreeSet<_>>()
         {
             excluded.push(ExcludedCandidate {
                 row_index,
-                reason: "below configured competence floor".to_string(),
+                reason: if competence(&rows[row_index], seat).is_none() {
+                    "missing required competence evidence"
+                } else {
+                    "below configured competence floor"
+                }
+                .to_string(),
             });
         }
     }
@@ -817,10 +789,7 @@ fn analyze(
     };
     let Some(Evaluation {
         selected,
-        combined,
-        quality,
         capacity,
-        best_competence,
         best_capacity,
     }) = choose(floor)
     else {
@@ -848,10 +817,7 @@ fn analyze(
             row_index: policy.row_index,
             competence: policy.competence,
             competence_floor: configured_floor,
-            worst_shortfall: combined[index],
-            competence_shortfall: quality[index],
             capacity_shortfall: capacity[index],
-            best_competence,
             minutes_per_task: cycle.wall / 60.0,
             cost_per_task: cycle.spend,
             attempt_limit: policy.limit,
@@ -879,7 +845,7 @@ fn analyze(
     };
     let row_indices: BTreeSet<usize> = policies
         .iter()
-        .filter(|policy| policy.competence >= floor)
+        .filter(|policy| meets_floor(policy, floor))
         .map(|policy| policy.row_index)
         .collect();
     let mut row_best: Vec<usize> = row_indices
@@ -889,20 +855,12 @@ fn analyze(
                 .iter()
                 .enumerate()
                 .filter_map(|(index, policy)| {
-                    (policy.row_index == row_index && policy.competence >= floor).then_some(index)
+                    (policy.row_index == row_index && meets_floor(policy, floor)).then_some(index)
                 })
-                .min_by(|left, right| {
-                    policy_order(
-                        *left, *right, &policies, &combined, &quality, &capacity, rows,
-                    )
-                })
+                .min_by(|left, right| policy_order(*left, *right, &policies, &capacity, rows))
         })
         .collect();
-    row_best.sort_by(|left, right| {
-        policy_order(
-            *left, *right, &policies, &combined, &quality, &capacity, rows,
-        )
-    });
+    row_best.sort_by(|left, right| policy_order(*left, *right, &policies, &capacity, rows));
     let top = row_best.into_iter().map(make_pick).collect();
     let first = make_pick(selected);
     let scenarios = scenario_defs
@@ -913,14 +871,15 @@ fn analyze(
             let winner = policies
                 .iter()
                 .enumerate()
-                .filter_map(|(index, policy)| (policy.competence >= floor).then_some(index))
+                .filter_map(|(index, policy)| (meets_floor(policy, floor)).then_some(index))
                 .max_by(|left, right| {
                     scenario[*left]
                         .total_cmp(&scenario[*right])
                         .then_with(|| {
                             policies[*left]
                                 .competence
-                                .total_cmp(&policies[*right].competence)
+                                .partial_cmp(&policies[*right].competence)
+                                .unwrap_or(std::cmp::Ordering::Equal)
                         })
                         .then_with(|| policies[*right].limit.cmp(&policies[*left].limit))
                         .then_with(|| {
@@ -959,10 +918,7 @@ fn analyze(
             row_index: first.row_index,
             competence: first.competence,
             competence_floor: first.competence_floor,
-            worst_shortfall: first.worst_shortfall,
-            competence_shortfall: first.competence_shortfall,
             capacity_shortfall: first.capacity_shortfall,
-            best_competence: first.best_competence,
             minutes_per_task: first.minutes_per_task,
             cost_per_task: first.cost_per_task,
             attempt_limit: first.attempt_limit,

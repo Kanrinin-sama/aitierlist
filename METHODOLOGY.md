@@ -1,6 +1,6 @@
 # Methodology
 
-aitierlist makes an independent recommendation for each role and plan tier. It separates role competence from operating capacity and automatically selects the candidate and retry cap with the smallest worst proportional shortfall across competence and a declared finite set of operating scenarios. Optional competence minimums enforce hard qualification requirements. Agent hours and vendor allowances are not allocated across a shared roster.
+aitierlist makes an independent recommendation for each role and plan tier. It separates role competence from operating capacity and automatically selects the candidate and retry cap with the most nominal verified reference tasks per week, with a band across a declared finite set of operating scenarios. Optional competence minimums enforce hard qualification requirements. Agent hours and vendor allowances are not allocated across a shared roster.
 
 ## Role competence
 
@@ -19,15 +19,7 @@ Comprehension = (LCR + Repository Q&A) / 2
 
 These fixed profiles encode the role judgment. The engine does not fit a preference function from the current candidate pool. A candidate with a missing required capability has no competence value for that role.
 
-For each role and tier, the best available competence is the maximum fixed competence among the feasible candidates. A policy's proportional competence shortfall is
-
-```text
-competence shortfall = 1 - policy competence / best available competence
-```
-
-A zero best competence produces zero competence shortfall. The zero point is fixed by the source scale; the engine does not normalize scores between the worst and best candidates in the current pool.
-
-Each role also has an optional competence minimum in settings. When set, candidates below the minimum are excluded before automatic selection. When unset, competence and capacity both participate in the automatic choice. The optional competence-minimum choices show the selected policy at each available score threshold; the list is a threshold decision curve rather than a claim that every displayed row is strictly Pareto-efficient.
+Each role also has an optional competence minimum in settings. When set, candidates with unknown competence or a score below the minimum are excluded before automatic selection. When unset, missing competence does not exclude a candidate. Competence is displayed and breaks ties after nominal throughput and worst scenario capacity shortfall. The optional competence-minimum choices show the selected policy at each available score threshold; the list is a threshold decision curve rather than a claim that every displayed row is strictly Pareto-efficient.
 
 The engine keeps the fixed weights because it has no preference observations from which to fit a robust ordinal regression family. Robust ordinal regression describes how a compatible preference family could be added when such observations exist: [Greco, Mousseau, and Słowiński (2008)](https://www.lamsade.dauphine.fr/mcda/biblio/PDF/GMS-EJOR2008.pdf). Treating competence as a constraint on an economic objective implements the epsilon-constraint method: [Mavrotas (2009)](https://www.sciencedirect.com/science/article/pii/S0096300309002574).
 
@@ -72,7 +64,7 @@ assisted completions = cycle capacity F_n
 
 Zero vendor usage leaves cycles time-limited. API tiers have unbounded vendor allowance. A ranged built-in allowance uses its midpoint for the nominal result and both endpoints in the scenario set. Direct USD vendor budgets pay vendor usage; external rescue cost is shown separately and does not consume the vendor allowance. Fixed call allowances are converted with pooled observed USD per step. A fixed USD override replaces the built-in allowance. Time and cost figures shown per cycle include the expected rescue branch; the interface separately reports agent completions, assisted completions, agent hours, and rescue hours.
 
-## Automatic competence–capacity balance
+## Automatic nominal throughput selection
 
 The engine evaluates every eligible candidate and every cap from 1 through 64 under the nominal assumptions and 66 deterministic operating scenarios formed from:
 
@@ -85,30 +77,29 @@ The engine evaluates every eligible candidate and every cap from 1 through 64 un
 
 The configured assumption distance sets the low and high stress values for runtime, cost, retry correlation, and rescue time. It is a modeling choice, not measured uncertainty or a confidence interval. The 66 scenarios are the declared finite set, not measurements, a causal model, or a guarantee over every value in a continuous uncertainty region.
 
-For policy `a`, consisting of a candidate and cap fixed before the scenario is known, and scenario `s`, proportional capacity shortfall is
+For policy `a`, consisting of an eligible candidate and retry cap from 1 through 64, the nominal result uses token-proportional reference time, the configured retry and rescue assumptions, and the midpoint of any allowance range:
 
 ```text
-best capacity(s)       = max_b autonomous capacity(b, s)
-capacity shortfall(a,s)= 1 - autonomous capacity(a,s) / best capacity(s)
-worst capacity loss(a) = max_s capacity shortfall(a,s)
-combined loss(a)       = max(competence shortfall(a), worst capacity loss(a))
-selected policy        = arg min_a combined loss(a)
+nominal tasks/week(a) = min(H / T, B / C) (1 - F_n)
+selected policy      = arg max_a nominal tasks/week(a)
 ```
 
-If a scenario's best capacity is zero, every policy has zero capacity shortfall in that scenario. Best competence and best capacity are computed separately and can be attained by different candidates. The scenario comparator `b` may choose its hindsight-best eligible candidate and cap.
+For API, cycle capacity is `H / T`. Zero vendor usage leaves capacity time-limited. The low/high band is the minimum and maximum autonomous capacity of the same policy across all 66 scenarios: two baseline time bases plus 32 joint endpoint combinations for each basis. The per-scenario list remains available.
 
-The selected policy protects competence and capacity equally in percentage terms. This equal proportional protection is a chosen decision rule, not an empirical fact. It is a discrete adaptation of proportional compromise ideas associated with bargaining solutions, not a claim that the model-selection problem is a classical bargaining problem: [European Central Bank Working Paper 1359](https://www.ecb.europa.eu/pub/pdf/scpwps/ecbwp1359.pdf). The finite-scenario worst-loss treatment follows minimax-regret decision methods for imprecise utility: [Boutilier et al. (2006)](https://www.cs.toronto.edu/~cebly/Papers/_download_/BPPS-aij06.pdf).
+An exact nominal tie prefers smaller worst-case proportional capacity shortfall across the scenarios, then higher known competence, the shorter cap, and the existing canonical display name, harness, and effort order. Unknown competence sorts below known competence at that tie-break. Per-scenario capacity shortfall is `1 - policy capacity / best eligible capacity` (zero when the best is zero). These per-scenario comparator values are displayed diagnostics; only their maximum is used to break an exact nominal tie. Competence shortfall and combined loss are not selection objectives. Competence is displayed and an optional per-seat minimum excludes unknown or insufficient competence before selection.
 
-Ties prefer the smaller combined loss, then the smaller sum of competence shortfall and worst capacity shortfall, higher nominal reference capacity, higher competence, the shorter cap, then canonical display name, harness, and effort order.
+Seat eligibility requires the reference-workload rewards, tokens, and time consumed by the capacity calculation: DeepSWE and Terminal-Bench for Implementer and Debugger, and Repository Q&A for Reviewer, Orchestrator, Sanity, and Comprehension. Missing GPQA, HLE, LCR, or intelligence index leaves any dependent competence unknown, without excluding the row unless that seat has a competence minimum. A zero or missing coding pass excludes Implementer and Debugger but does not exclude the Q&A-workload seats. No missing competence value is imputed. The pooled resource anchors also require token inputs from all three suites; missing non-workload rewards alone do not exclude a row.
+
+Rows with `(none)` effort are excluded. Claude Code configurations for GLM-5.1, GLM-5.2, and Qwen3.8 Max are excluded from subscription plans. The built-in allowance dollar values in `engine.rs` are declared modeling inputs, not vendor-published figures.
 
 ## Plan and counterfactual comparisons
 
 Plan comparisons use only the selected subscription policy at each tier. Every pair reports the actual configured monthly prices, raw competence values, and autonomous production over the same 66 scenarios. A cheaper plan is called dominant only when its price is known and it is no worse in competence or any scenario. An override without a known monthly subscription price remains price unknown; it is never treated as free or cheaper.
 
-The counterfactual report changes one input for one chosen model configuration at a time while every competitor remains unchanged. It evaluates 24 bounded, logarithmically spaced changes to agent-attempt runtime, vendor-usage cost, and configuration-specific allowance, recomputing retry caps, ideal competence and capacity points, and the full 66-scenario decision each time. When a sampled point wins, it refines the first sampled losing-to-winning bracket and returns a verified sufficient winning change. This is not proof of the globally smallest winning change because candidate, retry-cap, and ideal-point changes can make winning regions non-monotonic. If no sampled point wins, the report says no winning change was found at the sampled reductions or allowances; it does not claim that winning is impossible. These results are not measurements, causal estimates, or predictions that changing a shared vendor plan would leave competitors unchanged.
+The counterfactual report changes one input for one chosen model configuration at a time while every competitor remains unchanged. It evaluates 24 bounded, logarithmically spaced changes to agent-attempt runtime, vendor-usage cost, and configuration-specific allowance, recomputing retry caps, nominal throughput, and the full 66-scenario band and tie-break each time. When a sampled point wins, it refines the first sampled losing-to-winning bracket and returns a verified sufficient winning change. This is not proof of the globally smallest winning change because candidate, retry-cap, and scenario tie-break changes can make winning regions non-monotonic. If no sampled point wins, the report says no winning change was found at the sampled reductions or allowances; it does not claim that winning is impossible. These results are not measurements, causal estimates, or predictions that changing a shared vendor plan would leave competitors unchanged.
 
 ## Inputs
 
-DeepSWE, Terminal-Bench v2.1, and SWE-Atlas Repository Q&A outcomes are raw per-evaluation means. Missing or invalid required raw outcomes exclude the candidate. Direct cost partitions gross input tokens into uncached, cache-read, and cache-write categories, prices them separately, and anchors the weighted suite to pooled observed cost. When applicable model prices are absent, cost uses the pooled observed value. A zero-output suite uses pooled observed time. The interface labels the resource basis.
+DeepSWE, Terminal-Bench v2.1, and SWE-Atlas Repository Q&A outcomes are raw per-evaluation means. Missing or invalid reference-workload outcomes exclude the candidate from the seats that require them. Direct cost partitions gross input tokens into uncached, cache-read, and cache-write categories, prices them separately, and anchors the weighted suite to pooled observed cost. When applicable model prices are absent, cost uses the pooled observed value. A zero-output suite uses pooled observed time. The interface labels the resource basis.
 
 Matched GPQA, HLE, LCR, and intelligence-index values contribute only to competence. Artificial Analysis normalization divides canonical totals by unique task counts where task-level display values are needed. Hallucination is an optional informational indicator and does not alter competence, retries, or capacity. Missing hallucination data remains Unknown.

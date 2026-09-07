@@ -12,8 +12,8 @@ pub struct PlanComparison {
     pub right_tier: Tier,
     pub left_price: Option<f64>,
     pub right_price: Option<f64>,
-    pub left_competence: f64,
-    pub right_competence: f64,
+    pub left_competence: Option<f64>,
+    pub right_competence: Option<f64>,
     pub left_autonomous_tasks_per_week: f64,
     pub right_autonomous_tasks_per_week: f64,
     pub worst_capacity_delta: f64,
@@ -27,19 +27,8 @@ pub struct PlanComparison {
 pub struct ComparisonPick {
     pub row_index: usize,
     pub attempt_limit: usize,
-    pub competence: f64,
+    pub competence: Option<f64>,
     pub autonomous_tasks_per_week: f64,
-    pub competence_shortfall: f64,
-    pub capacity_shortfall: f64,
-    pub worst_shortfall: f64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum BindingShortfall {
-    Competence,
-    Capacity,
-    Balanced,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,7 +58,6 @@ pub struct CounterfactualReport {
     pub target_row_index: usize,
     pub baseline: Option<ComparisonPick>,
     pub target: Option<ComparisonPick>,
-    pub binding_shortfall: Option<BindingShortfall>,
     pub runtime: ImprovementThreshold,
     pub vendor_usage_cost: ImprovementThreshold,
     pub allowance: ImprovementThreshold,
@@ -137,18 +125,25 @@ pub fn plan_comparisons(table: &Table) -> Vec<PlanComparison> {
                     (left.monthly_price, right.monthly_price),
                     (Some(left_price), Some(right_price)) if same(left_price, right_price)
                 );
-                let competence_equal = same(left.competence, right.competence);
+                let competence_pair = left.competence.zip(right.competence);
+                let competence_equal = match (left.competence, right.competence) {
+                    (None, None) => true,
+                    (Some(left), Some(right)) => same(left, right),
+                    _ => false,
+                };
                 let equivalent = prices_equal && competence_equal && capacities_equal;
                 let left_dominates = matches!(
                     (left.monthly_price, right.monthly_price),
                     (Some(left_price), Some(right_price)) if left_price <= right_price
-                ) && left.competence >= right.competence
+                ) && (competence_equal
+                    || competence_pair.is_some_and(|(left, right)| left >= right))
                     && deltas.iter().all(|delta| *delta <= 0.0)
                     && (!prices_equal || !competence_equal || !capacities_equal);
                 let right_dominates = matches!(
                     (left.monthly_price, right.monthly_price),
                     (Some(left_price), Some(right_price)) if right_price <= left_price
-                ) && right.competence >= left.competence
+                ) && (competence_equal
+                    || competence_pair.is_some_and(|(left, right)| right >= left))
                     && deltas.iter().all(|delta| *delta >= 0.0)
                     && (!prices_equal || !competence_equal || !capacities_equal);
                 let dominant_tier = if left_dominates {
@@ -185,9 +180,6 @@ fn comparison_pick(pick: &Pick) -> ComparisonPick {
         attempt_limit: pick.attempt_limit,
         competence: pick.competence,
         autonomous_tasks_per_week: pick.tasks_per_week,
-        competence_shortfall: pick.competence_shortfall,
-        capacity_shortfall: pick.capacity_shortfall,
-        worst_shortfall: pick.worst_shortfall,
     }
 }
 
@@ -200,9 +192,6 @@ fn candidate_pick(pick: &Pick, row_index: usize) -> Option<ComparisonPick> {
             attempt_limit: candidate.attempt_limit,
             competence: candidate.competence,
             autonomous_tasks_per_week: candidate.tasks_per_week,
-            competence_shortfall: candidate.competence_shortfall,
-            capacity_shortfall: candidate.capacity_shortfall,
-            worst_shortfall: candidate.worst_shortfall,
         })
 }
 
@@ -360,7 +349,6 @@ pub fn compare_candidate(
         target_row_index: row_index,
         baseline: None,
         target: None,
-        binding_shortfall: None,
         runtime: threshold(ImprovementStatus::Ineligible, detail),
         vendor_usage_cost: threshold(ImprovementStatus::Ineligible, detail),
         allowance: threshold(ImprovementStatus::Ineligible, detail),
@@ -379,7 +367,6 @@ pub fn compare_candidate(
             target_row_index: row_index,
             baseline: Some(baseline),
             target: None,
-            binding_shortfall: None,
             runtime: threshold(
                 ImprovementStatus::Ineligible,
                 "Target is not eligible for this seat and tier",
@@ -393,13 +380,6 @@ pub fn compare_candidate(
                 "Target is not eligible for this seat and tier",
             ),
         };
-    };
-    let binding_shortfall = if same(target.competence_shortfall, target.capacity_shortfall) {
-        BindingShortfall::Balanced
-    } else if target.competence_shortfall > target.capacity_shortfall {
-        BindingShortfall::Competence
-    } else {
-        BindingShortfall::Capacity
     };
     let cost_not_applicable = tier == Tier::Api
         || (settings
@@ -446,7 +426,6 @@ pub fn compare_candidate(
             target_row_index: row_index,
             baseline: Some(baseline),
             target: Some(target),
-            binding_shortfall: Some(binding_shortfall),
             runtime: already_selected(),
             vendor_usage_cost: if cost_not_applicable {
                 cost_not_applicable_threshold()
@@ -469,7 +448,6 @@ pub fn compare_candidate(
         target_row_index: row_index,
         baseline: Some(baseline),
         target: Some(target),
-        binding_shortfall: Some(binding_shortfall),
         runtime: reduction_threshold(rows, settings, seat, tier, row_index, true),
         vendor_usage_cost: if cost_not_applicable {
             cost_not_applicable_threshold()
