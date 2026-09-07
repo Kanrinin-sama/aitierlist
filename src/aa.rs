@@ -13,15 +13,20 @@ use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, io::Read};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-const QNA_TOTAL_TRIALS: f64 = 372.0;
-const GPQA_TOTAL_TRIALS: f64 = 990.0;
-const HLE_TOTAL_TRIALS: f64 = 2158.0;
-const LCR_TOTAL_TRIALS: f64 = 300.0;
+const SWE_TASKS: f64 = 113.0;
+const TERMINAL_TASKS: f64 = 89.0;
+const QNA_TASKS: f64 = 124.0;
+const GPQA_TASKS: f64 = 198.0;
+const HLE_TASKS: f64 = 2158.0;
+const LCR_TASKS: f64 = 100.0;
 pub const EXCLUDED_EFFORTS: [&str; 1] = ["none"];
 const SITE: &str = "https://artificialanalysis.ai";
 
 fn number(value: &Value) -> f64 {
     value.as_f64().unwrap_or(f64::NAN)
+}
+fn finite_number(value: &Value) -> Option<f64> {
+    value.as_f64().filter(|value| value.is_finite())
 }
 fn label(value: &Value) -> &str {
     value.as_str().unwrap_or("")
@@ -50,10 +55,6 @@ pub fn median(values: impl IntoIterator<Item = f64>) -> Option<f64> {
     } else {
         Some(values[middle])
     }
-}
-
-pub fn noise(pass: f64, task_count: f64) -> f64 {
-    (pass * (1.0 - pass) / task_count).sqrt()
 }
 
 pub fn harness_key(name: &str) -> String {
@@ -152,6 +153,25 @@ pub fn vendor_key(harness: &str, model: &str) -> Option<&'static str> {
 struct ResponseBody {
     bytes: Vec<u8>,
     etag: Option<String>,
+}
+
+struct ModelMatch<'a> {
+    item: &'a Value,
+    key: String,
+    effort: Option<String>,
+    family: String,
+}
+
+fn preferred_model<'a>(items: Vec<&ModelMatch<'a>>) -> Option<&'a Value> {
+    let current: Vec<_> = items
+        .iter()
+        .copied()
+        .filter(|model| model.item["deprecated"] != true)
+        .collect();
+    let candidates = if current.is_empty() { &items } else { &current };
+    let configurations: std::collections::BTreeSet<_> =
+        candidates.iter().map(|model| &model.key).collect();
+    (configurations.len() == 1).then(|| candidates[0].item)
 }
 
 async fn fetch_response(
@@ -315,7 +335,93 @@ pub fn fetch_payloads(cached: &Value) -> Result<Value> {
     })
 }
 
-pub fn agent_row(raw: &Value) -> Option<Value> {
+fn model_prices(item: &Value, hosts: &[&Value]) -> Option<(f64, f64, f64, f64)> {
+    let price = |key: &str| {
+        item[key]
+            .as_f64()
+            .or_else(|| median(hosts.iter().map(|host| number(&host[key]))))
+            .filter(|price| price.is_finite() && *price >= 0.0)
+    };
+    let input = price("price1mInputTokens")?;
+    let output = price("price1mOutputTokens")?;
+    Some((
+        input,
+        output,
+        price("cacheHitPrice").unwrap_or(input),
+        price("cacheWritePrice").unwrap_or(input),
+    ))
+}
+
+fn model_speed(item: &Value, hosts: &[&Value]) -> Option<f64> {
+    let first_party: Vec<_> = hosts
+        .iter()
+        .copied()
+        .filter(|host| host["host"]["name"] == item["creator"]["name"])
+        .collect();
+    median(
+        if first_party.is_empty() {
+            hosts
+        } else {
+            &first_party
+        }
+        .iter()
+        .map(|host| number(&host["timescaleData"]["medianOutputSpeed"])),
+    )
+    .or_else(|| item["medianCanonicalAnswerOutputSpeed"].as_f64())
+    .filter(|speed| speed.is_finite() && *speed > 0.0)
+}
+
+fn task_metric(
+    benchmark: &str,
+    pass: f64,
+    seconds: f64,
+    usd: f64,
+    time_basis: &str,
+    cost_basis: &str,
+) -> Value {
+    json!({
+        "benchmark": benchmark,
+        "pass": pass,
+        "seconds": seconds,
+        "pooledSeconds": seconds,
+        "usd": usd,
+        "timeBasis": time_basis,
+        "costBasis": cost_basis
+    })
+}
+
+fn canonical_resources(
+    item: &Value,
+    key: &str,
+    tasks: f64,
+    prices: Option<(f64, f64, f64, f64)>,
+    speed: Option<f64>,
+) -> Option<(Option<f64>, Option<f64>)> {
+    let finite_token = |value: &Value| finite_number(value).filter(|value| *value >= 0.0);
+    let tokens = &item["canonicalEvalTokenCounts"][key];
+    let input = finite_token(&tokens["input"])?;
+    let answer = finite_token(&tokens["answer"])?;
+    let reasoning = finite_token(&tokens["reasoning"])?;
+    let cacheable = fallback(&tokens["cacheableInput"], 0.0).clamp(0.0, input);
+    let cached = if item["cacheHitRate"].is_number() {
+        cacheable * number(&item["cacheHitRate"]).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let usd = prices.map(|(input_price, output_price, cache_price, write_price)| {
+        let cache_write = cacheable - cached;
+        ((input - cacheable) * input_price
+            + cached * cache_price
+            + cache_write * write_price
+            + (answer + reasoning) * output_price)
+            / 1e6
+            / tasks
+    });
+    let seconds = speed.map(|speed| (answer + reasoning) / tasks / speed);
+    Some((seconds, usd))
+}
+
+pub fn agent_row(raw: &Value, item: Option<&Value>, hosts: &[&Value]) -> Option<Value> {
     if raw["isUnavailable"].as_bool().unwrap_or(false)
         || EXCLUDED_EFFORTS.iter().any(|effort| {
             label(&raw["displayLabel"])
@@ -345,75 +451,210 @@ pub fn agent_row(raw: &Value) -> Option<Value> {
     {
         return None;
     }
-    let implementation_mean =
-        |key: &str| (number(&swe[key]) * 113.0 + number(&term[key]) * 89.0) / 202.0;
+    if [swe, term, qna].iter().any(|evaluation| {
+        ["reward", "inputTokens", "outputTokens"]
+            .iter()
+            .any(|key| finite_number(&evaluation[key]).is_none_or(|value| value < 0.0))
+            || evaluation["cacheWriteTokens"]
+                .as_f64()
+                .is_some_and(|value| !value.is_finite() || value < 0.0)
+    }) || [
+        "costUsd",
+        "agentWallTimeSec",
+        "steps",
+        "inputTokens",
+        "outputTokens",
+        "cacheTokens",
+    ]
+    .iter()
+    .any(|key| finite_number(&mean[key]).is_none_or(|value| value < 0.0))
+        || number(&mean["agentWallTimeSec"]) <= 0.0
+        || number(&mean["inputTokens"]) <= 0.0
+        || number(&mean["outputTokens"]) <= 0.0
+        || number(&mean["steps"]) <= 0.0
+    {
+        return None;
+    }
+    let implementation_mean = |key: &str| {
+        (number(&swe[key]) * SWE_TASKS + number(&term[key]) * TERMINAL_TASKS)
+            / (SWE_TASKS + TERMINAL_TASKS)
+    };
     let pass = implementation_mean("reward");
     if pass <= 0.0 {
         return None;
     }
-    let wait = number(&mean["agentWallTimeSec"]) * implementation_mean("outputTokens")
-        / number(&mean["outputTokens"]);
-    let cost_scale = (implementation_mean("inputTokens") + implementation_mean("outputTokens"))
-        / (number(&mean["inputTokens"]) + number(&mean["outputTokens"]));
-    let read_seconds = number(&mean["agentWallTimeSec"]) * number(&qna["outputTokens"])
-        / number(&mean["outputTokens"]);
-    let read_usd = number(&mean["costUsd"])
-        * (number(&qna["inputTokens"]) + number(&qna["outputTokens"]))
-        / (number(&mean["inputTokens"]) + number(&mean["outputTokens"]));
-    let attempt_usd = number(&mean["costUsd"]) * cost_scale;
+    let pooled_seconds = number(&mean["agentWallTimeSec"]);
+    let pooled_usd = number(&mean["costUsd"]);
+    let weighted_mean_output = (number(&swe["outputTokens"]) * SWE_TASKS
+        + number(&term["outputTokens"]) * TERMINAL_TASKS
+        + number(&qna["outputTokens"]) * QNA_TASKS)
+        / (SWE_TASKS + TERMINAL_TASKS + QNA_TASKS);
+    let seconds_for = |evaluation: &Value| {
+        if weighted_mean_output > 0.0 {
+            pooled_seconds * number(&evaluation["outputTokens"]) / weighted_mean_output
+        } else {
+            pooled_seconds
+        }
+    };
+    let prices = item.and_then(|item| model_prices(item, hosts));
+    let cache_fraction =
+        (number(&mean["cacheTokens"]) / number(&mean["inputTokens"])).clamp(0.0, 1.0);
+    let write_fraction =
+        (fallback(&mean["cacheWriteTokens"], 0.0) / number(&mean["inputTokens"])).clamp(0.0, 1.0);
+    let priced = prices.is_some();
+    let token_cost = |evaluation: &Value| {
+        let (input_price, output_price, cache_price, write_price) = prices?;
+        let input = number(&evaluation["inputTokens"]);
+        let write = evaluation["cacheWriteTokens"]
+            .as_f64()
+            .unwrap_or(input * write_fraction)
+            .clamp(0.0, input);
+        let cached = (input * cache_fraction).clamp(0.0, input - write);
+        Some(
+            ((input - cached - write) * input_price
+                + cached * cache_price
+                + write * write_price
+                + number(&evaluation["outputTokens"]) * output_price)
+                / 1e6,
+        )
+    };
+    let direct_unanchored = [(swe, SWE_TASKS), (term, TERMINAL_TASKS), (qna, QNA_TASKS)]
+        .into_iter()
+        .map(|(evaluation, tasks)| token_cost(evaluation).map(|cost| cost * tasks))
+        .collect::<Option<Vec<_>>>()
+        .map(|costs| costs.into_iter().sum::<f64>() / (SWE_TASKS + TERMINAL_TASKS + QNA_TASKS));
+    let anchor = direct_unanchored
+        .filter(|cost| *cost > 0.0)
+        .map(|cost| pooled_usd / cost);
+    let cost_for = |evaluation: &Value| {
+        token_cost(evaluation)
+            .zip(anchor)
+            .map(|(cost, anchor)| cost * anchor)
+            .unwrap_or(pooled_usd)
+    };
+    let time_basis = "Pooled observed wall time allocated in proportion to task output tokens";
+    let cost_basis = if priced && anchor.is_some() {
+        "Token-price estimate anchored to pooled observed cost; cache mix transferred"
+    } else {
+        "Pooled cost; token prices unavailable"
+    };
+    let swe_seconds = seconds_for(swe);
+    let term_seconds = seconds_for(term);
+    let qna_seconds = seconds_for(qna);
+    let swe_usd = cost_for(swe);
+    let term_usd = cost_for(term);
+    let qna_usd = cost_for(qna);
+    let wait =
+        (swe_seconds * SWE_TASKS + term_seconds * TERMINAL_TASKS) / (SWE_TASKS + TERMINAL_TASKS);
+    let attempt_usd =
+        (swe_usd * SWE_TASKS + term_usd * TERMINAL_TASKS) / (SWE_TASKS + TERMINAL_TASKS);
+    let mut metrics = vec![
+        task_metric(
+            "swe",
+            number(&swe["reward"]),
+            swe_seconds,
+            swe_usd,
+            time_basis,
+            cost_basis,
+        ),
+        task_metric(
+            "terminal",
+            number(&term["reward"]),
+            term_seconds,
+            term_usd,
+            time_basis,
+            cost_basis,
+        ),
+        task_metric(
+            "qna",
+            number(&qna["reward"]),
+            qna_seconds,
+            qna_usd,
+            time_basis,
+            cost_basis,
+        ),
+    ];
+    for metric in &mut metrics {
+        metric["pooledSeconds"] = json!(pooled_seconds);
+    }
     let model_key = harness_key(label(&raw["display"]["model"]));
     let harness = label(&raw["agentName"]);
-    Some(json!({
+    let mut row = json!({
         "name":clean_label(label(&raw["displayLabel"])),"rawName":raw["displayLabel"],"model":raw["display"]["model"],"harness":harness,"modelKey":model_key,"family":family_key(harness,&model_key),"vendor":vendor_key(harness,&model_key),
         "swe":swe["reward"],"term":term["reward"],"qna":qna["reward"],"pass":pass,
-        "benches":[{"benchmark":"deep-swe","tasks":113,"attempts":3,"pass":swe["reward"]},{"benchmark":"terminal-bench-v2.1","tasks":89,"attempts":3,"pass":term["reward"]}],
-        "band":{},
-        "waitSeconds":wait,"waitSecondsBand":wait / 202.0_f64.sqrt(),"attemptUsd":attempt_usd,"attemptUsdBand":attempt_usd / 202.0_f64.sqrt(),"readSeconds":read_seconds,"readSecondsBand":read_seconds / QNA_TOTAL_TRIALS.sqrt(),"readUsd":read_usd,"readUsdBand":read_usd / QNA_TOTAL_TRIALS.sqrt(),"usdPerStep":number(&mean["costUsd"]) / number(&mean["steps"])
-    }))
+        "waitSeconds":wait,"attemptUsd":attempt_usd,"readSeconds":qna_seconds,"readUsd":qna_usd,"pooledSeconds":pooled_seconds,"usdPerStep":number(&mean["costUsd"]) / number(&mean["steps"]),"taskMetrics":metrics
+    });
+    if let Some(item) = item {
+        apply_model_quality(&mut row, item);
+    }
+    Some(row)
 }
 
 pub fn model_row(item: &Value, hosts: &[&Value]) -> Value {
-    let tokens = &item["canonicalEvalTokenCounts"]["terminalbenchV21"];
-    let price = |key: &str| {
-        item[key]
-            .as_f64()
-            .or_else(|| median(hosts.iter().map(|host| number(&host[key]))))
-    };
-    let input = price("price1mInputTokens");
-    let output = price("price1mOutputTokens");
-    let first_party: Vec<_> = hosts
-        .iter()
-        .copied()
-        .filter(|host| host["host"]["name"] == item["creator"]["name"])
-        .collect();
-    let speed = median(
-        if first_party.is_empty() {
-            hosts
-        } else {
-            &first_party
-        }
-        .iter()
-        .map(|host| number(&host["timescaleData"]["medianOutputSpeed"])),
-    )
-    .or_else(|| item["medianCanonicalAnswerOutputSpeed"].as_f64());
+    let prices = model_prices(item, hosts);
+    let speed = model_speed(item, hosts);
     let rankable = !item["deprecated"].as_bool().unwrap_or(false)
         && fallback(&item["terminalbenchV21"], 0.0) > 0.0
-        && !tokens.is_null()
+        && !item["canonicalEvalTokenCounts"]["terminalbenchV21"].is_null()
         && item["gpqa"].is_number()
         && item["hle"].is_number()
-        && input.is_some()
-        && output.is_some()
+        && prices.is_some()
         && speed.is_some_and(|speed| speed != 0.0 && !speed.is_nan());
-    let cache_price = price("cacheHitPrice");
-    let cached = if cache_price.is_some() && present(&item["cacheHitRate"]) {
-        fallback(&tokens["cacheableInput"], 0.0) * number(&item["cacheHitRate"])
-    } else {
-        0.0
-    };
-    let output_tokens = number(&tokens["answer"]) + number(&tokens["reasoning"]);
     let name = display_name(label(&item["name"]));
     let key = harness_key(label(&item["name"]));
-    let mut row = json!({"name":name,"rawName":item["name"],"model":name,"modelKey":key,"harness":"model","family":family_key("model",&key),"vendor":vendor_key("model",&key),"term":item["terminalbenchV21"],"gpqa":item["gpqa"],"hle":item["hle"],"logic":(number(&item["gpqa"])+number(&item["hle"]))/2.0,"benches":[{"benchmark":"terminal-bench-v2.1","tasks":89,"attempts":3,"pass":item["terminalbenchV21"]}],"pass":item["terminalbenchV21"],"rankable":rankable,"speed":speed,"waitSeconds":if rankable { Some(output_tokens / 89.0 / speed.unwrap()) } else { None },"waitSecondsBand":0,"attemptUsd":if rankable { Some(((number(&tokens["input"])-cached)*input.unwrap()+cached*cache_price.unwrap_or(0.0)+output_tokens*output.unwrap())/1e6/89.0) } else { None }});
+    let mut metrics = Vec::new();
+    if let Some(prices) = prices {
+        let mut terminal_proxy = None;
+        for (benchmark, score_key, token_key, tasks) in [
+            (
+                "terminal",
+                "terminalbenchV21",
+                "terminalbenchV21",
+                TERMINAL_TASKS,
+            ),
+            ("gpqa", "gpqa", "gpqa", GPQA_TASKS),
+            ("hle", "hle", "hle", HLE_TASKS),
+            ("lcr", "lcr", "lcr", LCR_TASKS),
+        ] {
+            let Some(pass) = item[score_key].as_f64() else {
+                continue;
+            };
+            if let Some((Some(seconds), Some(usd))) =
+                canonical_resources(item, token_key, tasks, Some(prices), speed)
+            {
+                if benchmark == "terminal" {
+                    terminal_proxy = Some((seconds, usd));
+                }
+                metrics.push(task_metric(
+                    benchmark,
+                    pass,
+                    seconds,
+                    usd,
+                    "Canonical output decode estimate per benchmark task",
+                    "Canonical token-price estimate per benchmark task; cache misses priced as writes",
+                ));
+            } else if let Some((seconds, usd)) = terminal_proxy {
+                metrics.push(task_metric(
+                    benchmark,
+                    pass,
+                    seconds,
+                    usd,
+                    "Terminal resource proxy; canonical tokens unavailable",
+                    "Terminal resource proxy; canonical tokens unavailable",
+                ));
+            }
+        }
+    }
+    let terminal_metric = metrics
+        .iter()
+        .find(|metric| metric["benchmark"] == "terminal");
+    let terminal_seconds = terminal_metric
+        .and_then(|metric| metric["seconds"].as_f64())
+        .unwrap_or(0.0);
+    let terminal_usd = terminal_metric
+        .and_then(|metric| metric["usd"].as_f64())
+        .unwrap_or(0.0);
+    let mut row = json!({"name":name,"rawName":item["name"],"model":name,"modelKey":key,"harness":"model","family":family_key("model",&key),"vendor":vendor_key("model",&key),"term":item["terminalbenchV21"],"gpqa":item["gpqa"],"hle":item["hle"],"logic":if item["gpqa"].is_number() && item["hle"].is_number() { Some((number(&item["gpqa"])+number(&item["hle"]))/2.0) } else { None },"pass":item["terminalbenchV21"],"rankable":rankable,"speed":speed,"waitSeconds":terminal_seconds,"attemptUsd":terminal_usd,"readSeconds":terminal_seconds,"readUsd":terminal_usd,"taskMetrics":metrics});
     row["deprecated"] = json!(item["deprecated"].as_bool().unwrap_or(false));
     apply_model_quality(&mut row, item);
     row
@@ -425,9 +666,16 @@ pub fn apply_model_quality(row: &mut Value, item: &Value) {
             .as_f64()
             .map(|value| value / 100.0)
     );
+    row["gpqa"] = item["gpqa"].clone();
+    row["hle"] = item["hle"].clone();
     row["lcr"] = item["lcr"].clone();
+    row["logic"] = json!(
+        item["gpqa"]
+            .as_f64()
+            .zip(item["hle"].as_f64())
+            .map(|(gpqa, hle)| (gpqa + hle) / 2.0)
+    );
     row["hallucination"] = item["omniscienceBreakdown"]["hallucinationRate"].clone();
-    row["band"] = json!({"index":row["index"].as_f64().map(|_|0.0),"lcr":row["lcr"].as_f64().map(|value|noise(value, LCR_TOTAL_TRIALS)),"gpqa":row["gpqa"].as_f64().map(|value|noise(value, GPQA_TOTAL_TRIALS)),"logic":(noise(number(&row["gpqa"]), GPQA_TOTAL_TRIALS)/2.0).hypot(noise(number(&row["hle"]), HLE_TOTAL_TRIALS)/2.0)});
 }
 
 fn disambiguate(rows: &mut [Value]) {
@@ -442,209 +690,6 @@ fn disambiguate(rows: &mut [Value]) {
     }
 }
 
-pub fn robust_line(xs: &[f64], ys: &[f64]) -> (f64, f64) {
-    let mut slopes = Vec::new();
-    for left in 0..xs.len() {
-        for right in left + 1..xs.len() {
-            if xs[right] != xs[left] {
-                slopes.push((ys[right] - ys[left]) / (xs[right] - xs[left]));
-            }
-        }
-    }
-    let slope = median(slopes).unwrap_or(1.0);
-    (
-        slope,
-        median(ys.iter().zip(xs).map(|(y, x)| y - slope * x)).unwrap_or(0.0),
-    )
-}
-
-pub fn apply_harness_line(agents: &mut [Value], models: &mut [Value]) {
-    let mut model_by_key: BTreeMap<&str, &Value> = BTreeMap::new();
-    for row in models.iter() {
-        model_by_key
-            .entry(label(&row["modelKey"]))
-            .and_modify(|existing| {
-                if existing["deprecated"] == true && row["deprecated"] != true {
-                    *existing = row;
-                }
-            })
-            .or_insert(row);
-    }
-    let mut model_by_family = BTreeMap::new();
-    for (key, model) in &model_by_key {
-        model_by_family
-            .entry(family_key("", key))
-            .and_modify(|entry| *entry = None)
-            .or_insert(Some(*model));
-    }
-    for row in agents.iter_mut() {
-        let key = label(&row["modelKey"]);
-        let model = model_by_key
-            .get(key)
-            .copied()
-            .or_else(|| {
-                if effort_of(key).is_none() {
-                    model_by_family.get(&family_key("", key)).copied().flatten()
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(&Value::Null);
-        for field in ["index", "lcr", "logic", "hallucination", "gpqa"] {
-            row[field] = model[field].clone();
-        }
-        for field in ["index", "lcr", "logic", "gpqa"] {
-            row["band"][field] = model["band"][field].clone();
-        }
-    }
-    let decode: BTreeMap<_, _> = models
-        .iter()
-        .filter(|row| row["rankable"] == true)
-        .map(|row| (label(&row["modelKey"]), number(&row["waitSeconds"])))
-        .collect();
-    let matched: Vec<_> = agents
-        .iter()
-        .filter(|row| decode.contains_key(label(&row["modelKey"])))
-        .collect();
-    let xs: Vec<_> = matched
-        .iter()
-        .map(|row| decode[label(&row["modelKey"])])
-        .collect();
-    let ys: Vec<_> = matched
-        .iter()
-        .map(|row| number(&row["waitSeconds"]))
-        .collect();
-    let (slope, intercept) = robust_line(&xs, &ys);
-    let predict = |value: f64| slope * value + intercept;
-    let mut ratios: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
-    for row in &matched {
-        ratios
-            .entry(label(&row["harness"]))
-            .or_default()
-            .push(number(&row["waitSeconds"]) / predict(decode[label(&row["modelKey"])]));
-    }
-    let mut measured: BTreeMap<String, Vec<f64>> = BTreeMap::new();
-    for row in &matched {
-        measured
-            .entry(label(&row["modelKey"]).to_owned())
-            .or_default()
-            .push(
-                number(&row["waitSeconds"])
-                    / median(ratios[label(&row["harness"])].iter().copied()).unwrap_or(f64::NAN),
-            );
-    }
-    let residual = median(xs.iter().zip(&ys).map(|(x, y)| (y - predict(*x)).abs())).unwrap_or(0.0);
-    for row in models.iter_mut().filter(|row| row["rankable"] == true) {
-        let measurement = measured
-            .get(label(&row["modelKey"]))
-            .and_then(|values| median(values.iter().copied()));
-        row["waitSeconds"] = json!(measurement.unwrap_or_else(|| {
-            number(&row["waitSeconds"]).max(predict(number(&row["waitSeconds"])))
-        }));
-        row["waitSecondsBand"] = json!(if measurement.is_some() { 0.0 } else { residual });
-    }
-}
-
-pub fn shrink_values(rows: &mut [Value], path: &str, task_count: f64) {
-    let passes: Vec<_> = rows
-        .iter()
-        .filter(|row| row["rankable"] != false)
-        .filter_map(|row| row.pointer(path).and_then(Value::as_f64))
-        .collect();
-    if passes.is_empty() {
-        return;
-    }
-    let mean = passes.iter().sum::<f64>() / passes.len() as f64;
-    let variance =
-        passes.iter().map(|pass| (pass - mean).powi(2)).sum::<f64>() / passes.len() as f64;
-    let noise_variance = passes
-        .iter()
-        .map(|pass| pass * (1.0 - pass) / task_count)
-        .sum::<f64>()
-        / passes.len() as f64;
-    let true_variance = (variance - noise_variance).max(1e-9);
-    let prior_weight = (mean * (1.0 - mean) / true_variance - 1.0).max(0.0);
-    for row in rows {
-        if let Some(value) = row.pointer_mut(path).filter(|value| value.is_number()) {
-            let pass = number(value);
-            let shrunk = (task_count * pass + prior_weight * mean) / (task_count + prior_weight);
-            let adjustment = shrunk - pass;
-            *value =
-                json!(pass + adjustment.signum() * adjustment.abs().min(noise(pass, task_count)));
-        }
-    }
-}
-
-pub fn shrink_quality_fields(rows: &mut [Value]) {
-    if rows.is_empty() {
-        return;
-    }
-    let benches = array(&rows[0]["benches"]).to_vec();
-    for (index, bench) in benches.iter().enumerate() {
-        shrink_values(
-            rows,
-            &format!("/benches/{index}/pass"),
-            number(&bench["tasks"]) * number(&bench["attempts"]),
-        );
-    }
-    for row in rows.iter_mut() {
-        let total: f64 = array(&row["benches"])
-            .iter()
-            .map(|bench| number(&bench["tasks"]))
-            .sum();
-        row["pass"] = json!(
-            array(&row["benches"])
-                .iter()
-                .map(|bench| number(&bench["tasks"]) / total * number(&bench["pass"]))
-                .sum::<f64>()
-        );
-        let measurement: f64 = array(&row["benches"])
-            .iter()
-            .map(|bench| {
-                (number(&bench["tasks"]) / total).powi(2)
-                    * number(&bench["pass"])
-                    * (1.0 - number(&bench["pass"]))
-                    / (number(&bench["tasks"]) * number(&bench["attempts"]))
-            })
-            .sum();
-        row["band"]["pass"] = json!(measurement.sqrt());
-    }
-    for (field, tasks) in [
-        ("qna", QNA_TOTAL_TRIALS),
-        ("gpqa", GPQA_TOTAL_TRIALS),
-        ("hle", HLE_TOTAL_TRIALS),
-    ] {
-        if field == "qna" || rows[0]["harness"] == "model" {
-            shrink_values(rows, &format!("/{field}"), tasks);
-        }
-    }
-    for row in rows {
-        let has_logic = row["gpqa"].is_number() && row["hle"].is_number();
-        if has_logic {
-            row["logic"] = json!((number(&row["gpqa"]) + number(&row["hle"])) / 2.0);
-        }
-        let qna_band = row["qna"].as_f64().map(|qna| noise(qna, QNA_TOTAL_TRIALS));
-        let lcr_band = row["lcr"].as_f64().map(|lcr| noise(lcr, LCR_TOTAL_TRIALS));
-        let logic_band = if has_logic {
-            Some(
-                (noise(number(&row["gpqa"]), GPQA_TOTAL_TRIALS) / 2.0)
-                    .hypot(noise(number(&row["hle"]), HLE_TOTAL_TRIALS) / 2.0),
-            )
-        } else {
-            row["band"]["logic"].as_f64()
-        };
-        row["band"]["index"] = json!(row["index"].as_f64().map(|_| 0.0));
-        row["band"]["lcr"] = json!(lcr_band);
-        row["band"]["logic"] = json!(logic_band);
-        row["band"]["sanityQuality"] = json!(qna_band);
-        row["band"]["gpqa"] = json!(
-            row["gpqa"]
-                .as_f64()
-                .map(|gpqa| noise(gpqa, GPQA_TOTAL_TRIALS))
-        );
-    }
-}
-
 pub fn rows_from_payloads(payloads: &Value) -> Result<Vec<Row>> {
     let agents = payloads["agents"]
         .as_array()
@@ -655,7 +700,60 @@ pub fn rows_from_payloads(payloads: &Value) -> Result<Vec<Row>> {
     let catalog = payloads["catalog"]
         .as_array()
         .context("missing model catalog")?;
-    let mut agents: Vec<_> = agents.iter().filter_map(agent_row).collect();
+    let model_matches: Vec<_> = evaluation
+        .iter()
+        .map(|item| {
+            let key = harness_key(label(&item["name"]));
+            ModelMatch {
+                effort: effort_of(&key),
+                family: family_key("", &key),
+                key,
+                item,
+            }
+        })
+        .collect();
+    let mut agents: Vec<_> = agents
+        .iter()
+        .filter_map(|raw| {
+            let slug = label(&raw["hostModelSlug"])
+                .split_once('_')
+                .map(|(_, slug)| slug)
+                .unwrap_or("");
+            let model_key = harness_key(label(&raw["display"]["model"]));
+            let exact = model_matches
+                .iter()
+                .filter(|model| model.key == model_key)
+                .collect();
+            let effort = effort_of(&model_key);
+            let compatible_slug = model_matches
+                .iter()
+                .filter(|model| label(&model.item["slug"]) == slug)
+                .filter(|model| model.effort.as_deref() == effort.as_deref())
+                .collect();
+            let family = if effort.is_none() {
+                let family = family_key("", &model_key);
+                let candidates: Vec<_> = model_matches
+                    .iter()
+                    .filter(|model| model.family == family && model.item["deprecated"] != true)
+                    .collect();
+                preferred_model(candidates)
+            } else {
+                None
+            };
+            let item = preferred_model(exact)
+                .or_else(|| preferred_model(compatible_slug))
+                .or(family);
+            let hosts: Vec<_> = item
+                .map(|item| {
+                    catalog
+                        .iter()
+                        .filter(|host| host["modelSlug"] == item["slug"])
+                        .collect()
+                })
+                .unwrap_or_default();
+            agent_row(raw, item, &hosts)
+        })
+        .collect();
     let mut models: Vec<_> = evaluation
         .iter()
         .map(|item| {
@@ -670,10 +768,7 @@ pub fn rows_from_payloads(payloads: &Value) -> Result<Vec<Row>> {
         .collect();
     disambiguate(&mut agents);
     disambiguate(&mut models);
-    shrink_quality_fields(&mut models);
-    apply_harness_line(&mut agents, &mut models);
     models.retain(|row| row["rankable"] == true);
-    shrink_quality_fields(&mut agents);
     agents.extend(models);
     agents
         .into_iter()

@@ -1,6 +1,9 @@
 fn main() {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
     let manifest_path = std::path::Path::new(&manifest_dir);
+    let icon_path = manifest_path.join("assets").join("aitierlist.ico");
+
+    println!("cargo:rerun-if-changed={}", icon_path.display());
 
     let commit = git_rev(manifest_path, "HEAD");
     let tree = git_rev(manifest_path, "HEAD^{tree}");
@@ -47,6 +50,13 @@ fn main() {
     }
 
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        #[cfg(windows)]
+        {
+            winresource::WindowsResource::new()
+                .set_icon(icon_path.to_string_lossy().as_ref())
+                .compile()
+                .expect("failed to embed the Windows application icon");
+        }
         println!("cargo:rustc-link-arg-bins=/DEPENDENTLOADFLAG:0x800");
     }
 }

@@ -3,7 +3,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+use crate::types::Seat;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PlanPrices {
     pub t200: f64,
@@ -21,7 +23,7 @@ impl Default for PlanPrices {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub escalation_minutes: f64,
@@ -29,6 +31,8 @@ pub struct Settings {
     pub rho: f64,
     pub agent_hours: f64,
     pub draws: u32,
+    pub assumption_span_pct: f64,
+    pub competence_floors: BTreeMap<String, Option<f64>>,
     pub plan_prices: PlanPrices,
     pub vendor_overrides: BTreeMap<String, Option<f64>>,
     pub cache_hours: u32,
@@ -57,17 +61,67 @@ impl Default for Settings {
         for vendor in known_vendors {
             vendor_overrides.insert(vendor.to_string(), None);
         }
+        let competence_floors = Seat::ALL
+            .into_iter()
+            .map(|seat| (seat.name().to_string(), None))
+            .collect();
         Self {
             escalation_minutes: 60.0,
             escalation_usd: 0.0,
             rho: 0.653,
             agent_hours: 56.0,
             draws: 4000,
+            assumption_span_pct: 25.0,
+            competence_floors,
             plan_prices: PlanPrices::default(),
             vendor_overrides,
             cache_hours: 1,
             show_hallucination: false,
         }
+    }
+}
+
+impl Settings {
+    pub fn normalize(mut self) -> Self {
+        let defaults = Self::default();
+        let finite = |value: f64, fallback: f64| {
+            if value.is_finite() { value } else { fallback }
+        };
+        self.escalation_minutes =
+            finite(self.escalation_minutes, defaults.escalation_minutes).clamp(0.0, 10080.0);
+        self.escalation_usd =
+            finite(self.escalation_usd, defaults.escalation_usd).clamp(0.0, 1_000_000.0);
+        self.rho = finite(self.rho, defaults.rho).clamp(0.0, 0.999);
+        self.agent_hours = finite(self.agent_hours, defaults.agent_hours).clamp(1.0, 1680.0);
+        self.draws = self.draws.clamp(1, 20000);
+        self.assumption_span_pct =
+            finite(self.assumption_span_pct, defaults.assumption_span_pct).clamp(0.0, 90.0);
+        for seat in Seat::ALL {
+            let floor = self
+                .competence_floors
+                .entry(seat.name().to_string())
+                .or_insert(None);
+            if let Some(value) = floor {
+                *floor = if value.is_finite() {
+                    Some(value.clamp(0.0, 1.0))
+                } else {
+                    None
+                };
+            }
+        }
+        self.plan_prices.t200 =
+            finite(self.plan_prices.t200, defaults.plan_prices.t200).clamp(1.0, 1000.0);
+        self.plan_prices.t100 =
+            finite(self.plan_prices.t100, defaults.plan_prices.t100).clamp(1.0, 1000.0);
+        self.plan_prices.t20 =
+            finite(self.plan_prices.t20, defaults.plan_prices.t20).clamp(1.0, 1000.0);
+        self.cache_hours = self.cache_hours.clamp(1, 48);
+        for allowance in self.vendor_overrides.values_mut() {
+            if allowance.is_some_and(|value| !value.is_finite() || value < 0.0) {
+                *allowance = None;
+            }
+        }
+        self
     }
 }
 
@@ -97,7 +151,7 @@ pub fn load_settings() -> Settings {
                 for vendor in Settings::default().vendor_overrides.into_keys() {
                     settings.vendor_overrides.entry(vendor).or_insert(None);
                 }
-                return settings;
+                return settings.normalize();
             }
             let mut settings = Settings::default();
             if let Some(v) = value.get("escalation_minutes").cloned()
@@ -124,6 +178,16 @@ pub fn load_settings() -> Settings {
                 && let Ok(val) = serde_json::from_value(v)
             {
                 settings.draws = val;
+            }
+            if let Some(v) = value.get("assumption_span_pct").cloned()
+                && let Ok(val) = serde_json::from_value(v)
+            {
+                settings.assumption_span_pct = val;
+            }
+            if let Some(v) = value.get("competence_floors").cloned()
+                && let Ok(val) = serde_json::from_value(v)
+            {
+                settings.competence_floors = val;
             }
             if let Some(v) = value.get("plan_prices").cloned() {
                 if let Ok(val) = serde_json::from_value(v.clone()) {
@@ -164,7 +228,7 @@ pub fn load_settings() -> Settings {
             {
                 settings.show_hallucination = val;
             }
-            settings
+            settings.normalize()
         }
         Err(_) => Settings::default(),
     }

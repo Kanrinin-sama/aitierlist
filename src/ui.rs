@@ -7,6 +7,14 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const REFRESH_COOLDOWN_SECONDS: u64 = 16;
 
+type ComparisonResponse = (
+    u64,
+    Seat,
+    Tier,
+    usize,
+    crate::comparison::CounterfactualReport,
+);
+
 pub struct App {
     table: Table,
     panel_widths: std::collections::HashMap<(Seat, Tier), f32>,
@@ -15,7 +23,8 @@ pub struct App {
     refresh_in_flight: bool,
     retry_after: Option<Instant>,
     refresh_warning: String,
-    table_rx: Receiver<(Table, bool)>,
+    table_rx: Receiver<(Table, bool, Settings)>,
+    scored_settings: Option<Settings>,
     settings_tx: Sender<(Settings, bool)>,
     engine_error_rx: Receiver<String>,
     engine_status: String,
@@ -30,6 +39,12 @@ pub struct App {
     available_update: Option<crate::update::Available>,
     staged_update: Option<crate::update::StagedUpdate>,
     install_rx: Option<Receiver<(String, Option<crate::update::StagedUpdate>)>>,
+    comparison_choice: std::collections::HashMap<(Seat, Tier), usize>,
+    comparison_generation: u64,
+    comparison_pending: Option<(u64, Seat, Tier, usize)>,
+    comparison_result: Option<ComparisonResponse>,
+    comparison_tx: Sender<ComparisonResponse>,
+    comparison_rx: Receiver<ComparisonResponse>,
 }
 
 impl App {
@@ -38,6 +53,7 @@ impl App {
         let settings = load_settings();
         let table = Table::empty();
         let (settings_tx, settings_rx) = channel::<(Settings, bool)>();
+        let (comparison_tx, comparison_rx) = channel();
         let (engine_error_tx, engine_error_rx) = channel();
         let context = cc.egui_ctx.clone();
         std::thread::spawn(move || {
@@ -72,7 +88,10 @@ impl App {
                 if let Some((rows, state, fetched)) = &loaded {
                     let table =
                         crate::engine::score(rows.clone(), &settings, *state, fetched.clone());
-                    if table_tx.send((table, fetched_rows)).is_err() {
+                    if table_tx
+                        .send((table, fetched_rows, settings.clone()))
+                        .is_err()
+                    {
                         break;
                     }
                     context.request_repaint();
@@ -90,6 +109,7 @@ impl App {
             retry_after: None,
             refresh_warning: String::new(),
             table_rx,
+            scored_settings: None,
             settings_tx,
             engine_error_rx,
             engine_status: "Loading rows…".to_string(),
@@ -111,6 +131,12 @@ impl App {
             available_update: None,
             staged_update: None,
             install_rx: None,
+            comparison_choice: std::collections::HashMap::new(),
+            comparison_generation: 0,
+            comparison_pending: None,
+            comparison_result: None,
+            comparison_tx,
+            comparison_rx,
         };
 
         if crate::update::due_for_check() {
@@ -121,127 +147,282 @@ impl App {
         app
     }
 
-    fn detail_content(&self, ui: &mut egui::Ui, seat: Seat, tier: Tier) {
+    fn frontier_content(&self, ui: &mut egui::Ui, seat: Seat, tier: Tier) -> Option<f64> {
+        let mut selected_floor = None;
+        let frontier = self
+            .table
+            .frontiers
+            .iter()
+            .find(|frontier| frontier.seat == seat && frontier.tier == tier);
+        ui.add_space(10.0);
+        egui::CollapsingHeader::new("Optional competence minimums")
+            .default_open(false)
+            .show(ui, |ui| {
+        ui.label("Add a hard qualification requirement only when the seat needs one. The automatic pick already balances competence and capacity.");
+        if let Some(frontier) = frontier {
+            egui::ScrollArea::both()
+                .id_salt(("frontier_scroll", seat, tier))
+                .max_height(280.0)
+                .show(ui, |ui| {
+                    egui::Grid::new(("frontier_grid", seat, tier))
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for heading in [
+                                "", "Minimum", "Agent", "Score", "MAX", "Agent/wk", "Range",
+                                "Quality loss", "Capacity loss", "Worst loss",
+                            ] {
+                                ui.strong(heading);
+                            }
+                            ui.end_row();
+                            for point in &frontier.points {
+                                let name = self
+                                    .table
+                                    .rows
+                                    .get(point.row_index)
+                                    .map(|row| row.display_name())
+                                    .unwrap_or_else(|| format!("Row #{}", point.row_index));
+                                if ui.button("Use minimum").clicked() {
+                                    selected_floor = Some(point.competence_floor);
+                                }
+                                ui.label(format!("{:.3}", point.competence_floor));
+                                ui.add_sized(
+                                    [190.0, ui.spacing().interact_size.y],
+                                    egui::Label::new(name).wrap(),
+                                );
+                                ui.label(format!("{:.3}", point.competence));
+                                ui.label(point.attempt_limit.to_string());
+                                ui.label(format!("{:.1}", point.tasks_per_week));
+                                ui.label(format!("{:.1}–{:.1}", point.tasks_low, point.tasks_high));
+                                ui.label(format!(
+                                    "{:.1}%",
+                                    point.competence_shortfall * 100.0
+                                ));
+                                ui.label(format!("{:.1}%", point.capacity_shortfall * 100.0));
+                                ui.label(format!("{:.1}%", point.worst_shortfall * 100.0));
+                                ui.end_row();
+                            }
+                        });
+                });
+            egui::CollapsingHeader::new(format!(
+                "Excluded candidates ({})",
+                frontier.excluded.len()
+            ))
+            .default_open(false)
+            .show(ui, |ui| {
+                for excluded in &frontier.excluded {
+                    let name = self
+                        .table
+                        .rows
+                        .get(excluded.row_index)
+                        .map(|row| row.display_name())
+                        .unwrap_or_else(|| format!("Row #{}", excluded.row_index));
+                    ui.label(format!("{name}: {}", excluded.reason));
+                }
+            });
+        } else {
+            ui.label("No competence–capacity choices are available.");
+        }
+            });
+        selected_floor
+    }
+
+    fn detail_content(&self, ui: &mut egui::Ui, seat: Seat, tier: Tier) -> Option<f64> {
+        let selected_floor;
         if let Some(pick) = self.table.get_pick(seat, tier) {
             let selected_row = self.table.rows.get(pick.row_index);
 
-            ui.heading("Top pick");
-            if let Some(r) = selected_row {
-                ui.label(egui::RichText::new(r.display_name()).strong().size(15.0));
-                ui.label(format!("Vendor: {} | Harness: {}", r.vendor, r.harness));
+            ui.heading("Selected policy");
+            if let Some(row) = selected_row {
+                ui.label(egui::RichText::new(row.display_name()).strong().size(15.0));
+                ui.label(format!("Vendor: {} | Harness: {}", row.vendor, row.harness));
             }
             ui.add_space(4.0);
+            ui.label(format!("Role competence: {:.3} of {:.3} best available", pick.competence, pick.best_competence)).on_hover_text(
+                "Fixed role-weighted benchmark utility on a 0–1 scale. It contributes to automatic selection and any optional minimum; it is not a retry success probability.",
+            );
+            if let Some(floor) = pick.competence_floor {
+                ui.label(format!("Required competence minimum: {floor:.3}"));
+            } else {
+                ui.label("Automatic competence–capacity balance");
+            }
             ui.label(format!(
-                "Leads simulations: {:.1}% | Family leads simulations: {:.1}% (N={})",
-                pick.win_rate * 100.0,
-                pick.family_win_rate * 100.0,
-                pick.n
+                "Worst proportional loss: {:.1}%",
+                pick.worst_shortfall * 100.0
+            ));
+            ui.label(format!(
+                "Competence retained: {:.1}% · worst-case capacity retained: {:.1}%",
+                (1.0 - pick.competence_shortfall) * 100.0,
+                (1.0 - pick.capacity_shortfall) * 100.0,
+            ));
+            ui.label(format!(
+                "Estimated {:.2} min/cycle | ${:.2}/cycle total",
+                pick.minutes_per_task, pick.cost_per_task,
+            ));
+            ui.label(format!(
+                "Per-cycle cost: ${:.2} vendor usage + ${:.2} external rescue",
+                pick.model_cost_per_task, pick.escalation_cost_per_task,
+            ));
+            ui.label(format!(
+                "MAX {} attempts/cycle | Estimated rescue share: {:.1}%",
+                pick.attempt_limit,
+                pick.escalation_rate * 100.0,
             ))
             .on_hover_text(
-                "How often this configuration, or its harness/model family, leads the simulation samples. This measures uncertainty under the model assumptions; it is not a task success rate or the ranking objective. N is the number of eligible configurations in the same harness/model family.",
+                "One attempt cap applies to every task type in this role. Attempts stop on success. Tasks still unfinished at the cap use the configured escalation time and cost.",
             );
             ui.label(format!(
-                "Speed: {:.2} min/task | Cost: ${:.2}/task",
-                pick.minutes_per_task, pick.cost_per_task
+                "Agent completions: {:.1}/week (scenario range {:.1}–{:.1})",
+                pick.tasks_per_week, pick.tasks_low, pick.tasks_high,
+            )).on_hover_text(
+                "Reference tasks completed by the agent before the retry cap. Assisted completions are reported separately and never credited to the agent.",
+            );
+            ui.label(format!(
+                "Assisted completions: {:.1}/week · rescue work: {:.1} hours/week",
+                pick.assisted_tasks_per_week, pick.escalation_hours_per_week,
             ));
             ui.label(format!(
-                "Estimated completed tasks/week: {:.1}",
-                pick.tasks_per_week
+                "Workflow time: {:.1} agent hours + {:.1} rescue hours/week across {:.1} cycles",
+                pick.agent_hours_per_week, pick.escalation_hours_per_week, pick.cycles_per_week,
             ));
-            if let Some(s) = pick.streams_star {
-                ui.label(format!("Capacity multiple: {:.2}x", s)).on_hover_text(
+            if let Some(capacity) = pick.streams_star {
+                ui.label(format!("Capacity multiple: {:.2}x", capacity)).on_hover_text(
                     "How many times the current weekly workload the estimated plan allowance can fund.",
                 );
             }
+            selected_floor = self.frontier_content(ui, seat, tier);
 
             ui.add_space(10.0);
-            ui.heading("Quality details");
-            if let Some(r) = selected_row {
-                egui::Grid::new("quality_grid")
+            ui.heading("Role competence and reference workload");
+            ui.add(egui::Label::new(
+                "Role competence and operating capacity are separate. The competence profile expresses the seat's capability judgment. Retry success, time, and cost come only from the reference workload.",
+            ).wrap());
+            if let Some(row) = selected_row {
+                ui.label(format!("Fixed role competence: {:.3}", pick.competence));
+                if let Some(components) = crate::engine::competence_components(row, seat) {
+                    egui::Grid::new(("competence_grid", seat, tier))
+                        .striped(true)
+                        .show(ui, |ui| {
+                            ui.strong("Capability");
+                            ui.strong("Score");
+                            ui.strong("Fixed weight");
+                            ui.end_row();
+                            for (name, score, weight) in components {
+                                ui.label(name);
+                                ui.label(format!("{score:.3}"));
+                                ui.label(format!("{:.1}%", weight * 100.0));
+                                ui.end_row();
+                            }
+                        });
+                }
+                ui.add_space(6.0);
+                ui.label(format!(
+                    "Reference workload inputs: {}",
+                    crate::engine::reference_workload_name(seat)
+                ));
+                egui::Grid::new(("workload_grid", seat, tier))
                     .striped(true)
                     .show(ui, |ui| {
-                        ui.strong("Metric");
-                        ui.strong("Value");
+                        ui.strong("Task component");
+                        ui.strong("Reference weight");
+                        ui.strong("Pass");
+                        ui.strong("Time/attempt");
+                        ui.strong("Cost/attempt");
                         ui.end_row();
-
-                        ui.label("Intelligence index").on_hover_text(
-                            "A normalized intelligence index, not a calibrated task success rate.",
-                        );
-                        ui.label(
-                            r.smart
-                                .map(|v| format!("{:.1}", v * 100.0))
-                                .unwrap_or_else(|| "-".into()),
-                        );
-                        ui.end_row();
-
-                        ui.label("Reasoning score").on_hover_text(
-                            "A combined score from the GPQA and Humanity's Last Exam benchmarks.",
-                        );
-                        ui.label(
-                            r.logic
-                                .map(|v| format!("{:.1}%", v * 100.0))
-                                .unwrap_or_else(|| "-".into()),
-                        );
-                        ui.end_row();
-
-                        ui.label("Software engineering (SWE)")
-                            .on_hover_text("Performance on a software engineering benchmark.");
-                        ui.label(
-                            r.swe
-                                .map(|v| format!("{:.1}%", v * 100.0))
-                                .unwrap_or_else(|| "-".into()),
-                        );
-                        ui.end_row();
-
-                        ui.label("Codebase questions (QnA)")
-                            .on_hover_text("Performance on questions about a codebase.");
-                        ui.label(
-                            r.qna
-                                .map(|v| format!("{:.1}%", v * 100.0))
-                                .unwrap_or_else(|| "-".into()),
-                        );
-                        ui.end_row();
-
-                        ui.label("Long-context reasoning (LCR)")
-                            .on_hover_text("Performance on long-context reasoning tasks.");
-                        ui.label(
-                            r.lcr
-                                .map(|v| format!("{:.1}%", v * 100.0))
-                                .unwrap_or_else(|| "-".into()),
-                        );
-                        ui.end_row();
-
-                        if self.settings.show_hallucination || r.halluc.is_some() {
-                            ui.label("Hallucination");
-                            ui.label(
-                                r.halluc
-                                    .map(|v| format!("{:.1}%", v * 100.0))
-                                    .unwrap_or_else(|| "-".into()),
+                        for (benchmark, weight) in crate::engine::reference_workload(seat) {
+                            let metric = row
+                                .task_metrics
+                                .iter()
+                                .find(|metric| metric.benchmark == *benchmark);
+                            ui.add_sized(
+                                [88.0, ui.spacing().interact_size.y],
+                                egui::Label::new(benchmark.name()).wrap(),
                             );
+                            ui.label(format!("{:.1}%", weight * 100.0));
+                            ui.label(
+                                metric
+                                    .map(|metric| format!("{:.1}%", metric.pass * 100.0))
+                                    .unwrap_or_else(|| "Unknown".into()),
+                            );
+                            let time = ui.label(
+                                metric
+                                    .map(|metric| format!("{:.2} min", metric.seconds / 60.0))
+                                    .unwrap_or_else(|| "Unknown".into()),
+                            );
+                            if let Some(metric) = metric {
+                                time.on_hover_text(&metric.time_basis);
+                            }
+                            let cost = ui.label(
+                                metric
+                                    .map(|metric| format!("${:.3}", metric.usd))
+                                    .unwrap_or_else(|| "Unknown".into()),
+                            );
+                            if let Some(metric) = metric {
+                                cost.on_hover_text(&metric.cost_basis);
+                            }
                             ui.end_row();
                         }
-
-                        ui.label("Wait Seconds");
-                        ui.label(format!("{:.1}s", r.wait_seconds));
-                        ui.end_row();
-
-                        ui.label("Read Seconds");
-                        ui.label(format!("{:.1}s", r.read_seconds));
-                        ui.end_row();
-
-                        ui.label("Attempt USD");
-                        ui.label(format!("${:.3}", r.attempt_usd));
-                        ui.end_row();
-
-                        ui.label("Read USD");
-                        ui.label(format!("${:.3}", r.read_usd));
-                        ui.end_row();
                     });
+
+                ui.label(format!(
+                    "Intelligence index: {}",
+                    row.smart
+                        .map(|value| format!("{:.1} points", value * 100.0))
+                        .unwrap_or_else(|| "Unknown".into()),
+                ))
+                .on_hover_text(
+                    "Normalized intelligence index; contributes half of Orchestrator competence. It is not a success probability.",
+                );
+
+                if self.settings.show_hallucination {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Hallucination reliability indicator:");
+                        ui.label(
+                            row.halluc
+                                .map(|value| format!("{:.1}%", value * 100.0))
+                                .unwrap_or_else(|| "Unknown".into()),
+                        );
+                    });
+                    ui.add(egui::Label::new(
+                        "This optional source indicator is informational. It is not used as a retry-transition probability, and missing data is not treated as perfect reliability.",
+                    ).wrap());
+                }
             }
 
             ui.add_space(10.0);
-            ui.heading(format!("Top-{} candidates", pick.top.len().min(4)));
-            ui.label("Ordered by estimated completed tasks/week.");
+            ui.heading("Declared capacity scenarios");
+            ui.add(egui::Label::new(format!(
+                "The engine evaluates joint corners at the configured {:.1}% stress distance, allowance endpoints, and both resource-time bases. This finite scenario set is assumed rather than measured. The selected candidate and retry cap stay fixed; each scenario comparator may use its own hindsight-best cap.",
+                self.settings.assumption_span_pct,
+            )).wrap());
+            egui::CollapsingHeader::new(format!("Scenarios ({})", pick.scenarios.len()))
+                .default_open(false)
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt(("scenario_scroll", seat, tier))
+                        .max_height(260.0)
+                        .show(ui, |ui| {
+                        for scenario in &pick.scenarios {
+                            let leader = self.table.rows.get(scenario.row_index)
+                                .map(|row| row.display_name())
+                                .unwrap_or_else(|| format!("Row #{}", scenario.row_index));
+                            ui.label(format!(
+                                "{}: autonomous-capacity leader {} MAX {} at {:.1}; selected policy {:.1} agent completions/week ({:.1}% shortfall)",
+                                scenario.name,
+                                leader,
+                                scenario.attempt_limit,
+                                scenario.tasks_per_week,
+                                scenario.selected_tasks_per_week,
+                                scenario.capacity_shortfall * 100.0,
+                            ));
+                        }
+                    });
+                });
+
+            ui.add_space(10.0);
+            ui.heading(format!("Top-{} robust policies", pick.top.len().min(4)));
+            ui.label(
+                "Ordered by automatic worst proportional loss across competence and capacity.",
+            );
             for (idx, cand) in pick.top.iter().take(4).enumerate() {
                 ui.group(|ui| {
                     let cand_row = self.table.rows.get(cand.row_index);
@@ -250,14 +431,21 @@ impl App {
                         .unwrap_or_else(|| format!("Row #{}", cand.row_index));
                     ui.strong(format!("#{}: {}", idx + 1, name));
                     ui.label(format!(
-                        "Leads simulations: {:.1}% | Family leads: {:.1}% | N: {}",
-                        cand.win_rate * 100.0,
-                        cand.family_win_rate * 100.0,
-                        cand.n
+                        "Competence {:.3}/{:.3} ({:.1}% loss) | Capacity loss {:.1}% | Worst loss {:.1}%",
+                        cand.competence,
+                        cand.best_competence,
+                        cand.competence_shortfall * 100.0,
+                        cand.capacity_shortfall * 100.0,
+                        cand.worst_shortfall * 100.0,
                     ));
                     ui.label(format!(
-                        "{:.1} tasks/wk | {:.2} min/task | ${:.2}/task",
-                        cand.tasks_per_week, cand.minutes_per_task, cand.cost_per_task
+                        "{:.1} agent completions/wk ({:.1}–{:.1}) | {:.2} min/cycle | ${:.2}/cycle | MAX {} attempts",
+                        cand.tasks_per_week,
+                        cand.tasks_low,
+                        cand.tasks_high,
+                        cand.minutes_per_task,
+                        cand.cost_per_task,
+                        cand.attempt_limit,
                     ));
                     ui.label(format!(
                         "Capacity multiple: {}",
@@ -265,34 +453,144 @@ impl App {
                             .map(|s| format!("{:.2}x", s))
                             .unwrap_or_else(|| "-".into())
                     ));
-                    if let Some(cr) = cand_row {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.small(format!(
-                                "Index: {} | SWE: {} | QnA: {}",
-                                cr.smart
-                                    .map(|v| format!("{:.1}", v * 100.0))
-                                    .unwrap_or_else(|| "-".into()),
-                                cr.swe
-                                    .map(|v| format!("{:.1}%", v * 100.0))
-                                    .unwrap_or_else(|| "-".into()),
-                                cr.qna
-                                    .map(|v| format!("{:.1}%", v * 100.0))
-                                    .unwrap_or_else(|| "-".into()),
+                    ui.label(format!(
+                        "${:.2} vendor usage/cycle + ${:.2} rescue cost/cycle | rescue {:.1}%",
+                        cand.model_cost_per_task,
+                        cand.escalation_cost_per_task,
+                        cand.escalation_rate * 100.0,
+                    ));
+                });
+            }
+        } else {
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                "No candidate meets the configured competence minimum for this seat and tier.",
+            );
+            selected_floor = self.frontier_content(ui, seat, tier);
+        }
+
+        ui.add_space(10.0);
+        ui.heading("Source & Timestamps");
+        ui.label("Source: Artificial Analysis");
+        ui.label(format!("Source Fetched: {}", self.table.source_fetched_at));
+        ui.label(format!("Generated At: {}", self.table.generated_at));
+        ui.label(format!("Cache State: {}", self.table.cache_state.name()));
+        selected_floor
+    }
+
+    fn counterfactual_content(&mut self, ui: &mut egui::Ui, seat: Seat, tier: Tier) {
+        let Some(pick) = self.table.get_pick(seat, tier) else {
+            return;
+        };
+        let mut alternatives = Vec::new();
+        for candidate in &pick.top {
+            if candidate.row_index != pick.row_index && !alternatives.contains(&candidate.row_index)
+            {
+                alternatives.push(candidate.row_index);
+            }
+        }
+        if alternatives.is_empty() {
+            return;
+        }
+        let choice = self
+            .comparison_choice
+            .entry((seat, tier))
+            .or_insert(alternatives[0]);
+        if !alternatives.contains(choice) {
+            *choice = alternatives[0];
+        }
+
+        ui.add_space(10.0);
+        ui.heading("What would change this pick?");
+        ui.label("Each estimate changes only this configuration. Competitors stay unchanged while ideal points and retry caps are recomputed across 24 bounded sampled changes.");
+        let selected_name = self
+            .table
+            .rows
+            .get(*choice)
+            .map(|row| row.display_name())
+            .unwrap_or_else(|| format!("Row #{}", *choice));
+        egui::ComboBox::from_id_salt(("comparison_choice", seat, tier))
+            .selected_text(selected_name)
+            .show_ui(ui, |ui| {
+                for row_index in alternatives {
+                    let name = self
+                        .table
+                        .rows
+                        .get(row_index)
+                        .map(|row| row.display_name())
+                        .unwrap_or_else(|| format!("Row #{row_index}"));
+                    ui.selectable_value(choice, row_index, name);
+                }
+            });
+
+        let request = (self.comparison_generation, seat, tier, *choice);
+        let pending = self.comparison_pending.is_some();
+        let score_is_current =
+            self.scored_settings.as_ref() == Some(&self.settings) && !self.refresh_in_flight;
+        if ui
+            .add_enabled(
+                !pending && score_is_current,
+                egui::Button::new(if pending {
+                    "Calculating…"
+                } else {
+                    "Calculate"
+                }),
+            )
+            .clicked()
+        {
+            let rows = self.table.rows.clone();
+            let settings = self.settings.clone();
+            let sender = self.comparison_tx.clone();
+            let context = ui.ctx().clone();
+            self.comparison_pending = Some(request);
+            self.comparison_result = None;
+            std::thread::spawn(move || {
+                let report =
+                    crate::comparison::compare_candidate(&rows, &settings, seat, tier, request.3);
+                let _ = sender.send((request.0, seat, tier, request.3, report));
+                context.request_repaint();
+            });
+        }
+
+        if let Some((generation, result_seat, result_tier, row_index, report)) =
+            &self.comparison_result
+            && (*generation, *result_seat, *result_tier, *row_index) == request
+        {
+            if let Some(target) = &report.target {
+                ui.label(format!(
+                    "Current alternative: competence {:.3}, {:.1} agent completions/week, MAX {}",
+                    target.competence, target.autonomous_tasks_per_week, target.attempt_limit
+                ));
+            }
+            for (label, threshold) in [
+                ("Agent runtime reduction", &report.runtime),
+                ("Vendor usage cost per attempt", &report.vendor_usage_cost),
+                ("Allowance for this configuration", &report.allowance),
+            ] {
+                ui.group(|ui| {
+                    ui.strong(label);
+                    ui.label(&threshold.detail);
+                    if let Some(factor) = threshold.applied_factor {
+                        if label == "Allowance for this configuration" {
+                            ui.label(format!(
+                                "Estimated winning allowance: about {factor:.2}× current"
                             ));
-                        });
+                        } else {
+                            ui.label(format!(
+                                "Estimated winning reduction: about {:.1}%",
+                                (1.0 - factor) * 100.0,
+                            ));
+                        }
                     }
                 });
             }
-
-            ui.add_space(10.0);
-            ui.heading("Source & Timestamps");
-            ui.label("Source: Artificial Analysis");
-            ui.label(format!("Source Fetched: {}", self.table.source_fetched_at));
-            ui.label(format!("Generated At: {}", self.table.generated_at));
-            ui.label(format!("Cache State: {}", self.table.cache_state.name()));
-        } else {
-            ui.label("No candidate pick available for this seat and tier.");
         }
+    }
+
+    fn invalidate_comparisons(&mut self) {
+        self.comparison_generation = self.comparison_generation.wrapping_add(1);
+        self.comparison_pending = None;
+        self.comparison_result = None;
     }
 
     fn detail_width(&mut self, ui: &mut egui::Ui, seat: Seat, tier: Tier) -> f32 {
@@ -311,7 +609,7 @@ impl App {
                 .sizing_pass(),
         );
         measure.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-        self.detail_content(&mut measure, seat, tier);
+        let _ = self.detail_content(&mut measure, seat, tier);
         let heading = ui.painter().layout_no_wrap(
             format!("{} - {}", seat.name(), tier.name()),
             egui::TextStyle::Heading.resolve(ui.style()),
@@ -341,6 +639,8 @@ impl App {
             return;
         }
         if self.settings_tx.send((self.settings.clone(), true)).is_ok() {
+            self.invalidate_comparisons();
+            self.scored_settings = None;
             self.refresh_in_flight = true;
             self.refresh_clicked_at = Some(Instant::now());
             self.engine_status = "Refreshing…".to_string();
@@ -393,7 +693,7 @@ impl App {
     }
 
     fn pump_channels(&mut self) {
-        while let Ok((new_table, fetched_rows)) = self.table_rx.try_recv() {
+        while let Ok((new_table, fetched_rows, scored_settings)) = self.table_rx.try_recv() {
             if fetched_rows {
                 self.refresh_in_flight = false;
                 if new_table.cache_state == CacheState::Live {
@@ -417,9 +717,20 @@ impl App {
                 }
             }
             self.panel_widths.clear();
+            self.invalidate_comparisons();
             self.table = new_table;
+            self.scored_settings = Some(scored_settings);
             if !self.refresh_in_flight {
                 self.engine_status.clear();
+            }
+        }
+
+        while let Ok(response) = self.comparison_rx.try_recv() {
+            let request = (response.0, response.1, response.2, response.3);
+            if response.0 == self.comparison_generation && self.comparison_pending == Some(request)
+            {
+                self.comparison_pending = None;
+                self.comparison_result = Some(response);
             }
         }
 
@@ -578,6 +889,7 @@ impl eframe::App for App {
         let t = ctx.animate_bool(egui::Id::new("side_panel_anim"), panel_open);
         if t > 0.001 {
             let (seat, tier) = self.selected_seat_tier.unwrap();
+            let mut selected_floor = None;
             let maximum = (ui.max_rect().width() * 0.45).max(1.0);
             let panel_width = self
                 .detail_width(ui, seat, tier)
@@ -615,16 +927,32 @@ impl eframe::App for App {
                         });
                         ui.separator();
 
-                        egui::ScrollArea::vertical().show(ui, |ui| {
-                            self.detail_content(ui, seat, tier);
-                        });
+                        egui::ScrollArea::vertical()
+                            .id_salt(("detail_scroll", seat, tier))
+                            .auto_shrink([false, false])
+                            .max_height(ui.available_height())
+                            .show(ui, |ui| {
+                                self.counterfactual_content(ui, seat, tier);
+                                ui.separator();
+                                selected_floor = self.detail_content(ui, seat, tier);
+                            });
                     }
                 });
+            if let Some(floor) = selected_floor {
+                self.settings
+                    .competence_floors
+                    .insert(seat.name().to_string(), Some(floor));
+                self.settings = self.settings.clone().normalize();
+                let _ = save_settings(&self.settings);
+                self.invalidate_comparisons();
+                let _ = self.settings_tx.send((self.settings.clone(), false));
+                self.engine_status = "Scoring…".to_string();
+            }
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("Total agent hours per week");
+                ui.heading("Workflow hours per week");
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.agent_hours_text).desired_width(80.0),
                 );
@@ -641,6 +969,7 @@ impl eframe::App for App {
                         if self.settings.agent_hours != hours {
                             self.settings.agent_hours = hours;
                             let _ = save_settings(&self.settings);
+                            self.invalidate_comparisons();
                             let _ = self.settings_tx.send((self.settings.clone(), false));
                             self.engine_status = "Scoring…".to_string();
                         }
@@ -652,7 +981,7 @@ impl eframe::App for App {
                     ui.colored_label(egui::Color32::YELLOW, "Enter a number from 1 to 1680.");
                 }
             });
-            ui.label("Example: 10 hours with 3 agents running in parallel = 30 total agent hours.");
+            ui.label("Combined weekly time for agent attempts and rescue work. Example: 10 hours across 3 parallel agents = 30 workflow hours.");
             ui.add_space(8.0);
             egui::ScrollArea::both()
                 .id_salt("roles_table_scroll")
@@ -663,23 +992,23 @@ impl eframe::App for App {
                     ui.strong("Coding Agent Tier List");
                     ui.add(
                         egui::Label::new(
-                            "Picks maximize estimated completed tasks per week within your available agent hours and plan allowance.",
+                            "Picks automatically balance proportional competence loss with worst-case proportional capacity loss. Optional competence minimums remain available for hard requirements.",
                         )
                         .wrap(),
                     )
                     .on_hover_text(
-                        "Estimates include retries and assume unfinished tasks are completed through modeled escalation.",
+                        "Every candidate and retry cap is evaluated across the declared joint resource scenarios. Estimates include retries and declared escalation.",
                     );
                     egui::CollapsingHeader::new("How estimates work")
                         .default_open(false)
                         .show(ui, |ui| {
                             for explanation in [
-                                "Benchmark scores are proxies for success in each role.",
-                                "Role proxies: Implementer uses coding benchmarks; Debugger uses coding and reasoning; Reviewer uses code Q&A and reasoning; Orchestrator uses the intelligence index and GPQA; Sanity uses Q&A; Comprehension uses long-context reasoning and Q&A.",
-                                "Budgeted plans use built-in allowance estimates unless you override them. The API budget has no spending cap.",
-                                "Simulation spread shows uncertainty conditional on these assumptions; its lead percentage is not a task success rate and does not determine the ranking.",
-                                "Role weights, retry failure correlation, and plan allowances are not automatically fitted to your task history.",
-                                "Unfinished tasks are assumed completed through escalation at the configured fixed extra time and cost. These values apply to every role; the default $0 escalation cost is an explicit assumption.",
+                                "Role competence is a fixed weighted utility of benchmark capabilities. It is a qualification measure, not a task success probability.",
+                                "Implementer and Debugger capacity uses the coding reference workload. Other seats use Repository Q&A as the reference workload. These are reference units, not observed real-role output.",
+                                "The engine chooses a candidate and maximum retry count before the scenario is known. Attempts stop on success; unfinished cycles use the configured rescue time and cost without crediting that completion to the agent.",
+                                "The automatic choice minimizes its largest percentage loss: competence versus the best available competence, or capacity versus each scenario's capacity leader.",
+                                "Scenarios combine the configured stress distance, allowance endpoints, and both resource-time bases. The distance is an assumption, not measured uncertainty or a confidence interval.",
+                                "Hallucination is an optional reliability indicator only. It is not a retry-transition probability, and missing values are not imputed as perfect reliability.",
                             ] {
                                 ui.add(egui::Label::new(explanation).wrap());
                             }
@@ -702,16 +1031,16 @@ impl eframe::App for App {
                         .show(ui, |ui| {
                             ui.strong("Role / budget");
                             ui.strong("Agent");
-                            ui.strong("Simulation lead").on_hover_text(
-                                "Share of simulation samples this configuration leads. This is an uncertainty statistic, not a task success rate or the ranking objective.",
+                            ui.strong("Competence").on_hover_text(
+                                "Fixed role-weighted benchmark utility on a 0–1 scale. It is not a task success probability.",
                             );
-                            ui.strong("Capacity").on_hover_text(
-                                "Multiple of the current weekly workload the estimated allowance can fund.",
+                            ui.strong("Worst loss").on_hover_text(
+                                "Largest proportional shortfall across competence and capacity scenarios. Smaller is better.",
                             );
-                            ui.strong("Min/task");
-                            ui.strong("$/task");
-                            ui.strong("Tasks/week").on_hover_text(
-                                "Estimated completed tasks per week, including retries and modeled escalation.",
+                            ui.strong("Min/cycle");
+                            ui.strong("$/cycle");
+                            ui.strong("Agent completions/week").on_hover_text(
+                                "Estimated reference tasks completed by the agent before rescue. Rescue completions are reported separately.",
                             );
                             for (heading, explanation) in [
                                 (
@@ -760,24 +1089,25 @@ impl eframe::App for App {
 
                                     let (
                                         agent_name,
-                                        win,
-                                        streams_star,
+                                        competence,
+                                        worst_shortfall,
                                         min_task,
                                         cost_task,
                                         tasks_wk,
                                         a_star_hours,
                                     ) = if let Some(pick) = maybe_pick {
-                                        let name = self
+                                        let mut name = self
                                             .table
                                             .rows
                                             .get(pick.row_index)
                                             .map(|r| r.display_name())
                                             .unwrap_or_else(|| "-".into());
-                                        let win = format!("{:.0}%", pick.win_rate * 100.0);
-                                        let streams_star = pick
-                                            .streams_star
-                                            .map(|s| format!("{:.2}x", s))
-                                            .unwrap_or_else(|| "-".into());
+                                        if pick.competence_floor.is_none() {
+                                            name.push_str(" · Automatic");
+                                        }
+                                        let competence = format!("{:.3}", pick.competence);
+                                        let worst_shortfall =
+                                            format!("{:.1}%", pick.worst_shortfall * 100.0);
                                         let min_task = format!("{:.2}", pick.minutes_per_task);
                                         let cost_task = format!("${:.2}", pick.cost_per_task);
                                         let tasks_wk = format!("{:.1}", pick.tasks_per_week);
@@ -790,8 +1120,8 @@ impl eframe::App for App {
                                         };
                                         (
                                             name,
-                                            win,
-                                            streams_star,
+                                            competence,
+                                            worst_shortfall,
                                             min_task,
                                             cost_task,
                                             tasks_wk,
@@ -799,7 +1129,7 @@ impl eframe::App for App {
                                         )
                                     } else {
                                         (
-                                            "-".into(),
+                                            "No candidate meets requirements".into(),
                                             "-".into(),
                                             "-".into(),
                                             "-".into(),
@@ -817,10 +1147,10 @@ impl eframe::App for App {
                                     if ui.selectable_label(is_selected, &agent_name).clicked() {
                                         clicked = true;
                                     }
-                                    if ui.selectable_label(is_selected, &win).clicked() {
+                                    if ui.selectable_label(is_selected, &competence).clicked() {
                                         clicked = true;
                                     }
-                                    if ui.selectable_label(is_selected, &streams_star).clicked() {
+                                    if ui.selectable_label(is_selected, &worst_shortfall).clicked() {
                                         clicked = true;
                                     }
                                     if ui.selectable_label(is_selected, &min_task).clicked() {
@@ -861,63 +1191,55 @@ impl eframe::App for App {
                             }
                         });
                     ui.add_space(8.0);
-                    for seat in Seat::ALL {
-                        let picks: Vec<_> = [
-                            (Tier::T200, self.settings.plan_prices.t200),
-                            (Tier::T100, self.settings.plan_prices.t100),
-                            (Tier::T20, self.settings.plan_prices.t20),
-                        ]
-                        .into_iter()
-                        .filter_map(|(tier, price)| {
-                            self.table
-                                .get_pick(seat, tier)
-                                .map(|pick| (tier, price, pick))
-                        })
-                        .collect();
-                        let Some(best) = picks.iter().max_by(|left, right| {
-                            left.2.tasks_per_week.total_cmp(&right.2.tasks_per_week)
-                        }) else {
-                            continue;
-                        };
-                        if let Some(enough) = picks
-                            .iter()
-                            .filter(|(_, _, pick)| {
-                                pick.tasks_per_week >= best.2.tasks_per_week * 0.95
-                            })
-                            .min_by(|left, right| left.1.total_cmp(&right.1))
-                        {
-                            let Some(row) = self.table.rows.get(enough.2.row_index) else {
-                                continue;
-                            };
-                            let agent = row.display_name();
-                            ui.label(if enough.0 == best.0 {
-                                format!(
-                                    "{}: {} - {} at {:.1}/wk",
-                                    seat.name(),
-                                    enough.0.name(),
-                                    agent,
-                                    enough.2.tasks_per_week
-                                )
-                            } else {
-                                format!(
-                                    "{}: {} is enough - {} at {:.1}/wk ({} gives {:.1})",
-                                    seat.name(),
-                                    enough.0.name(),
-                                    agent,
-                                    enough.2.tasks_per_week,
-                                    best.0.name(),
-                                    best.2.tasks_per_week
-                                )
-                            });
-                        }
-                    }
+                    egui::CollapsingHeader::new("Plan price, competence, and production comparisons")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.label("Each pair compares the selected subscription policies using actual monthly prices, raw competence, and autonomous output across all declared scenarios.");
+                            for seat in Seat::ALL {
+                                let comparisons = self.table.plan_comparisons
+                                    .iter()
+                                    .filter(|comparison| comparison.seat == seat)
+                                    .collect::<Vec<_>>();
+                                if comparisons.is_empty() {
+                                    continue;
+                                }
+                                ui.group(|ui| {
+                                    ui.strong(seat.name());
+                                    for comparison in comparisons {
+                                        let price = |tier: Tier, value: Option<f64>| value
+                                            .map(|value| format!("{} (${value:.0}/month)", tier.name()))
+                                            .unwrap_or_else(|| format!("{} (price unknown)", tier.name()));
+                                        let left = price(comparison.left_tier, comparison.left_price);
+                                        let right = price(comparison.right_tier, comparison.right_price);
+                                        if let Some(dominant) = comparison.dominant_tier {
+                                            ui.label(format!(
+                                                "{left} vs {right}: {} costs no more and is no worse in competence or any autonomous-capacity scenario.",
+                                                dominant.name(),
+                                            ));
+                                        } else if comparison.equivalent {
+                                            ui.label(format!("{left} vs {right}: selected policies are equivalent on competence and autonomous production."));
+                                        } else {
+                                            ui.label(format!(
+                                                "{left}: competence {:.3}, {:.1}/wk; {right}: competence {:.3}, {:.1}/wk. Scenario production difference ranges {:+.1} to {:+.1}/wk (right minus left).",
+                                                comparison.left_competence,
+                                                comparison.left_autonomous_tasks_per_week,
+                                                comparison.right_competence,
+                                                comparison.right_autonomous_tasks_per_week,
+                                                comparison.worst_capacity_delta,
+                                                comparison.best_capacity_delta,
+                                            ));
+                                        }
+                                    }
+                                });
+                            }
+                        });
                     for (heading, bare_model, columns) in [
                         (
                             "Coding Agents",
                             false,
                             [
                                 "rank", "Agent", "SWE", "Term", "QnA", "Vendor", "Wait", "Cost",
-                                "Tasks/wk",
+                                "Agent tasks/wk",
                             ],
                         ),
                         (
@@ -925,7 +1247,7 @@ impl eframe::App for App {
                             true,
                             [
                                 "rank", "Model", "Term", "Logic", "Tok/s", "Vendor", "Wait",
-                                "Cost", "Tasks/wk",
+                                "Cost", "Agent tasks/wk",
                             ],
                         ),
                     ] {
@@ -983,14 +1305,17 @@ impl eframe::App for App {
                                     } else {
                                         [percent(row.swe), percent(row.term), percent(row.qna)]
                                     };
-                                    let wall = crate::engine::cycle(
-                                        row.pass,
-                                        row.wait_seconds.round().max(1.0) as u32,
-                                        row.attempt_usd,
-                                        0.0,
+                                    let tasks = crate::engine::implementation_cycle(
+                                        row,
                                         &self.settings,
                                     )
-                                    .wall;
+                                    .map(|cycle| {
+                                        self.settings.agent_hours * 3600.0 / cycle.wall
+                                            * (1.0 - cycle.unfinished)
+                                    })
+                                    .filter(|tasks| tasks.is_finite())
+                                    .map(|tasks| format!("{tasks:.1}"))
+                                    .unwrap_or_else(|| "Unknown".into());
                                     let [first, second, third] = metrics;
                                     for (column, value) in [
                                         (rank + 1).to_string(),
@@ -1001,7 +1326,7 @@ impl eframe::App for App {
                                         row.vendor.clone(),
                                         format!("{:.2}m", row.wait_seconds / 60.0),
                                         format!("${:.2}", row.attempt_usd),
-                                        format!("{:.1}", self.settings.agent_hours * 3600.0 / wall),
+                                        tasks,
                                     ]
                                     .into_iter()
                                     .enumerate()
@@ -1029,11 +1354,14 @@ impl eframe::App for App {
                 .resizable(true)
                 .default_width(450.0)
                 .show(&ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("settings_scroll")
+                        .show(ui, |ui| {
                     let mut changed = false;
                     ui.heading("Engine & cache configuration");
                     ui.horizontal(|ui| {
-                        ui.label("Escalation time (minutes):").on_hover_text(
-                            "Unfinished tasks are modeled as completed through escalation with this fixed additional time. This setting applies to every role.",
+                        ui.label("Rescue time (minutes):").on_hover_text(
+                            "An unfinished cycle uses this additional rescue time. Assisted completions consume workflow time but are not credited to the agent.",
                         );
                         changed |= ui
                             .add(
@@ -1043,8 +1371,8 @@ impl eframe::App for App {
                             .changed();
                     });
                     ui.horizontal(|ui| {
-                        ui.label("Escalation cost (USD):").on_hover_text(
-                            "Unfinished tasks are modeled as completed through escalation with this fixed additional cost. This setting applies to every role.",
+                        ui.label("Rescue cost (USD):").on_hover_text(
+                            "An unfinished cycle uses this additional external rescue cost. This setting applies to every role.",
                         );
                         changed |= ui
                             .add(
@@ -1066,19 +1394,55 @@ impl eframe::App for App {
                             .changed();
                     });
 
+                    ui.separator();
+                    egui::CollapsingHeader::new("Optional competence minimums")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.add(egui::Label::new(
+                                "The automatic choice already balances competence and capacity. Enable a minimum only to enforce a hard qualification requirement.",
+                            ).wrap());
+                            for seat in Seat::ALL {
+                                let floor = self
+                                    .settings
+                                    .competence_floors
+                                    .entry(seat.name().to_string())
+                                    .or_insert(None);
+                                ui.horizontal(|ui| {
+                                    let mut enabled = floor.is_some();
+                                    if ui.checkbox(&mut enabled, seat.name()).changed() {
+                                        *floor = enabled.then_some(0.0);
+                                        changed = true;
+                                    }
+                                    if let Some(value) = floor {
+                                        changed |= ui
+                                            .add(
+                                                egui::DragValue::new(value)
+                                                    .speed(0.001)
+                                                    .range(0.0..=1.0)
+                                                    .fixed_decimals(3),
+                                            )
+                                            .changed();
+                                    } else {
+                                        ui.label("automatic");
+                                    }
+                                });
+                            }
+                        });
+
                     ui.horizontal(|ui| {
-                        ui.label("Simulation samples (1,000–20,000):").on_hover_text(
-                            "More samples stabilize uncertainty estimates under the same assumptions.",
+                        ui.label("Assumption scenario distance:").on_hover_text(
+                            "Percentage used in joint low/high runtime, model-cost, retry-correlation, and escalation-time stress scenarios. It is an assumed distance, not measured error.",
                         );
-                        if ui
+                        changed |= ui
                             .add(
-                                egui::Slider::new(&mut self.settings.draws, 1000..=20000)
-                                    .step_by(100.0),
+                                egui::Slider::new(
+                                    &mut self.settings.assumption_span_pct,
+                                    0.0..=90.0,
+                                )
+                                .suffix("%")
+                                .step_by(1.0),
                             )
-                            .changed()
-                        {
-                            changed = true;
-                        }
+                            .changed();
                     });
 
                     ui.horizontal(|ui| {
@@ -1094,7 +1458,7 @@ impl eframe::App for App {
                     if ui
                         .checkbox(
                             &mut self.settings.show_hallucination,
-                            "Show Hallucination rate in quality view",
+                            "Show hallucination reliability indicator",
                         )
                         .changed()
                     {
@@ -1170,10 +1534,13 @@ impl eframe::App for App {
                         });
 
                     if changed {
+                        self.settings = self.settings.clone().normalize();
                         let _ = save_settings(&self.settings);
+                        self.invalidate_comparisons();
                         let _ = self.settings_tx.send((self.settings.clone(), false));
                         self.engine_status = "Scoring…".to_string();
                     }
+                    });
                 });
             self.settings_open = open;
         }
