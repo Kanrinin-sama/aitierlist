@@ -62,8 +62,8 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $root = $PSScriptRoot
-$exe = Join-Path $root 'target\release\aitierlist.exe'
-$packedExe = Join-Path $root 'target\release\aitierlist-packed.exe'
+$packedExe = Join-Path $root 'target\release\aitierlist.exe'
+$unpackedExe = Join-Path $root 'target\release\aitierlist-unpacked.exe'
 $upx = 'C:\Users\kaltsit\AppData\Local\Microsoft\WinGet\Links\upx.exe'
 if (-not (Test-Path -LiteralPath $upx -PathType Leaf)) { throw "UPX was not found at $upx" }
 
@@ -1618,7 +1618,7 @@ function Invoke-BoundedProcess {
 
 # Stream an already-open, already-verified object to a remote file.
 #
-# `scp $exe host:...` is not object-bound: scp performs a *fresh* pathname
+# `scp $packedExe host:...` is not object-bound: scp performs a *fresh* pathname
 # resolution, and a same-user process can rename an ancestor directory between
 # the verification and the upload while the original leaf handle stays open. The
 # bytes that were checked and the bytes that go up would then be two different
@@ -2122,7 +2122,7 @@ if (-not $line) { throw 'could not read version from Cargo.toml' }
 $manifestVersion = $line.Matches[0].Groups[1].Value
 $Version = Assert-RequestedVersion -Requested $Version -Manifest $manifestVersion
 Assert-Grammar -Value $Version -Pattern (Get-VersionGrammar) -What 'version' | Out-Null
-if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "no release build at $exe - run: cargo build --release" }
+if (-not (Test-Path -LiteralPath $packedExe -PathType Leaf)) { throw "no release build at $packedExe - run: cargo build --release" }
 
 $script:ssh = Resolve-SystemTool 'ssh.exe'
 # No scp. Every byte this script uploads travels through the ssh standard input
@@ -2137,10 +2137,10 @@ Assert-Grammar -Value $remoteDir -Pattern (Get-WebRootGrammar) -What 'release di
 
 # ------------------------------------------------- one stable artifact, held
 
-# The unpacked build is held against writes and deletion through inspection and
+# The unpacked build is held against writes and deletion during inspection and
 # copying. The packed copy is held through its smoke test, hash, size and upload.
 $unpacked = [System.IO.File]::Open(
-    $exe,
+    $packedExe,
     [System.IO.FileMode]::Open,
     [System.IO.FileAccess]::Read,
     [System.IO.FileShare]::Read)
@@ -2166,30 +2166,37 @@ try {
     $reader = [System.IO.StreamReader]::new($unpacked, [System.Text.Encoding]::Latin1, $false, 1MB, $true)
     $bytes = $reader.ReadToEnd()
     $reader.Dispose()
-    Assert-VersionStamp -Image $bytes -Version $Version -Path $exe | Out-Null
+    Assert-VersionStamp -Image $bytes -Version $Version -Path $packedExe | Out-Null
     $head = if ($AllowUnbound) {
         try { Get-HeadIdentity -Root $root }
         catch { [pscustomobject]@{ Commit = ('0' * 40); Tree = ('0' * 40) } }
     } else {
         Get-HeadIdentity -Root $root
     }
-    Assert-HeadBinding -Image $bytes -Commit $head.Commit -Tree $head.Tree -Path $exe -AllowUnbound:$AllowUnbound | Out-Null
+    Assert-HeadBinding -Image $bytes -Commit $head.Commit -Tree $head.Tree -Path $packedExe -AllowUnbound:$AllowUnbound | Out-Null
     $bytes = $null
     Write-Host "  stamp    : $Version confirmed in binary" -ForegroundColor Green
     Write-Host "  built    : $($head.Commit) tree $($head.Tree)" -ForegroundColor Green
 
     # Inspect the unpacked build's PE headers, load flags and imports before
     # compression changes their on-disk representation. Copy this held object.
-    $image = Assert-ReleaseImage -Stream $unpacked -Path $exe
+    $image = Assert-ReleaseImage -Stream $unpacked -Path $packedExe
     Write-Host "  image    : $($image.Magic) $($image.Machine), DependentLoadFlags 0x$('{0:x4}' -f $image.DependentLoadFlags)" -ForegroundColor Green
     Write-Host "  imports  : $($image.Imports -join ', ')"
     $null = $artifact.Seek(0, [System.IO.SeekOrigin]::Begin)
 
     if ($WhatIf) {
-        Write-Host "`n(WhatIf) would pack $exe to $packedExe with UPX --best --lzma, smoke-test it, then publish its hash and size. Nothing was changed." -ForegroundColor Yellow
+        Write-Host "`n(WhatIf) would move $packedExe to $unpackedExe (overwriting any stale file), then pack $unpackedExe to $packedExe with UPX --best --lzma, smoke-test it, then publish its hash and size. Nothing was changed." -ForegroundColor Yellow
         return
     }
 
+    $unpacked.Dispose()
+    [System.IO.File]::Move($packedExe, $unpackedExe, $true)
+    $unpacked = [System.IO.File]::Open(
+        $unpackedExe,
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read,
+        [System.IO.FileShare]::Read)
     $artifact = New-PackedArtifact -Source $unpacked -Path $packedExe -Upx $upx -Root $root
     $size = $artifact.Length
     Assert-ArtifactSize -Size $size -What 'the packed release artifact' | Out-Null
