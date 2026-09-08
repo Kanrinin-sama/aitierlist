@@ -137,6 +137,7 @@ pub struct Row {
     pub gpqa: Option<f64>,
     pub hle: Option<f64>,
     pub task_metrics: Vec<TaskMetric>,
+    pub retry: crate::retry::RowRetry,
     pub usd_per_step: Option<f64>,
     pub speed: Option<f64>,
 }

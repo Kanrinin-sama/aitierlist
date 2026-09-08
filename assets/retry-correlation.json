@@ -1,0 +1,1372 @@
+{
+  "generated_at": "2026-09-08T01:49:32.5782284+00:00",
+  "sources": [
+    {
+      "name": "DeepSWE v1.1",
+      "url": "https://deepswe.datacurve.ai/artifacts/v1.1",
+      "revision_or_generated_at": "2026-09-03T18:24:37.984682-04:00"
+    },
+    {
+      "name": "Terminal-Bench 2.1",
+      "url": "https://github.com/harbor-framework/terminal-bench-2-1/tree/main/leaderboard/submissions",
+      "revision_or_generated_at": "7131e4375048a0e408a8fb404b5f499d726b695b"
+    }
+  ],
+  "deepswe": {
+    "pool_rho": 0.4575057884032161,
+    "bootstrap_draws": 400,
+    "bootstrap_seed": 113400,
+    "difficulty_ratio_normalizer": 0.7921450683808653,
+    "models": [
+      {
+        "model": "claude-fable-5",
+        "rho": 0.4987331670660216,
+        "rho_variance": 0.0006471715402225932,
+        "rho_valid_draws": 400,
+        "difficulty_ratio": 0.8140341566762082,
+        "difficulty_ratio_variance": 0.00015873201991990868,
+        "difficulty_ratio_valid_draws": 400,
+        "configs": [
+          {
+            "reasoning_effort": "high",
+            "rho_raw": 0.4546358083538582,
+            "rho_shrunk": 0.4915640230095188,
+            "rho_variance": 0.0033335764169360044,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.8126749650037436,
+            "difficulty_ratio_shrunk": 0.8137645208503491,
+            "difficulty_ratio_variance": 0.0006414110580304291,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.027292289420767
+          },
+          {
+            "reasoning_effort": "low",
+            "rho_raw": 0.42719435648888154,
+            "rho_shrunk": 0.48711622828346696,
+            "rho_variance": 0.003338205596861611,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.8123381134650799,
+            "difficulty_ratio_shrunk": 0.813789263776489,
+            "difficulty_ratio_variance": 0.0009405908476794302,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.027323524767836
+          },
+          {
+            "reasoning_effort": "max",
+            "rho_raw": 0.5926756862299036,
+            "rho_shrunk": 0.5134013792135304,
+            "rho_variance": 0.0034976365801048562,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.8113418445924977,
+            "difficulty_ratio_shrunk": 0.8136290895481415,
+            "difficulty_ratio_variance": 0.0008962934454686324,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.0271213216175028
+          },
+          {
+            "reasoning_effort": "medium",
+            "rho_raw": 0.5110077076609331,
+            "rho_shrunk": 0.5007566423649604,
+            "rho_variance": 0.003278615617396664,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.8129809657169599,
+            "difficulty_ratio_shrunk": 0.8138638717952796,
+            "difficulty_ratio_variance": 0.0008230059207088318,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.0274177095602037
+          },
+          {
+            "reasoning_effort": "xhigh",
+            "rho_raw": 0.5167058912172465,
+            "rho_shrunk": 0.5015902051779977,
+            "rho_variance": 0.0034239801613202563,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.8208348946027604,
+            "difficulty_ratio_shrunk": 0.8153825715744484,
+            "difficulty_ratio_variance": 0.0006418337921579899,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.0293349086185442
+          }
+        ]
+      },
+      {
+        "model": "claude-opus-4-8",
+        "rho": 0.45038632604499984,
+        "rho_variance": 0.0006486749152079871,
+        "rho_valid_draws": 400,
+        "difficulty_ratio": 0.7404680361325692,
+        "difficulty_ratio_variance": 0.0002121129163418918,
+        "difficulty_ratio_valid_draws": 400,
+        "configs": [
+          {
+            "reasoning_effort": "high",
+            "rho_raw": 0.4159198769290512,
+            "rho_shrunk": 0.4445956146906784,
+            "rho_variance": 0.003212253317922389,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.7561378853105364,
+            "difficulty_ratio_shrunk": 0.7430244658356179,
+            "difficulty_ratio_variance": 0.001088050903462099,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 0.9379903953127559
+          },
+          {
+            "reasoning_effort": "low",
+            "rho_raw": 0.46465171375736647,
+            "rho_shrunk": 0.4526440918988011,
+            "rho_variance": 0.003449889667628981,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.6949234704456063,
+            "difficulty_ratio_shrunk": 0.7339001545925702,
+            "difficulty_ratio_variance": 0.001258770897952366,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 0.9264719101169853
+          },
+          {
+            "reasoning_effort": "max",
+            "rho_raw": 0.4999429299390622,
+            "rho_shrunk": 0.46000113482083504,
+            "rho_variance": 0.0026947223980874225,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.7500572324526944,
+            "difficulty_ratio_shrunk": 0.7424430683549162,
+            "difficulty_ratio_variance": 0.0008177398495130657,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 0.9372564420207282
+          },
+          {
+            "reasoning_effort": "medium",
+            "rho_raw": 0.44007314524555924,
+            "rho_shrunk": 0.44842239719569976,
+            "rho_variance": 0.0027577120743136323,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.7413465951273335,
+            "difficulty_ratio_shrunk": 0.7406175464216512,
+            "difficulty_ratio_variance": 0.0010343144145261655,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 0.9349519121989415
+          },
+          {
+            "reasoning_effort": "xhigh",
+            "rho_raw": 0.4340252753596209,
+            "rho_shrunk": 0.44731543617255326,
+            "rho_variance": 0.002807327613986073,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.7598749973266757,
+            "difficulty_ratio_shrunk": 0.7437038944203083,
+            "difficulty_ratio_variance": 0.0010600278173278977,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 0.9388481025835708
+          }
+        ]
+      },
+      {
+        "model": "claude-opus-5",
+        "rho": 0.4916268052314026,
+        "rho_variance": 0.0007940963520003997,
+        "rho_valid_draws": 400,
+        "difficulty_ratio": 0.8374577251338003,
+        "difficulty_ratio_variance": 0.00012533777161291193,
+        "difficulty_ratio_valid_draws": 400,
+        "configs": [
+          {
+            "reasoning_effort": "high",
+            "rho_raw": 0.5095827570831232,
+            "rho_shrunk": 0.494598610168798,
+            "rho_variance": 0.00400391568530476,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.8512994413977623,
+            "difficulty_ratio_shrunk": 0.8394484631338035,
+            "difficulty_ratio_variance": 0.0007461429917122477,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.0597155705957064
+          },
+          {
+            "reasoning_effort": "low",
+            "rho_raw": 0.393624263059018,
+            "rho_shrunk": 0.4698030000449108,
+            "rho_variance": 0.0027718931975226156,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.8079998626497419,
+            "difficulty_ratio_shrunk": 0.8332948843840287,
+            "difficulty_ratio_variance": 0.0007616005145643801,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.0519473233447922
+          },
+          {
+            "reasoning_effort": "max",
+            "rho_raw": 0.5437313566714981,
+            "rho_shrunk": 0.5005076489955058,
+            "rho_variance": 0.0038649242681394504,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.8561905581395735,
+            "difficulty_ratio_shrunk": 0.8406208754451255,
+            "difficulty_ratio_variance": 0.0006169385396120093,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.061195618074533
+          },
+          {
+            "reasoning_effort": "medium",
+            "rho_raw": 0.4944716978523071,
+            "rho_shrunk": 0.4922151392307783,
+            "rho_variance": 0.0030457613725071472,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.8264342753319671,
+            "difficulty_ratio_shrunk": 0.8355460908414747,
+            "difficulty_ratio_variance": 0.0005974231870052161,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.05478923519567
+          },
+          {
+            "reasoning_effort": "xhigh",
+            "rho_raw": 0.5411149737628641,
+            "rho_shrunk": 0.4983323137104295,
+            "rho_variance": 0.005066514252091723,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.8453644881499569,
+            "difficulty_ratio_shrunk": 0.8386052041093962,
+            "difficulty_ratio_variance": 0.0007383086029115837,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.0586510445914847
+          }
+        ]
+      },
+      {
+        "model": "claude-sonnet-4-6",
+        "rho": 0.35413211854038734,
+        "rho_variance": 0.002604449905257658,
+        "rho_valid_draws": 400,
+        "difficulty_ratio": 0.774310459795477,
+        "difficulty_ratio_variance": 0.002356212623190709,
+        "difficulty_ratio_valid_draws": 400,
+        "configs": [
+          {
+            "reasoning_effort": "high",
+            "rho_raw": 0.35413211854038734,
+            "rho_shrunk": 0.35413211854038734,
+            "rho_variance": 0.002604449905257658,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.774310459795477,
+            "difficulty_ratio_shrunk": 0.774310459795477,
+            "difficulty_ratio_variance": 0.002356212623190709,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 0.9774856787004406
+          }
+        ]
+      },
+      {
+        "model": "claude-sonnet-5",
+        "rho": 0.38700131907706614,
+        "rho_variance": 0.0006015436212072176,
+        "rho_valid_draws": 400,
+        "difficulty_ratio": 0.786551178863643,
+        "difficulty_ratio_variance": 0.0002833280351533802,
+        "difficulty_ratio_valid_draws": 400,
+        "configs": [
+          {
+            "reasoning_effort": "high",
+            "rho_raw": 0.3682410861309945,
+            "rho_shrunk": 0.3835619625268066,
+            "rho_variance": 0.0026796219968846864,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.8013151045032505,
+            "difficulty_ratio_shrunk": 0.7895323240417805,
+            "difficulty_ratio_variance": 0.0011198354448734408,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 0.9967016845229811
+          },
+          {
+            "reasoning_effort": "low",
+            "rho_raw": 0.3616448126000486,
+            "rho_shrunk": 0.3829733074364944,
+            "rho_variance": 0.0031851993399387873,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.75261520606863,
+            "difficulty_ratio_shrunk": 0.782191275992817,
+            "difficulty_ratio_variance": 0.0019219991883881783,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 0.9874343819265406
+          },
+          {
+            "reasoning_effort": "max",
+            "rho_raw": 0.37921755764826287,
+            "rho_shrunk": 0.3856745181756296,
+            "rho_variance": 0.0029274500894735465,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.840722612554081,
+            "difficulty_ratio_shrunk": 0.7998766445325217,
+            "difficulty_ratio_variance": 0.000868473053854643,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.0097603033336553
+          },
+          {
+            "reasoning_effort": "medium",
+            "rho_raw": 0.40218472733921146,
+            "rho_shrunk": 0.3891738032524348,
+            "rho_variance": 0.003602621588294768,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.7668156942040372,
+            "difficulty_ratio_shrunk": 0.7836660190695217,
+            "difficulty_ratio_variance": 0.00165473310891192,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 0.9892960902620089
+          },
+          {
+            "reasoning_effort": "xhigh",
+            "rho_raw": 0.4203635210080456,
+            "rho_shrunk": 0.39262693544554866,
+            "rho_variance": 0.0029658556549757805,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.7712872769882168,
+            "difficulty_ratio_shrunk": 0.7834423447472069,
+            "difficulty_ratio_variance": 0.0011077694519316527,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 0.9890137249084354
+          }
+        ]
+      },
+      {
+        "model": "deepseek-v4-flash",
+        "rho": 0.33332022313556603,
+        "rho_variance": 0.0026312718038452995,
+        "rho_valid_draws": 400,
+        "difficulty_ratio": 0.7963576463221688,
+        "difficulty_ratio_variance": 0.0010080787894006442,
+        "difficulty_ratio_valid_draws": 400,
+        "configs": [
+          {
+            "reasoning_effort": "max",
+            "rho_raw": 0.333320223135566,
+            "rho_shrunk": 0.333320223135566,
+            "rho_variance": 0.0026312718038453003,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.7963576463221688,
+            "difficulty_ratio_shrunk": 0.7963576463221688,
+            "difficulty_ratio_variance": 0.0010080787894006442,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.0053179374706125
+          }
+        ]
+      },
+      {
+        "model": "deepseek-v4-pro",
+        "rho": 0.33646621794257625,
+        "rho_variance": 0.003019876293582561,
+        "rho_valid_draws": 400,
+        "difficulty_ratio": 0.8175040080568543,
+        "difficulty_ratio_variance": 0.0006537586961598247,
+        "difficulty_ratio_valid_draws": 400,
+        "configs": [
+          {
+            "reasoning_effort": "max",
+            "rho_raw": 0.33646621794257625,
+            "rho_shrunk": 0.33646621794257625,
+            "rho_variance": 0.0030198762935825605,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.8175040080568543,
+            "difficulty_ratio_shrunk": 0.8175040080568543,
+            "difficulty_ratio_variance": 0.0006537586961598247,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.032012999497456
+          }
+        ]
+      },
+      {
+        "model": "gemini-3-1-pro-preview",
+        "rho": 0.28588204563520214,
+        "rho_variance": 0.0032121831486460525,
+        "rho_valid_draws": 400,
+        "difficulty_ratio": 0.7037387018782817,
+        "difficulty_ratio_variance": 0.0043770034493491065,
+        "difficulty_ratio_valid_draws": 400,
+        "configs": [
+          {
+            "reasoning_effort": "high",
+            "rho_raw": 0.28588204563520214,
+            "rho_shrunk": 0.28588204563520214,
+            "rho_variance": 0.0032121831486460516,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.7037387018782817,
+            "difficulty_ratio_shrunk": 0.7037387018782817,
+            "difficulty_ratio_variance": 0.0043770034493491065,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 0.8883962420124825
+          }
+        ]
+      },
+      {
+        "model": "gemini-3-5-flash",
+        "rho": 0.3374723400728029,
+        "rho_variance": 0.0029684608440106487,
+        "rho_valid_draws": 400,
+        "difficulty_ratio": 0.7347014952512112,
+        "difficulty_ratio_variance": 0.0013492683552175347,
+        "difficulty_ratio_valid_draws": 400,
+        "configs": [
+          {
+            "reasoning_effort": "high",
+            "rho_raw": 0.33747234007280286,
+            "rho_shrunk": 0.3374723400728029,
+            "rho_variance": 0.0029684608440106474,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.7347014952512112,
+            "difficulty_ratio_shrunk": 0.7347014952512112,
+            "difficulty_ratio_variance": 0.0013492683552175347,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 0.9274835185844582
+          }
+        ]
+      },
+      {
+        "model": "gemini-3-6-flash",
+        "rho": 0.3632138151518301,
+        "rho_variance": 0.002663549793572334,
+        "rho_valid_draws": 400,
+        "difficulty_ratio": 0.7809392517682641,
+        "difficulty_ratio_variance": 0.0010119087491625284,
+        "difficulty_ratio_valid_draws": 400,
+        "configs": [
+          {
+            "reasoning_effort": "high",
+            "rho_raw": 0.3632138151518301,
+            "rho_shrunk": 0.3632138151518301,
+            "rho_variance": 0.002663549793572333,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.7809392517682641,
+            "difficulty_ratio_shrunk": 0.7809392517682641,
+            "difficulty_ratio_variance": 0.0010119087491625284,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 0.9858538327638575
+          }
+        ]
+      },
+      {
+        "model": "gemini-3-7-flash",
+        "rho": 0.5111327030567949,
+        "rho_variance": 0.0010162435205775277,
+        "rho_valid_draws": 400,
+        "difficulty_ratio": 0.8290120468510499,
+        "difficulty_ratio_variance": 0.0003235079135824928,
+        "difficulty_ratio_valid_draws": 400,
+        "configs": [
+          {
+            "reasoning_effort": "high",
+            "rho_raw": 0.5359957434339386,
+            "rho_shrunk": 0.5165264739622096,
+            "rho_variance": 0.003668216410741501,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.8272223407685755,
+            "difficulty_ratio_shrunk": 0.8285514792110037,
+            "difficulty_ratio_variance": 0.0009336018577620245,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.0459592722132989
+          },
+          {
+            "reasoning_effort": "low",
+            "rho_raw": 0.47014890387210073,
+            "rho_shrunk": 0.5005183077189442,
+            "rho_variance": 0.002907627698122464,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.8486942615027738,
+            "difficulty_ratio_shrunk": 0.8339156714573177,
+            "difficulty_ratio_variance": 0.0009749911983852369,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.052731001862867
+          },
+          {
+            "reasoning_effort": "medium",
+            "rho_raw": 0.5312711406461409,
+            "rho_shrunk": 0.5163107940789264,
+            "rho_variance": 0.0029360927028022087,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.8111195382818005,
+            "difficulty_ratio_shrunk": 0.8243355119631353,
+            "difficulty_ratio_variance": 0.0009142393190861602,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.0406370560989124
+          }
+        ]
+      },
+      {
+        "model": "gemini-3-8-flash",
+        "rho": 0.6046817558040622,
+        "rho_variance": 0.0019038125671508208,
+        "rho_valid_draws": 400,
+        "difficulty_ratio": 0.8364820610062724,
+        "difficulty_ratio_variance": 0.00042499482759282304,
+        "difficulty_ratio_valid_draws": 400,
+        "configs": [
+          {
+            "reasoning_effort": "high",
+            "rho_raw": 0.6214906041836288,
+            "rho_shrunk": 0.6103524919831754,
+            "rho_variance": 0.0037393518780969434,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.8321621963782988,
+            "difficulty_ratio_shrunk": 0.835038664228474,
+            "difficulty_ratio_variance": 0.0008469493467527923,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.054148662359639
+          },
+          {
+            "reasoning_effort": "medium",
+            "rho_raw": 0.5889566071131311,
+            "rho_shrunk": 0.5998286863637732,
+            "rho_variance": 0.004265012352100066,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.840801925634246,
+            "difficulty_ratio_shrunk": 0.8377720425851097,
+            "difficulty_ratio_variance": 0.0009982193895006256,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.0575992656212647
+          }
+        ]
+      },
+      {
+        "model": "glm-5-2",
+        "rho": 0.2861955470414866,
+        "rho_variance": 0.0016003684044846559,
+        "rho_valid_draws": 400,
+        "difficulty_ratio": 0.8016893013198008,
+        "difficulty_ratio_variance": 0.0007332339531367148,
+        "difficulty_ratio_valid_draws": 400,
+        "configs": [
+          {
+            "reasoning_effort": "high",
+            "rho_raw": 0.2974179127951993,
+            "rho_shrunk": 0.2902187535219268,
+            "rho_variance": 0.002863712587412983,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.8128293024958871,
+            "difficulty_ratio_shrunk": 0.80497580501977,
+            "difficulty_ratio_variance": 0.0017521510778814502,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.0161974582069047
+          },
+          {
+            "reasoning_effort": "max",
+            "rho_raw": 0.27565600239662547,
+            "rho_shrunk": 0.2827385748048157,
+            "rho_variance": 0.0032788013118259843,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.7905493001437143,
+            "difficulty_ratio_shrunk": 0.797048226308058,
+            "difficulty_ratio_variance": 0.001026752058643438,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.0061897222149154
+          }
+        ]
+      },
+      {
+        "model": "glm-5-3",
+        "rho": 0.4406140585019593,
+        "rho_variance": 0.003900967521259425,
+        "rho_valid_draws": 400,
+        "difficulty_ratio": 0.8458673956716775,
+        "difficulty_ratio_variance": 0.0008872259194647549,
+        "difficulty_ratio_valid_draws": 400,
+        "configs": [
+          {
+            "reasoning_effort": "max",
+            "rho_raw": 0.4406140585019593,
+            "rho_shrunk": 0.4406140585019592,
+            "rho_variance": 0.003900967521259426,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.8458673956716775,
+            "difficulty_ratio_shrunk": 0.8458673956716775,
+            "difficulty_ratio_variance": 0.0008872259194647549,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.067818799150792
+          }
+        ]
+      },
+      {
+        "model": "glm-5-3-flash",
+        "rho": 0.41803776893467137,
+        "rho_variance": 0.0030284916375947915,
+        "rho_valid_draws": 400,
+        "difficulty_ratio": 0.8167801251117075,
+        "difficulty_ratio_variance": 0.0007869340680251732,
+        "difficulty_ratio_valid_draws": 400,
+        "configs": [
+          {
+            "reasoning_effort": "max",
+            "rho_raw": 0.4180377689346713,
+            "rho_shrunk": 0.4180377689346713,
+            "rho_variance": 0.003028491637594791,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.8167801251117075,
+            "difficulty_ratio_shrunk": 0.8167801251117075,
+            "difficulty_ratio_variance": 0.0007869340680251732,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.0310991732627912
+          }
+        ]
+      },
+      {
+        "model": "gpt-5-4",
+        "rho": 0.40996002807929405,
+        "rho_variance": 0.003315982692165474,
+        "rho_valid_draws": 400,
+        "difficulty_ratio": 0.7737788442229879,
+        "difficulty_ratio_variance": 0.0010564076581799113,
+        "difficulty_ratio_valid_draws": 400,
+        "configs": [
+          {
+            "reasoning_effort": "xhigh",
+            "rho_raw": 0.4099600280792941,
+            "rho_shrunk": 0.40996002807929405,
+            "rho_variance": 0.003315982692165474,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.7737788442229879,
+            "difficulty_ratio_shrunk": 0.7737788442229879,
+            "difficulty_ratio_variance": 0.0010564076581799113,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 0.97681456984209
+          }
+        ]
+      },
+      {
+        "model": "gpt-5-5",
+        "rho": 0.4354539564582731,
+        "rho_variance": 0.000831075574178553,
+        "rho_valid_draws": 400,
+        "difficulty_ratio": 0.7794926146961493,
+        "difficulty_ratio_variance": 0.00035009822503548284,
+        "difficulty_ratio_valid_draws": 400,
+        "configs": [
+          {
+            "reasoning_effort": "high",
+            "rho_raw": 0.3727221353205858,
+            "rho_shrunk": 0.4222218022969927,
+            "rho_variance": 0.003108939304413601,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.7991140313067273,
+            "difficulty_ratio_shrunk": 0.7870250111509345,
+            "difficulty_ratio_variance": 0.0005618855200156834,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 0.9935364651825755
+          },
+          {
+            "reasoning_effort": "low",
+            "rho_raw": 0.46064450121827183,
+            "rho_shrunk": 0.44024785886768314,
+            "rho_variance": 0.0035359817128434654,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.7250024483829843,
+            "difficulty_ratio_shrunk": 0.7742263374046716,
+            "difficulty_ratio_variance": 0.003272367788860032,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 0.9773794830120961
+          },
+          {
+            "reasoning_effort": "medium",
+            "rho_raw": 0.46078972257250955,
+            "rho_shrunk": 0.44122774104143064,
+            "rho_variance": 0.0028157415294702776,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.7901547033266703,
+            "difficulty_ratio_shrunk": 0.7820397384795343,
+            "difficulty_ratio_variance": 0.0011153893688794815,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 0.9872430817224096
+          },
+          {
+            "reasoning_effort": "xhigh",
+            "rho_raw": 0.44960852748745633,
+            "rho_shrunk": 0.43853249815521006,
+            "rho_variance": 0.0029900577426234002,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.8036992757682148,
+            "difficulty_ratio_shrunk": 0.7881566440933969,
+            "difficulty_ratio_variance": 0.0006280504730815757,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 0.9949650329886915
+          }
+        ]
+      },
+      {
+        "model": "gpt-5-6-luna",
+        "rho": 0.36588219519034904,
+        "rho_variance": 0.0008379673121967998,
+        "rho_valid_draws": 400,
+        "difficulty_ratio": 0.7365769694005773,
+        "difficulty_ratio_variance": 0.000705175721356745,
+        "difficulty_ratio_valid_draws": 396,
+        "configs": [
+          {
+            "reasoning_effort": "high",
+            "rho_raw": 0.33629629629629626,
+            "rho_shrunk": 0.35944306058812536,
+            "rho_variance": 0.003012242025967091,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.7404108329930329,
+            "difficulty_ratio_shrunk": 0.7381047764740708,
+            "difficulty_ratio_variance": 0.0010643850898857784,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 0.9317798038972177
+          },
+          {
+            "reasoning_effort": "low",
+            "rho_raw": 0.18230528166322707,
+            "rho_shrunk": 0.3487028999486097,
+            "rho_variance": 0.008116500880185902,
+            "rho_valid_draws": 396,
+            "difficulty_ratio_raw": 0.6925333619792394,
+            "difficulty_ratio_shrunk": 0.7333405637384415,
+            "difficulty_ratio_variance": 0.008891421824452564,
+            "difficulty_ratio_valid_draws": 396,
+            "difficulty_ratio": 0.925765485402037
+          },
+          {
+            "reasoning_effort": "max",
+            "rho_raw": 0.35801164538570807,
+            "rho_shrunk": 0.36427103966279833,
+            "rho_variance": 0.0032555316409005716,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.8424780326988177,
+            "difficulty_ratio_shrunk": 0.7901682768940596,
+            "difficulty_ratio_variance": 0.0006883125549437621,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 0.9975045082451296
+          },
+          {
+            "reasoning_effort": "medium",
+            "rho_raw": 0.2909055559048224,
+            "rho_shrunk": 0.3576710202995362,
+            "rho_variance": 0.006813553174833308,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.6374729840301415,
+            "difficulty_ratio_shrunk": 0.7217355054087479,
+            "difficulty_ratio_variance": 0.004003640363862284,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 0.9111153174051393
+          },
+          {
+            "reasoning_effort": "xhigh",
+            "rho_raw": 0.4446848439066338,
+            "rho_shrunk": 0.38251576122894454,
+            "rho_variance": 0.003131959736852834,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.7699896353016544,
+            "difficulty_ratio_shrunk": 0.7504612713174925,
+            "difficulty_ratio_variance": 0.0009918343926727266,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 0.9473785816169077
+          }
+        ]
+      },
+      {
+        "model": "gpt-5-6-sol",
+        "rho": 0.5057040891030201,
+        "rho_variance": 0.0006920753078448911,
+        "rho_valid_draws": 400,
+        "difficulty_ratio": 0.7895057378706131,
+        "difficulty_ratio_variance": 0.00017318673119185482,
+        "difficulty_ratio_valid_draws": 400,
+        "configs": [
+          {
+            "reasoning_effort": "high",
+            "rho_raw": 0.49516499021271015,
+            "rho_shrunk": 0.5040205001915127,
+            "rho_variance": 0.003640247184341218,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.8080609400669581,
+            "difficulty_ratio_shrunk": 0.793152928686476,
+            "difficulty_ratio_variance": 0.0007079064106893438,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.0012723178440923
+          },
+          {
+            "reasoning_effort": "low",
+            "rho_raw": 0.43249728448701497,
+            "rho_shrunk": 0.49213581986475374,
+            "rho_variance": 0.0030419766151574884,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.735179121951352,
+            "difficulty_ratio_shrunk": 0.7824617460578147,
+            "difficulty_ratio_variance": 0.0011625117303931728,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 0.9877758219932579
+          },
+          {
+            "reasoning_effort": "max",
+            "rho_raw": 0.5696092885923916,
+            "rho_shrunk": 0.5160835846032721,
+            "rho_variance": 0.003568942061296228,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.8147469869878003,
+            "difficulty_ratio_shrunk": 0.7939418890429173,
+            "difficulty_ratio_variance": 0.0008122281602340323,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.0022682974795571
+          },
+          {
+            "reasoning_effort": "medium",
+            "rho_raw": 0.4861718897044986,
+            "rho_shrunk": 0.5023519267387309,
+            "rho_variance": 0.003340471878897939,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.7811580190255188,
+            "difficulty_ratio_shrunk": 0.788097544912179,
+            "difficulty_ratio_variance": 0.0008534581835065416,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 0.9948904264758481
+          },
+          {
+            "reasoning_effort": "xhigh",
+            "rho_raw": 0.565230190730775,
+            "rho_shrunk": 0.5145909630957246,
+            "rho_variance": 0.003943586809414098,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.8083836213214363,
+            "difficulty_ratio_shrunk": 0.793073646946712,
+            "difficulty_ratio_variance": 0.0007431479782799423,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.0011722329695807
+          }
+        ]
+      },
+      {
+        "model": "gpt-5-6-terra",
+        "rho": 0.44193937391435933,
+        "rho_variance": 0.0006547603986217483,
+        "rho_valid_draws": 400,
+        "difficulty_ratio": 0.7624238252026598,
+        "difficulty_ratio_variance": 0.00024943512728252865,
+        "difficulty_ratio_valid_draws": 400,
+        "configs": [
+          {
+            "reasoning_effort": "high",
+            "rho_raw": 0.3504238523731701,
+            "rho_shrunk": 0.42690830833926696,
+            "rho_variance": 0.0033316994478231766,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.7929403473598652,
+            "difficulty_ratio_shrunk": 0.7682030250516694,
+            "difficulty_ratio_variance": 0.0010676836412970236,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 0.9697756834134773
+          },
+          {
+            "reasoning_effort": "low",
+            "rho_raw": 0.43588615309185813,
+            "rho_shrunk": 0.4410008622956285,
+            "rho_variance": 0.003568319209115223,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.6990199536791827,
+            "difficulty_ratio_shrunk": 0.7569683592678478,
+            "difficulty_ratio_variance": 0.00264952033365162,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 0.9555930971268706
+          },
+          {
+            "reasoning_effort": "max",
+            "rho_raw": 0.4865528621357159,
+            "rho_shrunk": 0.4488487750166652,
+            "rho_variance": 0.003572978720760578,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.8183820096780782,
+            "difficulty_ratio_shrunk": 0.7764099619894994,
+            "difficulty_ratio_variance": 0.0007485485961613251,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 0.9801360798426376
+          },
+          {
+            "reasoning_effort": "medium",
+            "rho_raw": 0.4282841237582697,
+            "rho_shrunk": 0.43900565707440115,
+            "rho_variance": 0.002392881048467746,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.7389977137414984,
+            "difficulty_ratio_shrunk": 0.758376663587041,
+            "difficulty_ratio_variance": 0.0011943656518855527,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 0.9573709335048358
+          },
+          {
+            "reasoning_effort": "xhigh",
+            "rho_raw": 0.5151338313103018,
+            "rho_shrunk": 0.4548369206126991,
+            "rho_variance": 0.003061049531931854,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.762779101554675,
+            "difficulty_ratio_shrunk": 0.7625091215614502,
+            "difficulty_ratio_variance": 0.0007895119431680263,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 0.9625877279271705
+          }
+        ]
+      },
+      {
+        "model": "gpt-6-astra",
+        "rho": 0.7277786802214481,
+        "rho_variance": 0.0006277892681442202,
+        "rho_valid_draws": 400,
+        "difficulty_ratio": 0.830429764914903,
+        "difficulty_ratio_variance": 0.0001834349497657253,
+        "difficulty_ratio_valid_draws": 400,
+        "configs": [
+          {
+            "reasoning_effort": "high",
+            "rho_raw": 0.7044726307291536,
+            "rho_shrunk": 0.7238011985200283,
+            "rho_variance": 0.0030507412324179573,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.8310655158330421,
+            "difficulty_ratio_shrunk": 0.8305428759203118,
+            "difficulty_ratio_variance": 0.0008475782333525976,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.048473201528517
+          },
+          {
+            "reasoning_effort": "low",
+            "rho_raw": 0.6583652133190309,
+            "rho_shrunk": 0.7165016647121444,
+            "rho_variance": 0.003236444983380022,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.8113742924908334,
+            "difficulty_ratio_shrunk": 0.8275505130315297,
+            "difficulty_ratio_variance": 0.0010305747195711102,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.0446956574798008
+          },
+          {
+            "reasoning_effort": "max",
+            "rho_raw": 0.8107454661972651,
+            "rho_shrunk": 0.746922166571798,
+            "rho_variance": 0.0020930138757974406,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.8423870433061682,
+            "difficulty_ratio_shrunk": 0.8325326445642981,
+            "difficulty_ratio_variance": 0.0008596027541121614,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.0509850755821588
+          },
+          {
+            "reasoning_effort": "medium",
+            "rho_raw": 0.6926072625902117,
+            "rho_shrunk": 0.721924606394355,
+            "rho_variance": 0.003143983891278423,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.83508848533084,
+            "difficulty_ratio_shrunk": 0.8313070049500809,
+            "difficulty_ratio_variance": 0.0007907250420279583,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.04943783422052
+          },
+          {
+            "reasoning_effort": "xhigh",
+            "rho_raw": 0.7830821472612516,
+            "rho_shrunk": 0.7369669972965627,
+            "rho_variance": 0.0031508050941235163,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.8322334876136308,
+            "difficulty_ratio_shrunk": 0.8307306492393022,
+            "difficulty_ratio_variance": 0.0009162095175659818,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.048710245633802
+          }
+        ]
+      },
+      {
+        "model": "grok-4-5",
+        "rho": 0.4581763987222077,
+        "rho_variance": 0.0032201961065884597,
+        "rho_valid_draws": 400,
+        "difficulty_ratio": 0.7799664063396596,
+        "difficulty_ratio_variance": 0.0009388765807568949,
+        "difficulty_ratio_valid_draws": 400,
+        "configs": [
+          {
+            "reasoning_effort": "high",
+            "rho_raw": 0.4581763987222077,
+            "rho_shrunk": 0.4581763987222077,
+            "rho_variance": 0.00322019610658846,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.7799664063396596,
+            "difficulty_ratio_shrunk": 0.7799664063396596,
+            "difficulty_ratio_variance": 0.0009388765807568949,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 0.9846257175265906
+          }
+        ]
+      },
+      {
+        "model": "grok-4-6",
+        "rho": 0.47511235165082016,
+        "rho_variance": 0.00077860279803258,
+        "rho_valid_draws": 400,
+        "difficulty_ratio": 0.7943347989602634,
+        "difficulty_ratio_variance": 0.00020238305271537576,
+        "difficulty_ratio_valid_draws": 400,
+        "configs": [
+          {
+            "reasoning_effort": "high",
+            "rho_raw": 0.5074629678692967,
+            "rho_shrunk": 0.48187402396324136,
+            "rho_variance": 0.00294655262831265,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.8019614395061525,
+            "difficulty_ratio_shrunk": 0.7957761850205336,
+            "difficulty_ratio_variance": 0.0008684631544073548,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.0045839036113553
+          },
+          {
+            "reasoning_effort": "low",
+            "rho_raw": 0.3713609714897965,
+            "rho_shrunk": 0.4548419348258228,
+            "rho_variance": 0.003206570057095704,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.7355044916008471,
+            "difficulty_ratio_shrunk": 0.7856532990300232,
+            "difficulty_ratio_variance": 0.0011690685733002609,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 0.9918048226139801
+          },
+          {
+            "reasoning_effort": "medium",
+            "rho_raw": 0.5541907629562366,
+            "rho_shrunk": 0.4904438071291325,
+            "rho_variance": 0.0032373676617496153,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.8153583882271613,
+            "difficulty_ratio_shrunk": 0.7986295330037537,
+            "difficulty_ratio_variance": 0.0007883228051521512,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.0081859559337314
+          },
+          {
+            "reasoning_effort": "xhigh",
+            "rho_raw": 0.47716447553430885,
+            "rho_shrunk": 0.47545832610594513,
+            "rho_variance": 0.003839626594124452,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.8245148765068925,
+            "difficulty_ratio_shrunk": 0.8013382257823664,
+            "difficulty_ratio_variance": 0.0006697523147588359,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.011605396244266
+          }
+        ]
+      },
+      {
+        "model": "kimi-k2-7-code",
+        "rho": 0.3173059171051417,
+        "rho_variance": 0.0036239328567724363,
+        "rho_valid_draws": 400,
+        "difficulty_ratio": 0.7178263138067187,
+        "difficulty_ratio_variance": 0.0021702741131858763,
+        "difficulty_ratio_valid_draws": 400,
+        "configs": [
+          {
+            "reasoning_effort": null,
+            "rho_raw": 0.3173059171051417,
+            "rho_shrunk": 0.3173059171051417,
+            "rho_variance": 0.003623932856772437,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.7178263138067187,
+            "difficulty_ratio_shrunk": 0.7178263138067187,
+            "difficulty_ratio_variance": 0.0021702741131858763,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 0.9061803733424065
+          }
+        ]
+      },
+      {
+        "model": "kimi-k3",
+        "rho": 0.3721380816717404,
+        "rho_variance": 0.003546540784104125,
+        "rho_valid_draws": 400,
+        "difficulty_ratio": 0.839606506438751,
+        "difficulty_ratio_variance": 0.0006642988399521431,
+        "difficulty_ratio_valid_draws": 400,
+        "configs": [
+          {
+            "reasoning_effort": "max",
+            "rho_raw": 0.3721380816717404,
+            "rho_shrunk": 0.3721380816717404,
+            "rho_variance": 0.003546540784104125,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.839606506438751,
+            "difficulty_ratio_shrunk": 0.839606506438751,
+            "difficulty_ratio_variance": 0.0006642988399521431,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.059915083678923
+          }
+        ]
+      },
+      {
+        "model": "muse-spark-1-1",
+        "rho": 0.47083074641038103,
+        "rho_variance": 0.003080393636259462,
+        "rho_valid_draws": 400,
+        "difficulty_ratio": 0.8375827177639514,
+        "difficulty_ratio_variance": 0.0010700358523589599,
+        "difficulty_ratio_valid_draws": 400,
+        "configs": [
+          {
+            "reasoning_effort": "xhigh",
+            "rho_raw": 0.47083074641038103,
+            "rho_shrunk": 0.4708307464103811,
+            "rho_variance": 0.0030803936362594616,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.8375827177639514,
+            "difficulty_ratio_shrunk": 0.8375827177639514,
+            "difficulty_ratio_variance": 0.0010700358523589599,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.0573602629073486
+          }
+        ]
+      },
+      {
+        "model": "muse-spark-1-2",
+        "rho": 0.43500948766603426,
+        "rho_variance": 0.00256269601140379,
+        "rho_valid_draws": 400,
+        "difficulty_ratio": 0.8079375724468428,
+        "difficulty_ratio_variance": 0.0008901411529424745,
+        "difficulty_ratio_valid_draws": 400,
+        "configs": [
+          {
+            "reasoning_effort": "xhigh",
+            "rho_raw": 0.4350094876660343,
+            "rho_shrunk": 0.43500948766603426,
+            "rho_variance": 0.00256269601140379,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.8079375724468428,
+            "difficulty_ratio_shrunk": 0.8079375724468428,
+            "difficulty_ratio_variance": 0.0008901411529424745,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 1.0199363786967168
+          }
+        ]
+      },
+      {
+        "model": "qwen3-8-max",
+        "rho": 0.43594214737761167,
+        "rho_variance": 0.003053572392794584,
+        "rho_valid_draws": 400,
+        "difficulty_ratio": 0.7887634249385457,
+        "difficulty_ratio_variance": 0.0008695200086468926,
+        "difficulty_ratio_valid_draws": 400,
+        "configs": [
+          {
+            "reasoning_effort": "xhigh",
+            "rho_raw": 0.4359421473776116,
+            "rho_shrunk": 0.43594214737761167,
+            "rho_variance": 0.003053572392794584,
+            "rho_valid_draws": 400,
+            "difficulty_ratio_raw": 0.7887634249385457,
+            "difficulty_ratio_shrunk": 0.7887634249385457,
+            "difficulty_ratio_variance": 0.0008695200086468926,
+            "difficulty_ratio_valid_draws": 400,
+            "difficulty_ratio": 0.9957310301139264
+          }
+        ]
+      }
+    ]
+  },
+  "terminal_bench": {
+    "pool_rho": 0.5778533513130615,
+    "harnesses": [
+      {
+        "harness_label": "Claude Code",
+        "rho": 0.6047418998500398,
+        "submissions": [
+          {
+            "agent_display": "Claude Code",
+            "model_display": "Opus 4.8",
+            "reasoning_effort": "high",
+            "rho": 0.5003947839892027,
+            "accuracy": 78.88,
+            "n_trials": 445
+          },
+          {
+            "agent_display": "Claude Code",
+            "model_display": "Sonnet 5",
+            "reasoning_effort": "high",
+            "rho": 0.45150159213911145,
+            "accuracy": 74.61,
+            "n_trials": 445
+          },
+          {
+            "agent_display": "Claude Code",
+            "model_display": "Fable 5",
+            "reasoning_effort": "xhigh",
+            "rho": 0.5961620099789251,
+            "accuracy": 83.82,
+            "n_trials": 445
+          },
+          {
+            "agent_display": "Claude Code",
+            "model_display": "Opus 4.7",
+            "reasoning_effort": "max",
+            "rho": 0.6154948669063987,
+            "accuracy": 68.9,
+            "n_trials": 447
+          },
+          {
+            "agent_display": "Claude Code",
+            "model_display": "GLM-5.1",
+            "reasoning_effort": "max",
+            "rho": 0.7083701303200318,
+            "accuracy": 58.65,
+            "n_trials": 445
+          }
+        ]
+      },
+      {
+        "harness_label": "Codex",
+        "rho": 0.5695597384740925,
+        "submissions": [
+          {
+            "agent_display": "Codex",
+            "model_display": "GPT-5.6 Luna",
+            "reasoning_effort": "max",
+            "rho": 0.6071957576729667,
+            "accuracy": 75.73,
+            "n_trials": 445
+          },
+          {
+            "agent_display": "Codex",
+            "model_display": "GPT-5.6 Terra",
+            "reasoning_effort": "max",
+            "rho": 0.6296088279160907,
+            "accuracy": 78.43,
+            "n_trials": 445
+          },
+          {
+            "agent_display": "Codex",
+            "model_display": "GPT-5.6 Luna",
+            "reasoning_effort": "max",
+            "rho": 0.5524811988767415,
+            "accuracy": 71.24,
+            "n_trials": 445
+          },
+          {
+            "agent_display": "Codex",
+            "model_display": "GPT-5.6 Sol",
+            "reasoning_effort": "max",
+            "rho": 0.6141066645562936,
+            "accuracy": 76.18,
+            "n_trials": 445
+          },
+          {
+            "agent_display": "Codex",
+            "model_display": "GPT-5.6 Terra",
+            "reasoning_effort": "max",
+            "rho": 0.46536992065137883,
+            "accuracy": 74.38,
+            "n_trials": 445
+          },
+          {
+            "agent_display": "Codex",
+            "model_display": "GPT-5.5",
+            "reasoning_effort": "xhigh",
+            "rho": 0.5707030635272667,
+            "accuracy": 83.15,
+            "n_trials": 445
+          }
+        ]
+      },
+      {
+        "harness_label": "Cursor CLI",
+        "rho": 0.42319762085153856,
+        "submissions": [
+          {
+            "agent_display": "Cursor CLI",
+            "model_display": "Grok 4.5",
+            "reasoning_effort": "high",
+            "rho": 0.42319762085153856,
+            "accuracy": 79.33,
+            "n_trials": 445
+          }
+        ]
+      },
+      {
+        "harness_label": "Gemini CLI",
+        "rho": 0.550647388426885,
+        "submissions": [
+          {
+            "agent_display": "Gemini CLI",
+            "model_display": "Gemini 3.1 Pro",
+            "reasoning_effort": "high",
+            "rho": 0.47303499686176265,
+            "accuracy": 65.84,
+            "n_trials": 445
+          },
+          {
+            "agent_display": "Gemini CLI",
+            "model_display": "Gemini 3 Pro",
+            "reasoning_effort": "high",
+            "rho": 0.6253534575798836,
+            "accuracy": 65.84,
+            "n_trials": 445
+          }
+        ]
+      },
+      {
+        "harness_label": "mini-SWE-agent",
+        "rho": 0.5719225422476419,
+        "submissions": [
+          {
+            "agent_display": "mini-SWE-agent",
+            "model_display": "Muse Spark 1.1",
+            "reasoning_effort": "xhigh",
+            "rho": 0.5719225422476419,
+            "accuracy": 76.18,
+            "n_trials": 445
+          }
+        ]
+      },
+      {
+        "harness_label": "Terminus 2",
+        "rho": 0.5927954907470809,
+        "submissions": [
+          {
+            "agent_display": "Terminus 2",
+            "model_display": "Fable 5",
+            "reasoning_effort": "high",
+            "rho": 0.6068549829882568,
+            "accuracy": 80.45,
+            "n_trials": 445
+          },
+          {
+            "agent_display": "Terminus 2",
+            "model_display": "Gemini 3.1 Pro",
+            "reasoning_effort": "high",
+            "rho": 0.4980105100862554,
+            "accuracy": 65.62,
+            "n_trials": 445
+          },
+          {
+            "agent_display": "Terminus 2",
+            "model_display": "Opus 4.7",
+            "reasoning_effort": "max",
+            "rho": 0.6188257565501327,
+            "accuracy": 66.07,
+            "n_trials": 445
+          },
+          {
+            "agent_display": "Terminus 2",
+            "model_display": "Gemini 3 Pro",
+            "reasoning_effort": "high",
+            "rho": 0.6182439019782959,
+            "accuracy": 73.93,
+            "n_trials": 445
+          },
+          {
+            "agent_display": "Terminus 2",
+            "model_display": "GPT-5.5",
+            "reasoning_effort": "xhigh",
+            "rho": 0.6796368128622257,
+            "accuracy": 77.98,
+            "n_trials": 445
+          }
+        ]
+      }
+    ]
+  }
+}

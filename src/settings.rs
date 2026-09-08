@@ -28,7 +28,7 @@ impl Default for PlanPrices {
 pub struct Settings {
     pub escalation_minutes: f64,
     pub escalation_usd: f64,
-    pub rho: f64,
+    pub rho_override: Option<f64>,
     pub agent_hours: f64,
     pub draws: u32,
     pub assumption_span_pct: f64,
@@ -68,7 +68,7 @@ impl Default for Settings {
         Self {
             escalation_minutes: 60.0,
             escalation_usd: 0.0,
-            rho: 0.653,
+            rho_override: None,
             agent_hours: 56.0,
             draws: 4000,
             assumption_span_pct: 25.0,
@@ -91,7 +91,10 @@ impl Settings {
             finite(self.escalation_minutes, defaults.escalation_minutes).clamp(0.0, 10080.0);
         self.escalation_usd =
             finite(self.escalation_usd, defaults.escalation_usd).clamp(0.0, 1_000_000.0);
-        self.rho = finite(self.rho, defaults.rho).clamp(0.0, 0.999);
+        self.rho_override = self
+            .rho_override
+            .filter(|value| value.is_finite())
+            .map(|value| value.clamp(0.0, 0.999));
         self.agent_hours = finite(self.agent_hours, defaults.agent_hours).clamp(1.0, 1680.0);
         self.draws = self.draws.clamp(1, 20000);
         self.assumption_span_pct =
@@ -164,10 +167,10 @@ pub fn load_settings() -> Settings {
             {
                 settings.escalation_usd = val;
             }
-            if let Some(v) = value.get("rho").cloned()
+            if let Some(v) = value.get("rho_override").cloned()
                 && let Ok(val) = serde_json::from_value(v)
             {
-                settings.rho = val;
+                settings.rho_override = val;
             }
             if let Some(v) = value.get("agent_hours").cloned()
                 && let Ok(val) = serde_json::from_value(v)

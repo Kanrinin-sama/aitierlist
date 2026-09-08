@@ -51,7 +51,8 @@ fn pass(row: &Row, benchmark: Benchmark) -> Option<f64> {
         Benchmark::Hle => row.hle,
         Benchmark::Lcr => row.lcr,
     }?;
-    (value.is_finite() && (0.0..=1.0).contains(&value)).then_some(value)
+    (value.is_finite() && (0.0..=1.0).contains(&value))
+        .then(|| row.retry.adjusted_pass(benchmark, value))
 }
 
 pub fn competence(row: &Row, seat: Seat) -> Option<f64> {
@@ -240,13 +241,13 @@ struct Assumptions {
     name: String,
     runtime: f64,
     model_cost: f64,
-    rho: f64,
+    rho_multiplier: f64,
     escalation_time: f64,
     allowance_high: Option<bool>,
     time_basis: TimeBasis,
 }
 
-fn baseline(settings: &Settings, time_basis: TimeBasis) -> Assumptions {
+fn baseline(time_basis: TimeBasis) -> Assumptions {
     Assumptions {
         name: format!(
             "Baseline · {} time",
@@ -258,7 +259,7 @@ fn baseline(settings: &Settings, time_basis: TimeBasis) -> Assumptions {
         ),
         runtime: 1.0,
         model_cost: 1.0,
-        rho: settings.rho,
+        rho_multiplier: 1.0,
         escalation_time: 1.0,
         allowance_high: None,
         time_basis,
@@ -272,13 +273,13 @@ fn scenarios(settings: &Settings) -> Vec<Assumptions> {
     ];
     let mut scenarios = Vec::with_capacity(66);
     for time_basis in [TimeBasis::Token, TimeBasis::Pooled] {
-        scenarios.push(baseline(settings, time_basis));
+        scenarios.push(baseline(time_basis));
         for mask in 0..32_u8 {
             scenarios.push(Assumptions {
                 name: format!("{} time · runtime {} · cost {} · correlation {} · escalation {} · allowance {}", if time_basis == TimeBasis::Token { "Token" } else { "Pooled" }, if mask & 1 == 0 { "low" } else { "high" }, if mask & 2 == 0 { "low" } else { "high" }, if mask & 4 == 0 { "low" } else { "high" }, if mask & 8 == 0 { "low" } else { "high" }, if mask & 16 == 0 { "low" } else { "high" }),
                 runtime: multipliers[usize::from(mask & 1 != 0)],
                 model_cost: multipliers[usize::from(mask & 2 != 0)],
-                rho: (settings.rho * multipliers[usize::from(mask & 4 != 0)]).clamp(0.0, 1.0 - f64::EPSILON),
+                rho_multiplier: multipliers[usize::from(mask & 4 != 0)],
                 escalation_time: multipliers[usize::from(mask & 8 != 0)],
                 allowance_high: Some(mask & 16 != 0),
                 time_basis,
@@ -316,12 +317,21 @@ fn cycles_for(
         {
             return None;
         }
-        let ratio = assumptions.rho / (1.0 - assumptions.rho);
+        let resolved = match benchmark {
+            Benchmark::Swe => row.retry.deepswe,
+            Benchmark::Terminal => row.retry.terminal_bench,
+            Benchmark::Qna => row.retry.qna,
+            _ => return None,
+        };
+        let rho = (settings.rho_override.unwrap_or(resolved.rho) * assumptions.rho_multiplier)
+            .clamp(0.0, 1.0 - f64::EPSILON);
+        let ratio = rho / (1.0 - rho);
+        let pass = row.retry.adjusted_pass(benchmark, metric.pass);
         let mut reached = 1.0;
         let mut attempts = 0.0;
         for (attempt, total) in totals.iter_mut().enumerate() {
             attempts += reached;
-            reached *= 1.0 - metric.pass / (1.0 + attempt as f64 * ratio);
+            reached *= 1.0 - pass / (1.0 + attempt as f64 * ratio);
             let agent_seconds = attempts * seconds * assumptions.runtime * runtime_multiplier;
             let escalation_seconds =
                 reached * settings.escalation_minutes * 60.0 * assumptions.escalation_time;
@@ -346,22 +356,15 @@ pub fn implementation_cycle(row: &Row, settings: &Settings) -> Option<Cycle> {
     } else {
         &CODING[..]
     };
-    cycles_for(
-        row,
-        mix,
-        settings,
-        &baseline(settings, TimeBasis::Token),
-        1.0,
-        1.0,
-    )?
-    .into_iter()
-    .reduce(|best, next| {
-        if (1.0 - next.unfinished) / next.wall > (1.0 - best.unfinished) / best.wall {
-            next
-        } else {
-            best
-        }
-    })
+    cycles_for(row, mix, settings, &baseline(TimeBasis::Token), 1.0, 1.0)?
+        .into_iter()
+        .reduce(|best, next| {
+            if (1.0 - next.unfinished) / next.wall > (1.0 - best.unfinished) / best.wall {
+                next
+            } else {
+                best
+            }
+        })
 }
 
 fn allowance(row: &Row, plan: Option<Allowance>, override_amount: Option<f64>) -> (f64, f64) {
@@ -510,7 +513,7 @@ fn analyze(
         Tier::T20 => settings.plan_prices.t20,
     };
     let plans = VENDORS.map(|vendor| plan_for(vendor, budget));
-    let nominal_assumptions = baseline(settings, TimeBasis::Token);
+    let nominal_assumptions = baseline(TimeBasis::Token);
     let mut policies = Vec::new();
     let mut excluded = Vec::new();
     for (row_index, row) in rows.iter().enumerate() {
@@ -582,7 +585,7 @@ fn analyze(
             row,
             reference_workload(seat),
             settings,
-            &baseline(settings, TimeBasis::Pooled),
+            &baseline(TimeBasis::Pooled),
             runtime_multiplier,
             model_cost_multiplier,
         )
@@ -970,6 +973,9 @@ pub fn score(
     cache_state: CacheState,
     source_fetched_at: String,
 ) -> Table {
+    for row in &mut rows {
+        row.retry = crate::retry::resolve(row, settings.rho_override);
+    }
     rows.sort_by(|left, right| {
         let wall = |row: &Row| {
             implementation_cycle(row, settings)

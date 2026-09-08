@@ -25,6 +25,7 @@ pub struct App {
     table: Table,
     panel_widths: std::collections::HashMap<(Seat, Tier), f32>,
     agent_hours_text: String,
+    rho_override_text: String,
     agent_hours_invalid: bool,
     refresh_in_flight: bool,
     retry_after: Option<Instant>,
@@ -110,6 +111,10 @@ impl App {
             table,
             panel_widths: std::collections::HashMap::new(),
             agent_hours_text: settings.agent_hours.to_string(),
+            rho_override_text: settings
+                .rho_override
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
             agent_hours_invalid: false,
             refresh_in_flight: true,
             retry_after: None,
@@ -236,6 +241,7 @@ impl App {
             if let Some(row) = selected_row {
                 ui.label(egui::RichText::new(row.display_name()).strong().size(15.0));
                 ui.label(format!("Vendor: {} | Harness: {}", row.vendor, row.harness));
+                ui.label(row.retry.description());
             }
             ui.add_space(4.0);
             ui.label(format!("Role competence: {}", competence_text(pick.competence))).on_hover_text(
@@ -339,7 +345,13 @@ impl App {
                             ui.label(format!("{:.1}%", weight * 100.0));
                             ui.label(
                                 metric
-                                    .map(|metric| format!("{:.1}%", metric.pass * 100.0))
+                                    .map(|metric| {
+                                        format!(
+                                            "{:.1}%",
+                                            row.retry.adjusted_pass(*benchmark, metric.pass)
+                                                * 100.0
+                                        )
+                                    })
                                     .unwrap_or_else(|| "Unknown".into()),
                             );
                             let time = ui.label(
@@ -1315,7 +1327,7 @@ impl eframe::App for App {
                                                 .unwrap_or_else(|| "-".into()),
                                         ]
                                     } else {
-                                        [percent(row.swe), percent(row.term), percent(row.qna)]
+                                        [percent(row.swe.map(|value| row.retry.adjusted_pass(crate::types::Benchmark::Swe, value))), percent(row.term), percent(row.qna)]
                                     };
                                     let tasks = crate::engine::implementation_cycle(
                                         row,
@@ -1349,7 +1361,10 @@ impl eframe::App for App {
                                             egui::Layout::right_to_left(egui::Align::Center)
                                         };
                                         ui.with_layout(direction, |ui| {
-                                            ui.label(value);
+                                            let response = ui.label(value);
+                                            if column == 1 {
+                                                response.on_hover_text(row.retry.description());
+                                            }
                                         });
                                     }
                                     ui.end_row();
@@ -1394,16 +1409,27 @@ impl eframe::App for App {
                             .changed();
                     });
                     ui.horizontal(|ui| {
-                        ui.label("Retry failure correlation:").on_hover_text(
-                            "0 treats attempts as independent. Larger values make repeat failures more likely by reducing conditional success after failures.",
+                        ui.label("Retry correlation override:").on_hover_text(
+                            "Blank derives correlation separately for each row and suite. A number from 0 to 0.999 overrides every suite; 0 treats attempts as independent.",
                         );
-                        changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut self.settings.rho)
-                                    .speed(0.001)
-                                    .range(0.0..=0.999),
-                            )
-                            .changed();
+                        if ui.add(egui::TextEdit::singleline(&mut self.rho_override_text)
+                            .hint_text("derived")
+                            .desired_width(80.0)).changed() {
+                            if self.rho_override_text.trim().is_empty() {
+                                self.settings.rho_override = None;
+                                changed = true;
+                            } else if let Ok(value) = self.rho_override_text.trim().parse::<f64>()
+                                && value.is_finite()
+                                && (0.0..=0.999).contains(&value) {
+                                self.settings.rho_override = Some(value);
+                                changed = true;
+                            }
+                        }
+                        if !self.rho_override_text.trim().is_empty()
+                            && !self.rho_override_text.trim().parse::<f64>().is_ok_and(|value|
+                                value.is_finite() && (0.0..=0.999).contains(&value)) {
+                            ui.colored_label(egui::Color32::YELLOW, "Use 0–0.999 or leave blank");
+                        }
                     });
 
                     ui.separator();

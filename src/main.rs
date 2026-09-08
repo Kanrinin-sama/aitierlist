@@ -6,6 +6,7 @@ mod comparison;
 mod engine;
 mod file_tx;
 mod handoff;
+mod retry;
 mod settings;
 mod types;
 mod ui;
@@ -36,7 +37,13 @@ fn main() -> eframe::Result<()> {
                         "--agent-hours" => settings.agent_hours = value.parse()?,
                         "--draws" => settings.draws = value.parse()?,
                         "--assumption-span" => settings.assumption_span_pct = value.parse()?,
-                        "--rho" => settings.rho = value.parse()?,
+                        "--rho-override" => {
+                            settings.rho_override = if value.is_empty() {
+                                None
+                            } else {
+                                Some(value.parse()?)
+                            }
+                        }
                         "--escalation-minutes" => settings.escalation_minutes = value.parse()?,
                         "--escalation-usd" => settings.escalation_usd = value.parse()?,
                         "--competence-floor" => {
