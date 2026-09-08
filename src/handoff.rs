@@ -73,122 +73,12 @@ impl UpdateLock {
 pub struct ExpectedImage {
     pub size: u64,
     pub sha256: String,
-    pub version: String,
     pub volume: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ImageFacts {
     pub identity: FileIdentity,
-}
-
-fn stamp_prefix() -> Vec<u8> {
-    let mut prefix = Vec::with_capacity(19);
-    prefix.extend_from_slice(b"AITIERLIST");
-    prefix.push(b'_');
-    prefix.extend_from_slice(b"VERSION");
-    prefix.push(b'=');
-    prefix
-}
-
-#[derive(Debug, Default)]
-pub struct StampScan {
-    expected_prefix: Vec<u8>,
-    carry: Vec<u8>,
-    found: std::collections::BTreeSet<String>,
-}
-
-const MAX_STAMP_VALUE: usize = 32;
-
-impl StampScan {
-    pub fn new() -> Self {
-        StampScan {
-            expected_prefix: stamp_prefix(),
-            carry: Vec::new(),
-            found: std::collections::BTreeSet::new(),
-        }
-    }
-
-    fn window(&self) -> usize {
-        self.expected_prefix.len() + MAX_STAMP_VALUE + 1
-    }
-
-    pub fn feed(&mut self, chunk: &[u8]) {
-        let window = self.window();
-        let mut buffer = std::mem::take(&mut self.carry);
-        buffer.extend_from_slice(chunk);
-        let decidable = buffer.len().saturating_sub(window - 1);
-        self.scan(&buffer, decidable);
-        let keep = buffer.len().min(window - 1);
-        self.carry = buffer[buffer.len() - keep..].to_vec();
-    }
-
-    fn scan(&mut self, buffer: &[u8], decidable: usize) {
-        let first = self.expected_prefix[0];
-        let mut at = 0;
-        while at < decidable {
-            let Some(offset) = buffer[at..decidable].iter().position(|byte| *byte == first) else {
-                return;
-            };
-            let start = at + offset;
-            self.consider(&buffer[start..]);
-            at = start + 1;
-        }
-    }
-
-    fn consider(&mut self, at: &[u8]) {
-        if !at.starts_with(&self.expected_prefix) {
-            return;
-        }
-        let rest = &at[self.expected_prefix.len()..];
-        let Some(value) = stamp_value(rest) else {
-            return;
-        };
-        if crate::update::parse_release_version(value).is_some() {
-            self.found.insert(value.to_owned());
-        }
-    }
-
-    pub fn finish(mut self) -> Vec<String> {
-        let buffer = std::mem::take(&mut self.carry);
-        let decidable = buffer
-            .len()
-            .saturating_sub(self.expected_prefix.len().saturating_sub(1));
-        self.scan(&buffer, decidable);
-        self.found.into_iter().collect()
-    }
-}
-
-fn stamp_value(rest: &[u8]) -> Option<&str> {
-    let bytes = &rest[..rest.len().min(MAX_STAMP_VALUE)];
-    if !bytes.first().is_some_and(u8::is_ascii_digit) {
-        return None;
-    }
-    let mut i = 1;
-    while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
-        i += 1;
-    }
-    if i < bytes.len() && bytes[i] == b'-' {
-        let mut j = i + 1;
-        if j < bytes.len() && bytes[j].is_ascii_alphanumeric() {
-            j += 1;
-            while j < bytes.len() && bytes[j].is_ascii_alphanumeric() {
-                j += 1;
-            }
-            while j < bytes.len() && bytes[j] == b'.' {
-                let next = j + 1;
-                if next >= bytes.len() || !bytes[next].is_ascii_alphanumeric() {
-                    break;
-                }
-                j = next + 1;
-                while j < bytes.len() && bytes[j].is_ascii_alphanumeric() {
-                    j += 1;
-                }
-            }
-            i = j;
-        }
-    }
-    std::str::from_utf8(&bytes[..i]).ok()
 }
 
 pub fn authenticate_image(file: &mut File, expect: &ExpectedImage) -> Result<ImageFacts> {
@@ -203,11 +93,9 @@ pub fn authenticate_image(file: &mut File, expect: &ExpectedImage) -> Result<Ima
 
     file.seek(std::io::SeekFrom::Start(0))
         .context("rewinding the image")?;
-    let mut stamps = StampScan::new();
     let mut head = Vec::with_capacity(4096);
     let (measured, digest) =
         crate::file_tx::hash_reader_with(file, "hashed image size overflowed u64", |chunk| {
-            stamps.feed(chunk);
             if head.len() < 4096 {
                 let room = 4096 - head.len();
                 head.extend_from_slice(&chunk[..room.min(chunk.len())]);
@@ -230,20 +118,6 @@ pub fn authenticate_image(file: &mut File, expect: &ExpectedImage) -> Result<Ima
         );
     }
     verify_pe_shape(&head)?;
-
-    let found = stamps.finish();
-    match found.as_slice() {
-        [only] if *only == expect.version => {}
-        [] => bail!("the update carries no AITIERLIST version stamp at all"),
-        [only] => bail!(
-            "the update is stamped {only}, not the {} it was published as",
-            expect.version
-        ),
-        many => bail!(
-            "the update carries more than one version stamp ({})",
-            many.join(", ")
-        ),
-    }
 
     Ok(ImageFacts { identity })
 }
@@ -306,7 +180,6 @@ impl Control {
         ExpectedImage {
             size: self.size,
             sha256: self.sha256.clone(),
-            version: self.version.clone(),
             volume: Some(self.canonical_volume),
         }
     }
@@ -908,7 +781,6 @@ mod windows_handoff {
         let expect = ExpectedImage {
             size: copied,
             sha256: digest,
-            version: env!("CARGO_PKG_VERSION").to_string(),
             volume: None,
         };
         let mut pinned = file_tx::open_launch_image(&path)
@@ -948,7 +820,6 @@ mod windows_handoff {
         let expect = ExpectedImage {
             size: staged.size,
             sha256: staged.sha256.to_owned(),
-            version: staged.version.to_owned(),
             volume: Some(canonical.volume_serial()),
         };
         let stage_path = staged.stage.path().to_path_buf();

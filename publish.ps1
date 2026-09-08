@@ -63,6 +63,9 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $root = $PSScriptRoot
 $exe = Join-Path $root 'target\release\aitierlist.exe'
+$packedExe = Join-Path $root 'target\release\aitierlist-packed.exe'
+$upx = 'C:\Users\kaltsit\AppData\Local\Microsoft\WinGet\Links\upx.exe'
+if (-not (Test-Path -LiteralPath $upx -PathType Leaf)) { throw "UPX was not found at $upx" }
 
 # ---------------------------------------------------------------- primitives
 
@@ -2042,6 +2045,57 @@ function Assert-HashSizeLine {
 }
 
 
+function New-PackedArtifact {
+    param(
+        [Parameter(Mandatory)][System.IO.Stream] $Source,
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][string] $Upx,
+        [Parameter(Mandatory)][string] $Root
+    )
+
+    $settings = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'aitierlist\settings.json'
+    $scratch = Join-Path ([IO.Path]::GetTempPath()) ('aitierlist-smoke-' + [Guid]::NewGuid().ToString('N') + '.json')
+    $cache = Join-Path $Root 'assets\aa-snapshot.json'
+    $packed = $null
+    try {
+        Copy-Item -LiteralPath $settings -Destination $scratch
+        foreach ($lzma in @($true, $false)) {
+            $null = $Source.Seek(0, [IO.SeekOrigin]::Begin)
+            $copy = [IO.File]::Open($Path, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            try { $Source.CopyTo($copy) }
+            finally { $copy.Dispose() }
+            $arguments = @('--best')
+            if ($lzma) { $arguments += '--lzma' }
+            $arguments += $Path
+            $compression = Invoke-BoundedProcess -FilePath $Upx -ArgumentList $arguments -What 'packing the release executable'
+            Write-Host $compression.StandardOutput.Trim()
+            $packed = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+            try {
+                Write-Host "  command  : & '$Path' --dump-table '--settings=$scratch' '--cache=$cache'"
+                $smoke = Invoke-BoundedProcess -FilePath $Path -ArgumentList @('--dump-table', "--settings=$scratch", "--cache=$cache") `
+                    -What 'the packed executable smoke test' -TimeoutSeconds 300 -MaxOutputBytes 64MB
+            }
+            catch {
+                $packed.Dispose()
+                $packed = $null
+                if (-not $lzma) { throw }
+                Write-Warning "The --best --lzma smoke test failed: $($_.Exception.Message). Retrying with --best without --lzma."
+                continue
+            }
+            Write-Host "  smoke    : exit $($smoke.ExitCode), UPX $(if ($lzma) { '--best --lzma' } else { '--best' })" -ForegroundColor Green
+            return $packed
+        }
+        throw 'the packed executable did not pass its smoke test'
+    }
+    catch {
+        if ($null -ne $packed) { $packed.Dispose() }
+        throw
+    }
+    finally {
+        if (Test-Path -LiteralPath $scratch) { Remove-Item -LiteralPath $scratch -Force }
+    }
+}
+
 # One remote command, through the shared bounded and noninteractive machinery.
 # No `-o` of its own, no argument string, no shell: Invoke-RemoteCommand adds
 # the control arguments - which include `-n`, because a control command's
@@ -2083,27 +2137,16 @@ Assert-Grammar -Value $remoteDir -Pattern (Get-WebRootGrammar) -What 'release di
 
 # ------------------------------------------------- one stable artifact, held
 
-# The artifact is opened once, read for its hash and its length, and that handle
-# stays open until the upload has finished. Hashing a path, then measuring the
-# path, then uploading the path is three separate resolutions of one name: a
-# rebuild landing between any two of them publishes a manifest describing bytes
-# that were never uploaded. Denying write and delete sharing also means a
-# concurrent `cargo build` fails loudly instead of racing this script.
-$artifact = [System.IO.File]::Open(
+# The unpacked build is held against writes and deletion through inspection and
+# copying. The packed copy is held through its smoke test, hash, size and upload.
+$unpacked = [System.IO.File]::Open(
     $exe,
     [System.IO.FileMode]::Open,
     [System.IO.FileAccess]::Read,
     [System.IO.FileShare]::Read)
+$artifact = $unpacked
 try {
-    $size = $artifact.Length
-    Assert-ArtifactSize -Size $size -What 'the release binary' | Out-Null
-    $sha = (Get-FileHash -InputStream $artifact -Algorithm SHA256).Hash.ToLower()
-    $null = $artifact.Seek(0, [System.IO.SeekOrigin]::Begin)
-
     Write-Host "AITIERLIST $Version" -ForegroundColor Cyan
-    Write-Host ("  artifact : {0}  ({1:N1} MB)" -f $fileName, ($size / 1MB))
-    Write-Host "  sha256   : $sha"
-    Write-Host "  target   : ${RemoteHost}:$remoteDir"
 
     # The binary must actually have been built from this version, or the manifest
     # describes bytes that were never built from this tree. This is not paranoia: a
@@ -2120,7 +2163,7 @@ try {
     # "AITIERLIST_VERSION=0.5.9", and "AITIERLIST_VERSION=0.5.9.1" contains it too, so both
     # published happily as 0.5.9. Every stamp in the image is enumerated, they
     # must all be one value, and that value must equal this version.
-    $reader = [System.IO.StreamReader]::new($artifact, [System.Text.Encoding]::Latin1, $false, 1MB, $true)
+    $reader = [System.IO.StreamReader]::new($unpacked, [System.Text.Encoding]::Latin1, $false, 1MB, $true)
     $bytes = $reader.ReadToEnd()
     $reader.Dispose()
     Assert-VersionStamp -Image $bytes -Version $Version -Path $exe | Out-Null
@@ -2135,19 +2178,26 @@ try {
     Write-Host "  stamp    : $Version confirmed in binary" -ForegroundColor Green
     Write-Host "  built    : $($head.Commit) tree $($head.Tree)" -ForegroundColor Green
 
-    # What this artifact *is*, checked on the held object and before anything
-    # leaves this machine - -WhatIf included, because "what would happen" must
-    # not skip the check that decides whether it may.
-    #
-    # The stream, never the path: this is the same object that was hashed, and
-    # the upload below streams that same object. Re-opening $exe here would let
-    # a rebuild - or anything else - substitute a different file between the
-    # hash, the check and the upload, and the manifest would then describe bytes
-    # nobody verified.
-    $image = Assert-ReleaseImage -Stream $artifact -Path $exe
+    # Inspect the unpacked build's PE headers, load flags and imports before
+    # compression changes their on-disk representation. Copy this held object.
+    $image = Assert-ReleaseImage -Stream $unpacked -Path $exe
     Write-Host "  image    : $($image.Magic) $($image.Machine), DependentLoadFlags 0x$('{0:x4}' -f $image.DependentLoadFlags)" -ForegroundColor Green
     Write-Host "  imports  : $($image.Imports -join ', ')"
     $null = $artifact.Seek(0, [System.IO.SeekOrigin]::Begin)
+
+    if ($WhatIf) {
+        Write-Host "`n(WhatIf) would pack $exe to $packedExe with UPX --best --lzma, smoke-test it, then publish its hash and size. Nothing was changed." -ForegroundColor Yellow
+        return
+    }
+
+    $artifact = New-PackedArtifact -Source $unpacked -Path $packedExe -Upx $upx -Root $root
+    $size = $artifact.Length
+    Assert-ArtifactSize -Size $size -What 'the packed release artifact' | Out-Null
+    $sha = (Get-FileHash -InputStream $artifact -Algorithm SHA256).Hash.ToLower()
+    $null = $artifact.Seek(0, [System.IO.SeekOrigin]::Begin)
+    Write-Host ("  artifact : {0}  ({1} unpacked bytes, {2} packed bytes)" -f $fileName, $unpacked.Length, $size)
+    Write-Host "  sha256   : $sha"
+    Write-Host "  target   : ${RemoteHost}:$remoteDir"
 
     # The manifest, as bytes, before anything is uploaded. These exact bytes are
     # what goes up, what is hashed here, and what every check from the stage to
@@ -2156,11 +2206,6 @@ try {
     $expectedManifest = New-ReleaseManifest -Version $Version -FileName $fileName -Sha256 $sha -Size $size
     $manifestDocument = New-ReleaseManifestBytes -Manifest $expectedManifest
     Write-Host "  manifest : $($manifestDocument.Size) bytes, sha256 $($manifestDocument.Sha256)"
-
-    if ($WhatIf) {
-        Write-Host "`n(WhatIf) nothing was uploaded." -ForegroundColor Yellow
-        return
-    }
 
     # A unique staging name per run, local and remote. A fixed `$env:TEMP\aitierlist-update.json`
     # and a fixed `~/aitierlist-stage/<file>` are both names something else may already
@@ -2359,5 +2404,6 @@ try {
 }
 finally {
     $artifact.Dispose()
+    if ($unpacked -ne $artifact) { $unpacked.Dispose() }
 }
 
