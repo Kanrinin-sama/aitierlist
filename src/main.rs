@@ -77,7 +77,7 @@ fn main() -> eframe::Result<()> {
             } else {
                 aa::load_rows(false, f64::INFINITY)?
             };
-            let table = engine::score(rows, &settings, state, fetched);
+            let table = engine::score(rows, &settings, state, fetched, None);
             let output = if let Some(request) = comparison_request {
                 let mut parts = request.split(':');
                 let seat_name = parts.next().unwrap_or_default();

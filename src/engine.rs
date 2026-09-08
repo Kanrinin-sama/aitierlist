@@ -972,7 +972,11 @@ pub fn score(
     settings: &Settings,
     cache_state: CacheState,
     source_fetched_at: String,
+    vendor_filter: Option<&str>,
 ) -> Table {
+    if let Some(vendor) = vendor_filter {
+        rows.retain(|row| row.vendor == vendor);
+    }
     for row in &mut rows {
         row.retry = crate::retry::resolve(row, settings.rho_override);
     }

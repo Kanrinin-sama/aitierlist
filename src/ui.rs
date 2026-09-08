@@ -6,6 +6,13 @@ use std::time::{Duration, Instant};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const REFRESH_COOLDOWN_SECONDS: u64 = 16;
+const VENDOR_TABS: [(&str, &str); 5] = [
+    ("Codex", "openai"),
+    ("Claude", "anthropic"),
+    ("Muse", "muse"),
+    ("Gemini", "google"),
+    ("Grok", "xai"),
+];
 
 fn competence_text(value: Option<f64>) -> String {
     value
@@ -23,6 +30,8 @@ type ComparisonResponse = (
 
 pub struct App {
     table: Table,
+    vendor_tables: [Table; 5],
+    selected_tab: usize,
     panel_widths: std::collections::HashMap<(Seat, Tier), f32>,
     agent_hours_text: String,
     rho_override_text: String,
@@ -30,7 +39,7 @@ pub struct App {
     refresh_in_flight: bool,
     retry_after: Option<Instant>,
     refresh_warning: String,
-    table_rx: Receiver<(Table, bool, Settings)>,
+    table_rx: Receiver<(Table, [Table; 5], bool, Settings)>,
     scored_settings: Option<Settings>,
     settings_tx: Sender<(Settings, bool)>,
     engine_error_rx: Receiver<String>,
@@ -93,10 +102,24 @@ impl App {
                     }
                 }
                 if let Some((rows, state, fetched)) = &loaded {
-                    let table =
-                        crate::engine::score(rows.clone(), &settings, *state, fetched.clone());
+                    let table = crate::engine::score(
+                        rows.clone(),
+                        &settings,
+                        *state,
+                        fetched.clone(),
+                        None,
+                    );
+                    let vendor_tables = VENDOR_TABS.map(|(_, vendor)| {
+                        crate::engine::score(
+                            rows.clone(),
+                            &settings,
+                            *state,
+                            fetched.clone(),
+                            Some(vendor),
+                        )
+                    });
                     if table_tx
-                        .send((table, fetched_rows, settings.clone()))
+                        .send((table, vendor_tables, fetched_rows, settings.clone()))
                         .is_err()
                     {
                         break;
@@ -109,6 +132,8 @@ impl App {
 
         let mut app = Self {
             table,
+            vendor_tables: std::array::from_fn(|_| Table::empty()),
+            selected_tab: 0,
             panel_widths: std::collections::HashMap::new(),
             agent_hours_text: settings.agent_hours.to_string(),
             rho_override_text: settings
@@ -156,6 +181,14 @@ impl App {
             app.update_status = format!("Last seen: {version}");
         }
         app
+    }
+
+    fn selected_table(&self) -> &Table {
+        if self.selected_tab == 0 {
+            &self.table
+        } else {
+            &self.vendor_tables[self.selected_tab - 1]
+        }
     }
 
     fn frontier_content(&self, ui: &mut egui::Ui, seat: Seat, tier: Tier) -> Option<f64> {
@@ -233,9 +266,10 @@ impl App {
     }
 
     fn detail_content(&self, ui: &mut egui::Ui, seat: Seat, tier: Tier) -> Option<f64> {
+        let table = self.selected_table();
         let selected_floor;
-        if let Some(pick) = self.table.get_pick(seat, tier) {
-            let selected_row = self.table.rows.get(pick.row_index);
+        if let Some(pick) = table.get_pick(seat, tier) {
+            let selected_row = table.rows.get(pick.row_index);
 
             ui.heading("Selected policy");
             if let Some(row) = selected_row {
@@ -413,7 +447,7 @@ impl App {
                         .max_height(260.0)
                         .show(ui, |ui| {
                         for scenario in &pick.scenarios {
-                            let leader = self.table.rows.get(scenario.row_index)
+                            let leader = table.rows.get(scenario.row_index)
                                 .map(|row| row.display_name())
                                 .unwrap_or_else(|| format!("Row #{}", scenario.row_index));
                             ui.label(format!(
@@ -439,7 +473,7 @@ impl App {
             );
             for (idx, cand) in pick.top.iter().take(4).enumerate() {
                 ui.group(|ui| {
-                    let cand_row = self.table.rows.get(cand.row_index);
+                    let cand_row = table.rows.get(cand.row_index);
                     let name = cand_row
                         .map(|r| r.display_name())
                         .unwrap_or_else(|| format!("Row #{}", cand.row_index));
@@ -484,8 +518,14 @@ impl App {
                     .is_some()
                 {
                     "No candidate meets the configured competence minimum for this seat and tier."
+                        .to_string()
+                } else if self.selected_tab != 0 {
+                    format!(
+                        "{} has no eligible plan or candidate at this tier.",
+                        VENDOR_TABS[self.selected_tab - 1].0
+                    )
                 } else {
-                    "No eligible candidate has this seat's reference workload data."
+                    "No eligible candidate has this seat's reference workload data.".to_string()
                 },
             );
             selected_floor = self.frontier_content(ui, seat, tier);
@@ -494,14 +534,19 @@ impl App {
         ui.add_space(10.0);
         ui.heading("Source & Timestamps");
         ui.label("Source: Artificial Analysis");
-        ui.label(format!("Source Fetched: {}", self.table.source_fetched_at));
-        ui.label(format!("Generated At: {}", self.table.generated_at));
-        ui.label(format!("Cache State: {}", self.table.cache_state.name()));
+        ui.label(format!("Source Fetched: {}", table.source_fetched_at));
+        ui.label(format!("Generated At: {}", table.generated_at));
+        ui.label(format!("Cache State: {}", table.cache_state.name()));
         selected_floor
     }
 
     fn counterfactual_content(&mut self, ui: &mut egui::Ui, seat: Seat, tier: Tier) {
-        let Some(pick) = self.table.get_pick(seat, tier) else {
+        let table = if self.selected_tab == 0 {
+            &self.table
+        } else {
+            &self.vendor_tables[self.selected_tab - 1]
+        };
+        let Some(pick) = table.get_pick(seat, tier) else {
             return;
         };
         let mut alternatives = Vec::new();
@@ -525,8 +570,7 @@ impl App {
         ui.add_space(10.0);
         ui.heading("What would change this pick?");
         ui.label("Each estimate changes only this configuration. Competitors stay unchanged while nominal throughput, scenario bands, and retry caps are recomputed across 24 bounded sampled changes.");
-        let selected_name = self
-            .table
+        let selected_name = table
             .rows
             .get(*choice)
             .map(|row| row.display_name())
@@ -535,8 +579,7 @@ impl App {
             .selected_text(selected_name)
             .show_ui(ui, |ui| {
                 for row_index in alternatives {
-                    let name = self
-                        .table
+                    let name = table
                         .rows
                         .get(row_index)
                         .map(|row| row.display_name())
@@ -560,7 +603,7 @@ impl App {
             )
             .clicked()
         {
-            let rows = self.table.rows.clone();
+            let rows = table.rows.clone();
             let settings = self.settings.clone();
             let sender = self.comparison_tx.clone();
             let context = ui.ctx().clone();
@@ -717,7 +760,9 @@ impl App {
     }
 
     fn pump_channels(&mut self) {
-        while let Ok((new_table, fetched_rows, scored_settings)) = self.table_rx.try_recv() {
+        while let Ok((new_table, vendor_tables, fetched_rows, scored_settings)) =
+            self.table_rx.try_recv()
+        {
             if fetched_rows {
                 self.refresh_in_flight = false;
                 if new_table.cache_state == CacheState::Live {
@@ -743,6 +788,8 @@ impl App {
             self.panel_widths.clear();
             self.invalidate_comparisons();
             self.table = new_table;
+            self.vendor_tables = vendor_tables;
+            self.comparison_choice.clear();
             self.scored_settings = Some(scored_settings);
             if !self.refresh_in_flight {
                 self.engine_status.clear();
@@ -1037,6 +1084,18 @@ impl eframe::App for App {
                                 ui.add(egui::Label::new(explanation).wrap());
                             }
                         });
+                    let previous_tab = self.selected_tab;
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.selected_tab, 0, "Best in house");
+                        for (index, (label, _)) in VENDOR_TABS.iter().enumerate() {
+                            ui.selectable_value(&mut self.selected_tab, index + 1, *label);
+                        }
+                    });
+                    if self.selected_tab != previous_tab {
+                        self.panel_widths.clear();
+                        self.comparison_choice.clear();
+                        self.invalidate_comparisons();
+                    }
                     if !self.refresh_warning.is_empty() {
                         ui.colored_label(egui::Color32::YELLOW, &self.refresh_warning);
                     }
@@ -1109,7 +1168,8 @@ impl eframe::App for App {
                                 for tier in Tier::ALL {
                                     let is_selected = self.selected_seat_tier == Some((seat, tier));
                                     let label = tier.name();
-                                    let maybe_pick = self.table.get_pick(seat, tier);
+                                    let table = self.selected_table();
+                                    let maybe_pick = table.get_pick(seat, tier);
 
                                     let (
                                         agent_name,
@@ -1120,15 +1180,11 @@ impl eframe::App for App {
                                         tasks_wk,
                                         a_star_hours,
                                     ) = if let Some(pick) = maybe_pick {
-                                        let mut name = self
-                                            .table
+                                        let name = table
                                             .rows
                                             .get(pick.row_index)
                                             .map(|r| r.display_name())
                                             .unwrap_or_else(|| "-".into());
-                                        if pick.competence_floor.is_none() {
-                                            name.push_str(" · Automatic");
-                                        }
                                         let competence = competence_text(pick.competence);
                                         let capacity_shortfall =
                                             format!("{:.1}%", pick.capacity_shortfall * 100.0);
@@ -1153,7 +1209,22 @@ impl eframe::App for App {
                                         )
                                     } else {
                                         (
-                                            "No candidate meets requirements".into(),
+                                            if self.selected_tab != 0
+                                                && self
+                                                    .settings
+                                                    .competence_floors
+                                                    .get(seat.name())
+                                                    .copied()
+                                                    .flatten()
+                                                    .is_none()
+                                            {
+                                                format!(
+                                                    "{} has no eligible plan or candidate at this tier.",
+                                                    VENDOR_TABS[self.selected_tab - 1].0
+                                                )
+                                            } else {
+                                                "No candidate meets requirements".into()
+                                            },
                                             "-".into(),
                                             "-".into(),
                                             "-".into(),
