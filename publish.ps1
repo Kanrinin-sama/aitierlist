@@ -1666,7 +1666,7 @@ function Invoke-RemoteCommand {
         $LeadingArguments = Get-SshControlArguments
     }
     if ($TimeoutSeconds -le 0) { $TimeoutSeconds = $script:DefaultControlTimeoutSeconds }
-    $arguments = @($LeadingArguments) + @($RemoteHost, $Command)
+    $arguments = @($LeadingArguments) + @($RemoteHost, $Command.Replace("`r`n", "`n"))
     $result = Invoke-BoundedProcess -FilePath $Ssh -ArgumentList $arguments -What $What `
         -TimeoutSeconds $TimeoutSeconds -MaxOutputBytes $MaxOutputBytes
     return $result.StandardOutput.Trim()
