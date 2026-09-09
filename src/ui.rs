@@ -120,8 +120,8 @@ pub struct App {
     comparison_result: Option<ComparisonResponse>,
     comparison_tx: Sender<ComparisonResponse>,
     comparison_rx: Receiver<ComparisonResponse>,
-    conductor_comparison_rx: Receiver<Vec<crate::portfolio::ConductorTradeoff>>,
-    conductor_comparison_tx: Sender<Vec<crate::portfolio::ConductorTradeoff>>,
+    conductor_comparison_rx: Receiver<(u64, Vec<crate::portfolio::ConductorTradeoff>)>,
+    conductor_comparison_tx: Sender<(u64, Vec<crate::portfolio::ConductorTradeoff>)>,
     conductor_comparison_pending: bool,
     conductor_comparison: Vec<crate::portfolio::ConductorTradeoff>,
 }
@@ -1141,6 +1141,8 @@ impl App {
             self.table_revision = self.table_revision.wrapping_add(1);
             self.table = new_table;
             self.vendor_tables = vendor_tables;
+            self.conductor_comparison.clear();
+            self.conductor_comparison_pending = false;
             self.comparison_choice.clear();
             self.scored_settings = Some(scored_settings);
             if !self.refresh_in_flight {
@@ -1208,6 +1210,8 @@ impl App {
         self.settings = self.settings.clone().normalize();
         let _ = save_settings(&self.settings);
         self.invalidate_comparisons();
+        self.conductor_comparison.clear();
+        self.table_revision = self.table_revision.wrapping_add(1);
         let _ = self.settings_tx.send((self.settings.clone(), false));
         self.engine_status = "Scoring…".to_owned();
     }
@@ -1276,7 +1280,9 @@ impl App {
             }
             return;
         }
-        if let Ok(points) = self.conductor_comparison_rx.try_recv() {
+        if let Ok((revision, points)) = self.conductor_comparison_rx.try_recv()
+            && revision == self.table_revision
+        {
             self.conductor_comparison = points;
             self.conductor_comparison_pending = false;
         }
@@ -1410,9 +1416,13 @@ impl App {
                 let rows = self.table.rows.clone();
                 let settings = self.settings.clone();
                 let sender = self.conductor_comparison_tx.clone();
+                let revision = self.table_revision;
                 let context = ui.ctx().clone();
                 std::thread::spawn(move || {
-                    let _ = sender.send(crate::portfolio::compare_conductors(&rows, &settings));
+                    let _ = sender.send((
+                        revision,
+                        crate::portfolio::compare_conductors(&rows, &settings),
+                    ));
                     context.request_repaint();
                 });
             }
@@ -1422,6 +1432,7 @@ impl App {
             );
         });
         if !self.conductor_comparison.is_empty() {
+            let mut selected_conductor_floor = None;
             egui::Grid::new("conductor_floor_comparison")
                 .striped(true)
                 .show(ui, |ui| {
@@ -1450,17 +1461,24 @@ impl App {
                             |gap| format!("{:.1}%", gap * 100.0),
                         ));
                         if ui.button("Use floor").clicked() {
-                            self.settings.competence_floors.insert(
-                                Seat::Orchestrator.name().to_owned(),
-                                Some(point.competence_floor),
-                            );
-                            let _ = save_settings(&self.settings);
-                            let _ = self.settings_tx.send((self.settings.clone(), false));
-                            self.engine_status = "Scoring…".to_owned();
+                            selected_conductor_floor = Some(point.competence_floor);
                         }
                         ui.end_row();
                     }
                 });
+            if let Some(floor) = selected_conductor_floor {
+                self.settings
+                    .competence_floors
+                    .insert(Seat::Orchestrator.name().to_owned(), Some(floor));
+                let _ = save_settings(&self.settings);
+                self.comparison_generation = self.comparison_generation.wrapping_add(1);
+                self.comparison_pending = None;
+                self.comparison_result = None;
+                self.conductor_comparison.clear();
+                self.table_revision = self.table_revision.wrapping_add(1);
+                let _ = self.settings_tx.send((self.settings.clone(), false));
+                self.engine_status = "Scoring…".to_owned();
+            }
         }
         ui.strong("Role assignments");
         ui.label(
@@ -1554,20 +1572,17 @@ impl App {
                                 .research_candidates
                                 .iter()
                                 .find(|candidate| candidate.primary);
-                            if let Some(row) =
-                                rule.row_index.and_then(|index| self.table.rows.get(index))
-                            {
-                                ui.label(row.display_name());
-                                ui.label(rule.provider_id.as_deref().unwrap_or("Unknown"));
-                            } else if let Some(primary) = rule
-                                .research_candidates
-                                .iter()
-                                .find(|candidate| candidate.primary)
+                            if let Some(primary) = research_primary
                                 && let Some(row) = self.table.rows.get(primary.row_index)
                             {
                                 ui.label(research_route_name(row, &primary.native_harness));
                                 ui.label(&primary.provider_id)
                                     .on_hover_text(&primary.plan_id);
+                            } else if let Some(row) =
+                                rule.row_index.and_then(|index| self.table.rows.get(index))
+                            {
+                                ui.label(row.display_name());
+                                ui.label(rule.provider_id.as_deref().unwrap_or("Unknown"));
                             } else {
                                 ui.label("No qualified model");
                                 ui.label("—");
@@ -1577,7 +1592,7 @@ impl App {
                                     .map(|candidate| candidate.score)
                                     .or(rule.competence),
                             ));
-                            ui.label(if research_primary.is_some() {
+                            ui.label(if research_primary.is_some() && rule.planned_jobs == 0 {
                                 "On demand".to_owned()
                             } else {
                                 format!("{:.2}", rule.expected_visits)

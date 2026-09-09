@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-08T01:49:32.5782284+00:00",
+  "generated_at": "2026-09-09T22:42:42.0033511+00:00",
   "sources": [
     {
       "name": "DeepSWE v1.1",
@@ -10,10 +10,15 @@
       "name": "Terminal-Bench 2.1",
       "url": "https://github.com/harbor-framework/terminal-bench-2-1/tree/main/leaderboard/submissions",
       "revision_or_generated_at": "7131e4375048a0e408a8fb404b5f499d726b695b"
+    },
+    {
+      "name": "Terminal-Bench 4.0",
+      "url": "https://github.com/harbor-framework/terminal-bench/tree/main/leaderboard/submissions",
+      "revision_or_generated_at": "83c7a6172d629c6575b785ab12c8db787bb2e323"
     }
   ],
   "deepswe": {
-    "pool_rho": 0.4575057884032161,
+    "pool_rho": 0.45750578840321604,
     "bootstrap_draws": 400,
     "bootstrap_seed": 113400,
     "difficulty_ratio_normalizer": 0.7921450683808653,
@@ -1364,6 +1369,139 @@
             "rho": 0.6796368128622257,
             "accuracy": 77.98,
             "n_trials": 445
+          }
+        ]
+      }
+    ]
+  },
+  "terminal_bench_v4": {
+    "pool_rho": 0.5108060954141533,
+    "harnesses": [
+      {
+        "harness_label": "Claude Code",
+        "rho": 0.547298518247306,
+        "submissions": [
+          {
+            "agent_display": "Claude Code",
+            "model_display": "Fable 5.1",
+            "reasoning_effort": "max",
+            "rho": 0.5471715588010431,
+            "accuracy": 57.88,
+            "n_trials": 330
+          },
+          {
+            "agent_display": "Claude Code",
+            "model_display": "GLM-5.3",
+            "reasoning_effort": "max",
+            "rho": 0.6715581270025492,
+            "accuracy": 41.82,
+            "n_trials": 330
+          },
+          {
+            "agent_display": "Claude Code",
+            "model_display": "Opus 5",
+            "reasoning_effort": "max",
+            "rho": 0.6367285004061105,
+            "accuracy": 51.82,
+            "n_trials": 330
+          },
+          {
+            "agent_display": "Claude Code",
+            "model_display": "Sonnet 5",
+            "reasoning_effort": "max",
+            "rho": 0.2521914661593052,
+            "accuracy": 12.42,
+            "n_trials": 330
+          },
+          {
+            "agent_display": "Claude Code",
+            "model_display": "Fable 5",
+            "reasoning_effort": "max",
+            "rho": 0.5222231186162987,
+            "accuracy": 44.55,
+            "n_trials": 330
+          },
+          {
+            "agent_display": "Claude Code",
+            "model_display": "Opus 4.8",
+            "reasoning_effort": "max",
+            "rho": 0.43521708815505544,
+            "accuracy": 23.64,
+            "n_trials": 330
+          }
+        ]
+      },
+      {
+        "harness_label": "Codex",
+        "rho": 0.49753707268159275,
+        "submissions": [
+          {
+            "agent_display": "Codex",
+            "model_display": "GPT-5.6 Luna",
+            "reasoning_effort": "max",
+            "rho": 0.518596853896333,
+            "accuracy": 17.27,
+            "n_trials": 330
+          },
+          {
+            "agent_display": "Codex",
+            "model_display": "GPT-5.6 Sol",
+            "reasoning_effort": "max",
+            "rho": 0.5227300650663937,
+            "accuracy": 37.27,
+            "n_trials": 330
+          },
+          {
+            "agent_display": "Codex",
+            "model_display": "GPT-5.6 Terra",
+            "reasoning_effort": "max",
+            "rho": 0.4447062222082876,
+            "accuracy": 21.52,
+            "n_trials": 330
+          }
+        ]
+      },
+      {
+        "harness_label": "Grok Build",
+        "rho": 0.4830581257662939,
+        "submissions": [
+          {
+            "agent_display": "Grok Build",
+            "model_display": "Grok 4.6",
+            "reasoning_effort": "none",
+            "rho": 0.501296322870314,
+            "accuracy": 20.3,
+            "n_trials": 330
+          },
+          {
+            "agent_display": "Grok Build",
+            "model_display": "Grok 4.5",
+            "reasoning_effort": "none",
+            "rho": 0.4482063872234524,
+            "accuracy": 12.42,
+            "n_trials": 330
+          }
+        ]
+      },
+      {
+        "harness_label": "mini-SWE-agent",
+        "rho": 0.38192175047235566,
+        "submissions": [
+          {
+            "agent_display": "mini-SWE-agent",
+            "model_display": "Gemini 3.8 Flash",
+            "reasoning_effort": "high",
+            "rho": 0.35594913792193006,
+            "accuracy": 19.09,
+            "n_trials": 330
+          },
+          {
+            "agent_display": "mini-SWE-agent",
+            "model_display": "Gemini 3.7 Flash",
+            "reasoning_effort": "high",
+            "rho": 0.43700417176927764,
+            "accuracy": 11.21,
+            "n_trials": 330
           }
         ]
       }

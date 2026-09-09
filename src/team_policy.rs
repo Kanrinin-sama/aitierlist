@@ -6,7 +6,7 @@ use crate::agent_setup::NativeCoefficient;
 use crate::portfolio::WorkClass;
 use crate::types::Seat;
 
-pub const VERSION: &str = concat!("aitierlist-", env!("CARGO_PKG_VERSION"), "-team-policy-v1");
+pub const VERSION: &str = concat!("aitierlist-", env!("CARGO_PKG_VERSION"), "-team-policy-v2");
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "snake_case")]

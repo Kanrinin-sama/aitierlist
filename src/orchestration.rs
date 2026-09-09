@@ -338,7 +338,17 @@ pub fn render_with_discovery(
     }
     output.push_str("## Risk-qualified workflow templates\n\nRecord the eight risk-vector dimensions and evaluate from Extensive to Focused; first match wins. File count informs load and never selects a template. Research eligibility depends provisionally on verified source tools, billing, permissions, and task-relevant evidence; it has no coding-benchmark prerequisite and no fabricated success probability.\n\n");
     for class in portfolio.dispatch.classes.iter().rev() {
-        writeln!(output, "- {}: {}.", class.class.name(), class.condition)?;
+        writeln!(
+            output,
+            "- {}: {}. Research reference: {}.",
+            class.class.name(),
+            class.condition,
+            if class.research_included {
+                "included in every static proxy job"
+            } else {
+                "excluded from the coding-only static proxy"
+            }
+        )?;
     }
     output.push_str("\n## Exact model registry\n\nIDs identify native harness/model/effort combinations, not aliases with independent quota.\n\n| ID | Benchmark harness | Native harness | Model | Effort | Model provider | Profile binding ID |\n|---|---|---|---|---|---|---|\n");
     let mut registry = std::collections::BTreeSet::new();
@@ -527,7 +537,7 @@ pub fn render_with_discovery(
             }
         }
     }
-    output.push_str("\n## Net Research ranking policy\n\nEach template has one default route selected by `score = accuracy × weight + non-hallucination × weight + LCR × weight + HLE × weight`. Weights are task-policy preferences, not probabilities. GPQA and GDP.pdf are diagnostics. Expected USD and decode hours are AA reference-workload proxies, not native research latency, budget, quota, or holds. Every route remains conditional on task-specific tools, permissions, source scope, billing, and a native hold.\n\n| Template | Rank | Route | Native harness | Account / plan | Score | Weighted components | Diagnostics | AA proxy USD / decode h | Eligibility | Source |\n|---|---:|---|---|---|---:|---|---|---|---|---|\n");
+    output.push_str("\n## Net Research ranking policy\n\nEach template ranks routes by `score = accuracy × weight + no incorrect answer (all questions) × weight + LCR × weight + HLE × weight`. The funded default is the route selected by the joint schedule; without funded research, the highest score leads the conditional recommendations. Weights are task-policy preferences, not probabilities. GPQA and GDP.pdf are diagnostics. Expected USD and decode hours are AA reference-workload proxies, not native research latency, budget, quota, or holds. Every route remains conditional on task-specific tools, permissions, source scope, billing, and a native hold.\n\n| Template | Rank | Route | Native harness | Account / plan | Score | Weighted components | Diagnostics | AA proxy USD / decode h | Eligibility | Source |\n|---|---:|---|---|---|---:|---|---|---|---|---|\n");
     if let Some(role) = portfolio
         .roles
         .iter()
@@ -541,7 +551,7 @@ pub fn render_with_discovery(
                     .context("Research candidate unavailable")?;
                 writeln!(
                     output,
-                    "| {} | {} | {} ({}) | {} | {} / {} | {:.4} | accuracy {:.4} x {:.2}; non-hallucination {:.4} x {:.2}; LCR {:.4} x {:.2}; HLE {} x {:.2} | GPQA {}; GDP.pdf {} | {} / {} | {} | {}; [methodology](https://artificialanalysis.ai/methodology/intelligence-benchmarking) |",
+                    "| {} | {} | {} ({}) | {} | {} / {} | {:.4} | accuracy {:.4} x {:.2}; no incorrect answer (all questions) {:.4} x {:.2}; LCR {:.4} x {:.2}; HLE {} x {:.2} | GPQA {}; GDP.pdf {} | {} / {} | {} | {}; [methodology](https://artificialanalysis.ai/methodology/intelligence-benchmarking) |",
                     rule.class.name(),
                     if candidate.primary {
                         "Default".to_string()
@@ -556,8 +566,8 @@ pub fn render_with_discovery(
                     candidate.score,
                     candidate.accuracy,
                     candidate.accuracy_weight,
-                    candidate.non_hallucination,
-                    candidate.non_hallucination_weight,
+                    candidate.non_wrong,
+                    candidate.non_wrong_weight,
                     candidate.lcr,
                     candidate.lcr_weight,
                     candidate

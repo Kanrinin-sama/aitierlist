@@ -242,14 +242,51 @@ $harnesses = @($submissions | Group-Object agent_display | Sort-Object Name | Fo
         })
     }
 })
+$terminalBenchV21 = [ordered]@{ pool_rho = Fit-Rho $submissions; harnesses = $harnesses }
+$terminalBenchV21Revision = $revision
+$terminalBenchV4Revision = '83c7a6172d629c6575b785ab12c8db787bb2e323'
+$terminalBenchV4Repo = 'https://api.github.com/repos/harbor-framework/terminal-bench'
+$files = Invoke-RestMethod "$terminalBenchV4Repo/contents/leaderboard/submissions?ref=$terminalBenchV4Revision"
+$submissions = @($files | Where-Object name -Like '*.json' | Sort-Object name | ForEach-Object {
+    $submission = Invoke-RestMethod $_.download_url
+    $metrics = $submission.metrics
+    @{
+        date = $submission.metadata.date
+        agent_display = $submission.metadata.agent_display.label
+        model_display = $submission.metadata.model_display.label
+        reasoning_effort = $submission.metadata.reasoning_effort
+        accuracy = $metrics.accuracy
+        n_trials = $metrics.n_trials
+        observed = [double[]]@(($metrics.accuracy / 100.0), $metrics.pass_at_2, $metrics.pass_at_3, $metrics.pass_at_4, $metrics.pass_at_5)
+    }
+})
+$harnesses = @($submissions | Group-Object agent_display | Sort-Object Name | ForEach-Object {
+    [ordered]@{
+        harness_label = $_.Name
+        rho = Fit-Rho $_.Group
+        submissions = @($_.Group | Sort-Object date -Descending | ForEach-Object {
+            [ordered]@{
+                agent_display = $_.agent_display
+                model_display = $_.model_display
+                reasoning_effort = $_.reasoning_effort
+                rho = Fit-Rho @($_)
+                accuracy = $_.accuracy
+                n_trials = $_.n_trials
+            }
+        })
+    }
+})
+$terminalBenchV4 = [ordered]@{ pool_rho = Fit-Rho $submissions; harnesses = $harnesses }
 $result = [ordered]@{
     generated_at = [DateTimeOffset]::UtcNow.ToString('o')
     sources = @(
         [ordered]@{ name = 'DeepSWE v1.1'; url = $deepUrl; revision_or_generated_at = $leaderboard.generated_at }
-        [ordered]@{ name = 'Terminal-Bench 2.1'; url = 'https://github.com/harbor-framework/terminal-bench-2-1/tree/main/leaderboard/submissions'; revision_or_generated_at = $revision }
+        [ordered]@{ name = 'Terminal-Bench 2.1'; url = 'https://github.com/harbor-framework/terminal-bench-2-1/tree/main/leaderboard/submissions'; revision_or_generated_at = $terminalBenchV21Revision }
+        [ordered]@{ name = 'Terminal-Bench 4.0'; url = 'https://github.com/harbor-framework/terminal-bench/tree/main/leaderboard/submissions'; revision_or_generated_at = $terminalBenchV4Revision }
     )
     deepswe = [ordered]@{ pool_rho = Get-Pool $moments.Values; bootstrap_draws = $bootstrapDraws; bootstrap_seed = $bootstrapSeed; difficulty_ratio_normalizer = $meanRatio; models = $models }
-    terminal_bench = [ordered]@{ pool_rho = Fit-Rho $submissions; harnesses = $harnesses }
+    terminal_bench = $terminalBenchV21
+    terminal_bench_v4 = $terminalBenchV4
 }
 $json = ($result | ConvertTo-Json -Depth 12).Replace("`r`n", "`n")
 [IO.File]::WriteAllText($destination, $json + "`n", [Text.UTF8Encoding]::new($false))

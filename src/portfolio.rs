@@ -5,8 +5,6 @@ use crate::subscriptions;
 use crate::types::{Row, Seat};
 use serde::{Deserialize, Serialize};
 
-const EXPECTED_VISITS: [f64; 7] = [1.0, 0.25, 1.25, 2.0, 1.25, 1.0, 0.0];
-const RESERVED_VISITS: [usize; 7] = [1, 1, 2, 2, 2, 1, 0];
 const SEARCH_NODES: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,75 +56,108 @@ pub struct WorkflowStage {
     pub id: usize,
     pub seat: Seat,
     pub visit: usize,
-    pub dependencies: &'static [usize],
+    pub dependencies: Vec<usize>,
     pub condition: &'static str,
 }
 
-pub const STAGES: &[WorkflowStage] = &[
-    WorkflowStage {
+fn workflow_stages(class: WorkClass, research: bool) -> Vec<WorkflowStage> {
+    let mut stages = vec![WorkflowStage {
         id: 0,
         seat: Seat::Orchestrator,
         visit: 1,
-        dependencies: &[],
+        dependencies: Vec::new(),
         condition: "Admitted change",
-    },
-    WorkflowStage {
-        id: 1,
-        seat: Seat::Comprehension,
-        visit: 1,
-        dependencies: &[0],
-        condition: "Brief accepted",
-    },
-    WorkflowStage {
-        id: 2,
+    }];
+    let mut dependency = 0;
+    if research {
+        stages.push(WorkflowStage {
+            id: stages.len(),
+            seat: Seat::NetResearch,
+            visit: 1,
+            dependencies: vec![dependency],
+            condition: "Class policy includes one declared research reference visit",
+        });
+        dependency = stages.len() - 1;
+    }
+    if matches!(class, WorkClass::Complex | WorkClass::Extensive) {
+        stages.push(WorkflowStage {
+            id: stages.len(),
+            seat: Seat::Comprehension,
+            visit: 1,
+            dependencies: vec![dependency],
+            condition: "Brief and evidence packet accepted",
+        });
+        dependency = stages.len() - 1;
+    }
+    stages.push(WorkflowStage {
+        id: stages.len(),
         seat: Seat::Implementer,
         visit: 1,
-        dependencies: &[1],
-        condition: "Context established",
-    },
-    WorkflowStage {
-        id: 3,
-        seat: Seat::Reviewer,
-        visit: 1,
-        dependencies: &[2],
-        condition: "Implementation produced immutable output; skip if implementation blocked",
-    },
-    WorkflowStage {
-        id: 4,
-        seat: Seat::Sanity,
-        visit: 1,
-        dependencies: &[2],
-        condition: "Implementation produced immutable output; skip if implementation blocked",
-    },
-    WorkflowStage {
-        id: 5,
+        dependencies: vec![dependency],
+        condition: "Required context and evidence accepted",
+    });
+    let implementation = stages.len() - 1;
+    if class == WorkClass::Focused {
+        stages.push(WorkflowStage {
+            id: stages.len(),
+            seat: Seat::Orchestrator,
+            visit: 2,
+            dependencies: vec![implementation],
+            condition: "Accept bounded output or close with deferral",
+        });
+        return stages;
+    }
+    for seat in [Seat::Reviewer, Seat::Sanity] {
+        stages.push(WorkflowStage {
+            id: stages.len(),
+            seat,
+            visit: 1,
+            dependencies: vec![implementation],
+            condition: "Implementation produced immutable output",
+        });
+    }
+    let initial_checks = [stages.len() - 2, stages.len() - 1];
+    stages.push(WorkflowStage {
+        id: stages.len(),
         seat: Seat::Debugger,
         visit: 1,
-        dependencies: &[3, 4],
+        dependencies: initial_checks.to_vec(),
         condition: "Implementation blocked or either initial check rejected; otherwise skip",
-    },
-    WorkflowStage {
-        id: 6,
-        seat: Seat::Reviewer,
-        visit: 2,
-        dependencies: &[5],
-        condition: "Repair produced immutable output; otherwise skip",
-    },
-    WorkflowStage {
-        id: 7,
-        seat: Seat::Sanity,
-        visit: 2,
-        dependencies: &[5],
-        condition: "Repair produced immutable output; otherwise skip",
-    },
-    WorkflowStage {
-        id: 8,
+    });
+    let repair = stages.len() - 1;
+    for seat in [Seat::Reviewer, Seat::Sanity] {
+        stages.push(WorkflowStage {
+            id: stages.len(),
+            seat,
+            visit: 2,
+            dependencies: vec![repair],
+            condition: "Repair produced immutable output; otherwise skip",
+        });
+    }
+    stages.push(WorkflowStage {
+        id: stages.len(),
         seat: Seat::Orchestrator,
         visit: 2,
-        dependencies: &[6, 7],
+        dependencies: vec![stages.len() - 2, stages.len() - 1],
         condition: "Accept checked output or close with bounded deferral",
-    },
-];
+    });
+    stages
+}
+
+fn reserved_visits(class: WorkClass, seat: Seat, research: bool) -> usize {
+    workflow_stages(class, research)
+        .iter()
+        .filter(|stage| stage.seat == seat)
+        .count()
+}
+
+fn expected_visits(class: WorkClass, seat: Seat, research: bool) -> f64 {
+    match seat {
+        Seat::Debugger => (class != WorkClass::Focused) as u8 as f64 * 0.25,
+        Seat::Reviewer | Seat::Sanity => (class != WorkClass::Focused) as u8 as f64 * 1.25,
+        _ => reserved_visits(class, seat, research) as f64,
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -196,7 +227,7 @@ pub struct DispatchPlan {
 }
 
 fn policy_version() -> String {
-    format!("aitierlist-{}-team-policy-v1", env!("CARGO_PKG_VERSION"))
+    crate::team_policy::VERSION.to_owned()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,6 +238,8 @@ pub struct WorkClassDemand {
     pub resource_factor: f64,
     pub forecast_changes: usize,
     pub admitted_changes: usize,
+    #[serde(default)]
+    pub research_included: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -302,8 +335,9 @@ pub struct ResearchCandidate {
     pub score: f64,
     pub accuracy: f64,
     pub accuracy_weight: f64,
-    pub non_hallucination: f64,
-    pub non_hallucination_weight: f64,
+    pub non_wrong: f64,
+    pub non_wrong_weight: f64,
+    pub conditional_hallucination: f64,
     pub lcr: f64,
     pub lcr_weight: f64,
     pub hle: Option<f64>,
@@ -328,7 +362,8 @@ pub struct ResearchTierPick {
 struct ResearchAssessment {
     score: f64,
     accuracy: f64,
-    non_hallucination: f64,
+    non_wrong: f64,
+    conditional_hallucination: f64,
     lcr: f64,
     hle: Option<f64>,
     expected_usd: Option<f64>,
@@ -339,7 +374,8 @@ fn assess_research(row: &Row, weights: [f64; 4]) -> Option<ResearchAssessment> {
     let bounded =
         |value: Option<f64>| value.filter(|value| value.is_finite() && (0.0..=1.0).contains(value));
     let accuracy = bounded(row.omniscience_accuracy)?;
-    let non_hallucination = 1.0 - bounded(row.halluc)?;
+    let conditional_hallucination = bounded(row.halluc)?;
+    let non_wrong = 1.0 - conditional_hallucination * (1.0 - accuracy);
     let lcr = bounded(row.lcr)?;
     let hle = if weights[3] > 0.0 {
         Some(bounded(row.hle)?)
@@ -369,11 +405,12 @@ fn assess_research(row: &Row, weights: [f64; 4]) -> Option<ResearchAssessment> {
         });
     Some(ResearchAssessment {
         score: weights[0] * accuracy
-            + weights[1] * non_hallucination
+            + weights[1] * non_wrong
             + weights[2] * lcr
             + weights[3] * hle.unwrap_or(0.0),
         accuracy,
-        non_hallucination,
+        non_wrong,
+        conditional_hallucination,
         lcr,
         hle,
         expected_usd: resources.map(|(omni, lcr, hle)| {
@@ -459,6 +496,7 @@ struct Policy {
     attempt_limit: usize,
     cycle: DispatchCycle,
     fable: bool,
+    research_class: Option<WorkClass>,
 }
 
 struct Group {
@@ -498,6 +536,20 @@ pub struct ConductorAllocation {
     pub cost_basis: String,
     pub time_basis: String,
     pub classes: Vec<ConductorClassDemand>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConductorTradeoff {
+    pub competence_floor: f64,
+    pub row_index: usize,
+    pub binding_id: String,
+    pub admitted_changes: usize,
+    pub quality: f64,
+    pub bound: Option<f64>,
+    pub relative_gap: Option<f64>,
+    pub proven: bool,
+    pub pool_claims: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -581,7 +633,7 @@ fn sequence(total: usize) -> Vec<WorkClass> {
         .collect()
 }
 
-fn prune(mut policies: Vec<Policy>, rows: &[Row]) -> Vec<Policy> {
+fn prune(mut policies: Vec<Policy>, rows: &[Row], preserve_competence: bool) -> Vec<Policy> {
     policies.sort_by(|left, right| {
         (rows[left.row_index].harness != "model")
             .cmp(&(rows[right.row_index].harness != "model"))
@@ -601,9 +653,13 @@ fn prune(mut policies: Vec<Policy>, rows: &[Row]) -> Vec<Policy> {
         .iter()
         .enumerate()
         .map(|(index, policy)| {
+            if policy.research_class.is_some() {
+                return true;
+            }
             !policies.iter().enumerate().any(|(other_index, other)| {
                 other_index != index
                     && other.pool == policy.pool
+                    && (!preserve_competence || other.competence == policy.competence)
                     && (!other.fable || policy.fable)
                     && other.utility >= policy.utility
                     && other.cycle.reserved_usage <= policy.cycle.reserved_usage
@@ -648,8 +704,9 @@ fn schedule(
     sequence: &[WorkClass],
     pools: &[PoolUsage],
     hours: f64,
+    research_classes: &std::collections::BTreeMap<String, bool>,
 ) -> Option<Schedule> {
-    let mut lookup = [[None; 6]; 4];
+    let mut lookup = [[None; 7]; 4];
     let mut orchestrator = None;
     for (index, group) in groups.iter().enumerate() {
         if let Some(class) = group.class {
@@ -658,26 +715,32 @@ fn schedule(
             orchestrator = Some(index);
         }
     }
-    let mut policies = Vec::new();
-    for class in sequence {
-        for stage in STAGES {
+    let mut planned = Vec::new();
+    for (change_index, class) in sequence.iter().copied().enumerate() {
+        let research = research_classes.get(class.name()).copied().unwrap_or(false);
+        let stages = workflow_stages(class, research);
+        let base = planned.len();
+        for stage in stages {
             let role = Seat::ALL.iter().position(|seat| *seat == stage.seat)?;
             let group = if stage.seat == Seat::Orchestrator {
                 orchestrator?
             } else {
                 lookup[class.index()][role]?
             };
-            policies.push(&groups[group].policies[choices[group]]);
+            planned.push((
+                change_index,
+                class,
+                base,
+                stage,
+                &groups[group].policies[choices[group]],
+            ));
         }
     }
-    let mut finishes = vec![0.0_f64; policies.len()];
+    let mut finishes = vec![0.0_f64; planned.len()];
     let mut calendars: Vec<Vec<AccountCalendar>> = (0..pools.len()).map(|_| Vec::new()).collect();
-    let mut visits = Vec::with_capacity(policies.len());
+    let mut visits = Vec::with_capacity(planned.len());
     let mut makespan = 0.0_f64;
-    for (index, policy) in policies.iter().enumerate() {
-        let stage = &STAGES[index % STAGES.len()];
-        let base = index / STAGES.len() * STAGES.len();
-        let class = sequence[index / STAGES.len()];
+    for (index, (change_index, class, base, stage, policy)) in planned.iter().enumerate() {
         let duration = policy.cycle.reserved_seconds * class.resource_factor() / 3600.0;
         let dependency_start = stage
             .dependencies
@@ -746,8 +809,8 @@ fn schedule(
             calendar.fable_usage += usage;
         }
         visits.push(ScheduledVisit {
-            change_index: index / STAGES.len(),
-            class,
+            change_index: *change_index,
+            class: *class,
             seat: stage.seat,
             visit: stage.visit,
             stage: stage.id,
@@ -767,9 +830,12 @@ fn search(
     sequence: &[WorkClass],
     candidates: &[Vec<Policy>],
     pools: &[PoolUsage],
-    hours: f64,
+    settings: &Settings,
     limit: usize,
 ) -> Search {
+    let hours = settings.agent_hours;
+    let research_classes = &settings.research_classes;
+    let monotonic_class_competence = settings.monotonic_class_competence;
     let mut counts = [0_usize; 4];
     for class in &sequence[..count] {
         counts[class.index()] += 1;
@@ -787,13 +853,28 @@ fn search(
     for class in WorkClass::ALL {
         if counts[class.index()] > 0 {
             for (role, policies) in candidates.iter().enumerate() {
-                if role == orchestrator_role || Seat::ALL[role] == Seat::NetResearch {
+                if role == orchestrator_role
+                    || (Seat::ALL[role] == Seat::NetResearch
+                        && !research_classes.get(class.name()).copied().unwrap_or(false))
+                    || reserved_visits(
+                        class,
+                        Seat::ALL[role],
+                        research_classes.get(class.name()).copied().unwrap_or(false),
+                    ) == 0
+                {
                     continue;
                 }
                 groups.push(Group {
                     role,
                     class: Some(class),
-                    policies: policies.clone(),
+                    policies: policies
+                        .iter()
+                        .filter(|policy| {
+                            Seat::ALL[role] != Seat::NetResearch
+                                || policy.research_class == Some(class)
+                        })
+                        .cloned()
+                        .collect(),
                 });
             }
         }
@@ -812,9 +893,28 @@ fn search(
     });
     let path_resource = capacities.len();
     capacities.extend([hours; 8]);
+    let mut competence_links = Vec::new();
+    if monotonic_class_competence {
+        for role in 0..Seat::ALL.len() {
+            if matches!(Seat::ALL[role], Seat::Orchestrator | Seat::NetResearch) {
+                continue;
+            }
+            let present: Vec<_> = WorkClass::ALL
+                .into_iter()
+                .filter_map(|class| {
+                    groups
+                        .iter()
+                        .position(|group| group.role == role && group.class == Some(class))
+                })
+                .collect();
+            competence_links.extend(present.windows(2).map(|pair| (pair[0], pair[1])));
+        }
+        capacities.extend(std::iter::repeat_n(1.0, competence_links.len()));
+    }
     let choices = groups
         .iter()
-        .map(|group| {
+        .enumerate()
+        .map(|(group_index, group)| {
             let demands: Vec<_> = match group.class {
                 Some(class) => vec![(counts[class.index()] as f64, class.resource_factor())],
                 None => WorkClass::ALL
@@ -822,18 +922,39 @@ fn search(
                     .map(|class| (counts[class.index()] as f64, class.resource_factor()))
                     .collect(),
             };
-            let visits = if group.role == orchestrator_role {
-                2.0
-            } else {
-                EXPECTED_VISITS[group.role]
-            };
             let expected_factor: f64 = demands
                 .iter()
-                .map(|(changes, factor)| changes * factor * visits)
+                .map(|(changes, factor)| {
+                    let class = group.class.unwrap_or(WorkClass::Focused);
+                    changes
+                        * factor
+                        * if group.class.is_none() {
+                            2.0
+                        } else {
+                            expected_visits(
+                                class,
+                                Seat::ALL[group.role],
+                                research_classes.get(class.name()).copied().unwrap_or(false),
+                            )
+                        }
+                })
                 .sum();
             let reserved_factor: f64 = demands
                 .iter()
-                .map(|(changes, factor)| changes * factor * RESERVED_VISITS[group.role] as f64)
+                .map(|(changes, factor)| {
+                    let class = group.class.unwrap_or(WorkClass::Focused);
+                    changes
+                        * factor
+                        * if group.class.is_none() {
+                            2.0
+                        } else {
+                            reserved_visits(
+                                class,
+                                Seat::ALL[group.role],
+                                research_classes.get(class.name()).copied().unwrap_or(false),
+                            ) as f64
+                        }
+                })
                 .sum();
             group
                 .policies
@@ -848,17 +969,28 @@ fn search(
                     {
                         resources[index] = resources[policy.pool * 2];
                     }
+                    for (link_index, (lower, upper)) in competence_links.iter().enumerate() {
+                        let resource = path_resource + 8 + link_index;
+                        if group_index == *lower {
+                            resources[resource] = policy.competence;
+                        } else if group_index == *upper {
+                            resources[resource] = 1.0 - policy.competence;
+                        }
+                    }
                     for (class, changes) in WorkClass::ALL.into_iter().zip(counts) {
                         if group.class.is_some_and(|selected| selected != class) || changes == 0 {
                             continue;
                         }
                         let path = path_resource + class.index() * 2;
                         let factor = class.resource_factor();
-                        resources[path] += [1.0, 1.0, 2.0, 2.0, 0.0, 1.0][group.role]
+                        let seat = Seat::ALL[group.role];
+                        let research = research_classes.get(class.name()).copied().unwrap_or(false);
+                        let visits = reserved_visits(class, seat, research) as f64;
+                        resources[path] += if seat == Seat::Sanity { 0.0 } else { visits }
                             * factor
                             * policy.cycle.reserved_seconds
                             / 3600.0;
-                        resources[path + 1] += [1.0, 1.0, 0.0, 2.0, 2.0, 1.0][group.role]
+                        resources[path + 1] += if seat == Seat::Reviewer { 0.0 } else { visits }
                             * factor
                             * policy.cycle.reserved_seconds
                             / 3600.0;
@@ -878,7 +1010,14 @@ fn search(
         capacities,
     };
     let outcome = solver::solve(&problem, limit, |choices| {
-        schedule(&groups, choices, &sequence[..count], pools, hours)
+        schedule(
+            &groups,
+            choices,
+            &sequence[..count],
+            pools,
+            hours,
+            research_classes,
+        )
     });
     Search {
         groups,
@@ -952,7 +1091,7 @@ fn seed_class_recommendations(
                 } else {
                     "accounts"
                 },
-                crate::agent_setup::binding_id(&rows[policy.row_index])
+                crate::agent_setup::binding_id_for(&policy.native_harness, &rows[policy.row_index],)
             );
             rule.fallback_policy = "For an authorized task in this class, jointly replan against all qualified bindings and current native windows; use this evidence-ranked route only if exact capability, billing, and a fresh hold qualify.".to_owned();
             rule.calibration = "Route evidence and per-visit values come from the current benchmark configuration. No job, weekly usage, native capacity, or completion is allocated until an authorized task is jointly admitted.".to_owned();
@@ -1026,8 +1165,9 @@ pub fn research_tier_picks(
                         score: assessment.score,
                         accuracy: assessment.accuracy,
                         accuracy_weight: weights[0],
-                        non_hallucination: assessment.non_hallucination,
-                        non_hallucination_weight: weights[1],
+                        non_wrong: assessment.non_wrong,
+                        non_wrong_weight: weights[1],
+                        conditional_hallucination: assessment.conditional_hallucination,
                         lcr: assessment.lcr,
                         lcr_weight: weights[2],
                         hle: assessment.hle,
@@ -1129,10 +1269,105 @@ pub fn research_tier_picks(
                 tier,
                 primary,
                 alternatives,
-                scope: "Standard research weights: Omniscience accuracy 0.30, non-hallucination 0.30, AA-LCR 0.40. This analytical tier comparison has no retry-throughput or coding prerequisite.".to_owned(),
+                scope: "Standard research weights: Omniscience accuracy 0.30, no incorrect answer across all questions 0.30, AA-LCR 0.40. This analytical tier comparison has no retry-throughput or coding prerequisite.".to_owned(),
             }
         })
         .collect()
+}
+
+pub fn compare_conductors(rows: &[Row], settings: &Settings) -> Vec<ConductorTradeoff> {
+    let selected: Vec<_> = subscriptions::PROVIDERS
+        .iter()
+        .filter_map(|provider| {
+            let plan_id = settings.subscriptions.get(provider.id)?;
+            Some((
+                provider,
+                provider.plans.iter().find(|plan| plan.id == plan_id)?,
+            ))
+        })
+        .collect();
+    let mut floors: Vec<_> = rows
+        .iter()
+        .filter(|row| {
+            selected.iter().any(|(provider, plan)| {
+                subscriptions::eligible(provider, plan, row)
+                    || (row.harness == "model"
+                        && rows.iter().any(|native| {
+                            subscriptions::eligible(provider, plan, native)
+                                && crate::aa::family_key("", &native.model_key)
+                                    == crate::aa::family_key("", &row.model_key)
+                        }))
+            })
+        })
+        .filter_map(|row| {
+            engine::orchestrator_dispatch_cycle(row, settings)?;
+            selected
+                .iter()
+                .any(|(provider, plan)| {
+                    let maps_to_provider = subscriptions::eligible(provider, plan, row)
+                        || (row.harness == "model"
+                            && rows.iter().any(|native| {
+                                subscriptions::eligible(provider, plan, native)
+                                    && crate::aa::family_key("", &native.model_key)
+                                        == crate::aa::family_key("", &row.model_key)
+                            }));
+                    let capacity = settings
+                        .vendor_overrides
+                        .get(provider.id)
+                        .copied()
+                        .flatten()
+                        .unwrap_or(plan.monthly_allowance_low * 12.0 / 52.0);
+                    maps_to_provider && capacity > 0.0 && settings.agent_hours > 0.0
+                })
+                .then(|| engine::competence(row, Seat::Orchestrator))
+                .flatten()
+        })
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .collect();
+    floors.sort_by(f64::total_cmp);
+    floors.dedup_by(|left, right| (*left - *right).abs() <= 1e-12);
+    let mut points = Vec::new();
+    for floor in floors {
+        let mut scenario = settings.clone();
+        scenario
+            .competence_floors
+            .insert(Seat::Orchestrator.name().to_owned(), Some(floor));
+        let Some(portfolio) = allocate(rows, &scenario) else {
+            continue;
+        };
+        let Some(conductor) = &portfolio.conductor else {
+            continue;
+        };
+        let point = ConductorTradeoff {
+            competence_floor: floor,
+            row_index: conductor.row_index,
+            binding_id: conductor.binding_id.clone(),
+            admitted_changes: portfolio.dispatch.admitted_changes,
+            quality: portfolio.dispatch.solver.quality,
+            bound: portfolio.dispatch.solver.bound,
+            relative_gap: portfolio.dispatch.solver.relative_gap,
+            proven: portfolio.dispatch.solver.proven_optimal,
+            pool_claims: portfolio
+                .pools
+                .iter()
+                .filter(|pool| pool.reserved_usage > 0.0 || pool.reserved_hours > 0.0)
+                .map(|pool| {
+                    format!(
+                        "{} / {}: {:.2} modeled API-equivalent USD, {:.2} reference h",
+                        pool.provider_id, pool.plan_id, pool.reserved_usage, pool.reserved_hours
+                    )
+                })
+                .collect(),
+        };
+        if !points.iter().any(|existing: &ConductorTradeoff| {
+            existing.binding_id == point.binding_id
+                && existing.admitted_changes == point.admitted_changes
+                && (existing.quality - point.quality).abs() <= 1e-9
+        }) {
+            points.push(point);
+        }
+    }
+    points
 }
 
 pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
@@ -1187,7 +1422,7 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
             "Each owned subscription contributes one modeled allowance and one account calendar within the same elapsed working horizon. Forecast account ordinals are scheduling slots, not native account identities, authentication, meters, or authorization. The fixed conductor remains on the first account slot.".to_owned(),
             "Select workflow templates from consequence, uncertainty, coupling, reversibility, evidence need, tool risk, correlation, and deadline risk. File count is load information only and never determines the workflow.".to_owned(),
             "The full forecast uses largest-remainder class counts with canonical ties. A fixed deficit-ordered sequence supplies nested admission prefixes; reduced demand never re-apportions.".to_owned(),
-            "The API-equivalent proxy reserves Orchestrator 2, Comprehension 1, Implementer 1, Debugger 1, Reviewer 2, and Sanity 2 visits per proxy job, with 25% expected repair incidence. Native tasks expand from their risk vectors and add Net Research only when evidence is required.".to_owned(),
+            "The API-equivalent proxy uses three stages for Focused, eight for Standard, and nine for Complex and Extensive work, with 25% expected repair incidence where checks activate repair. Each class can explicitly include one AA research-reference visit; the default coding forecast excludes it. Native tasks expand from their risk vectors and actual task evidence.".to_owned(),
             "The Orchestrator uses one persistent model and effort for both visits across the whole plan. Its resource load is two Intelligence Index benchmark-task-equivalent units per class-weighted admitted change; every real native call is also charged once in the runtime ledger. Each worker visit uses one model and effort with 1–3 same-model attempts.".to_owned(),
             "Multi-criteria role utility uses each skill component once: capped completion for reference-workload evidence, static values for other skills. It is not real-job success probability. Class factors scale demand and resources, not calibrated difficulty.".to_owned(),
             "The proxy calendar places its declared stage sequence in earliest account gaps to estimate API-equivalent capacity. Native scheduling instead uses authorized ready task IDs, risk-selected DAGs, immutable artifact dependencies, current reset windows, and deadlines.".to_owned(),
@@ -1203,7 +1438,7 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
         dispatch: DispatchPlan {
             policy_version: crate::team_policy::VERSION.to_owned(),
             forecast_changes: forecast, native_admission_changes: 0, admitted_changes: 0, deferred_changes: forecast, cadence_hours: 4.0, repair_incidence: 0.25,
-            classes: WorkClass::ALL.into_iter().map(|class| WorkClassDemand { class, condition: class.condition().to_owned(), resource_factor: class.resource_factor(), forecast_changes: forecast_counts[class.index()], admitted_changes: 0 }).collect(),
+            classes: WorkClass::ALL.into_iter().map(|class| WorkClassDemand { class, condition: class.condition().to_owned(), resource_factor: class.resource_factor(), forecast_changes: forecast_counts[class.index()], admitted_changes: 0, research_included: settings.research_classes.get(class.name()).copied().unwrap_or(false) }).collect(),
             solver: SolverReport { status: "infeasible".to_owned(), proven_optimal: false, quality: 0.0, bound: None, relative_gap: None, nodes: 0, message: String::new() },
             executable: false, admitted_sequence: Vec::new(), reserved_makespan_hours: 0.0, schedule: Vec::new(),
         },
@@ -1257,8 +1492,9 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
                         score: assessment.score,
                         accuracy: assessment.accuracy,
                         accuracy_weight: weights[0],
-                        non_hallucination: assessment.non_hallucination,
-                        non_hallucination_weight: weights[1],
+                        non_wrong: assessment.non_wrong,
+                        non_wrong_weight: weights[1],
+                        conditional_hallucination: assessment.conditional_hallucination,
                         lcr: assessment.lcr,
                         lcr_weight: weights[2],
                         hle: assessment.hle,
@@ -1300,65 +1536,7 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
             if let Some(primary) = candidates.first_mut() {
                 primary.primary = true;
             }
-            let mut account_champions = std::collections::BTreeMap::new();
-            for candidate in &candidates {
-                account_champions
-                    .entry((
-                        candidate.provider_id.clone(),
-                        candidate.native_harness.clone(),
-                    ))
-                    .or_insert_with(|| {
-                        (
-                            candidate.binding_id.clone(),
-                            crate::aa::family_key("", &rows[candidate.row_index].model_key),
-                        )
-                    });
-            }
-            let frontier: Vec<_> = candidates
-                .iter()
-                .enumerate()
-                .map(|(index, candidate)| {
-                    let account = (
-                        candidate.provider_id.clone(),
-                        candidate.native_harness.clone(),
-                    );
-                    let Some((champion, family)) = account_champions.get(&account) else {
-                        return false;
-                    };
-                    index == 0
-                        || candidate.binding_id == *champion
-                        || (crate::aa::family_key("", &rows[candidate.row_index].model_key)
-                            == *family
-                            && !candidates.iter().any(|other| {
-                                let resources = other
-                                    .expected_usd
-                                    .zip(other.decode_hours)
-                                    .zip(candidate.expected_usd.zip(candidate.decode_hours));
-                                other.provider_id == candidate.provider_id
-                                    && other.native_harness == candidate.native_harness
-                                    && crate::aa::family_key("", &rows[other.row_index].model_key)
-                                        == *family
-                                    && resources.is_some_and(
-                                        |(
-                                            (other_usd, other_hours),
-                                            (candidate_usd, candidate_hours),
-                                        )| {
-                                            other.score >= candidate.score
-                                                && other_usd <= candidate_usd
-                                                && other_hours <= candidate_hours
-                                                && (other.score > candidate.score
-                                                    || other_usd < candidate_usd
-                                                    || other_hours < candidate_hours)
-                                        },
-                                    )
-                            }))
-                })
-                .collect();
-            rule.research_candidates = candidates
-                .into_iter()
-                .zip(frontier)
-                .filter_map(|(candidate, keep)| keep.then_some(candidate))
-                .collect();
+            rule.research_candidates = candidates;
             let (condition, fallback) = match rule.class {
                 WorkClass::Focused => (
                     "Known authoritative source fetch with direct support, freshness, and consuming-decision provenance.",
@@ -1464,15 +1642,16 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
                     attempt_limit: 1,
                     cycle,
                     fable: subscriptions::is_fable(row) && row.vendor == "anthropic",
+                    research_class: None,
                 });
                 continue;
             }
             let Some(cycles) =
-                cycles[usize::from(!matches!(seat, Seat::Implementer | Seat::Debugger))]
+                cycles[usize::from(!matches!(seat, Seat::Implementer | Seat::Debugger))].as_ref()
             else {
                 continue;
             };
-            for (index, cycle) in cycles.into_iter().enumerate() {
+            for (index, cycle) in cycles.iter().copied().enumerate() {
                 if cycle.success > 0.0
                     && let Some(utility) = engine::dispatch_utility(row, seat, &cycle)
                 {
@@ -1485,14 +1664,64 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
                         attempt_limit: index + 1,
                         cycle,
                         fable: subscriptions::is_fable(row) && row.vendor == "anthropic",
+                        research_class: None,
                     });
                 }
             }
         }
     }
+    let research_role = Seat::ALL
+        .iter()
+        .position(|seat| *seat == Seat::NetResearch)
+        .unwrap_or(Seat::ALL.len() - 1);
+    let stress = 1.0 + settings.assumption_span_pct / 100.0;
+    if let Some(role) = portfolio
+        .roles
+        .iter()
+        .find(|role| role.seat == Seat::NetResearch)
+    {
+        for rule in role.rules.iter().filter(|rule| {
+            settings
+                .research_classes
+                .get(rule.class.name())
+                .copied()
+                .unwrap_or(false)
+        }) {
+            for candidate in &rule.research_candidates {
+                let Some(pool) = portfolio.pools.iter().position(|pool| {
+                    pool.provider_id == candidate.provider_id && pool.plan_id == candidate.plan_id
+                }) else {
+                    continue;
+                };
+                let Some((usage, hours)) = candidate.expected_usd.zip(candidate.decode_hours)
+                else {
+                    continue;
+                };
+                candidates[research_role].push(Policy {
+                    row_index: candidate.row_index,
+                    native_harness: candidate.native_harness.clone(),
+                    pool,
+                    competence: candidate.score,
+                    utility: candidate.score,
+                    attempt_limit: 1,
+                    cycle: DispatchCycle {
+                        success: 0.0,
+                        nominal_usage: usage,
+                        nominal_seconds: hours * 3600.0,
+                        reserved_usage: usage * stress,
+                        reserved_seconds: hours * 3600.0 * stress,
+                        reference_completion: [None; 3],
+                    },
+                    fable: subscriptions::is_fable(&rows[candidate.row_index])
+                        && candidate.provider_id == "anthropic",
+                    research_class: Some(rule.class),
+                });
+            }
+        }
+    }
     let candidates: Vec<_> = candidates
         .into_iter()
-        .map(|policies| prune(policies, rows))
+        .map(|policies| prune(policies, rows, settings.monotonic_class_competence))
         .collect();
     seed_class_recommendations(&mut portfolio, &candidates, rows, settings.agent_hours);
     let mut nodes = 0;
@@ -1502,7 +1731,7 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
         &sequence,
         &candidates,
         &portfolio.pools,
-        settings.agent_hours,
+        settings,
         256,
     );
     nodes += initial.outcome.nodes;
@@ -1523,7 +1752,7 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
                 &sequence,
                 &candidates,
                 &portfolio.pools,
-                settings.agent_hours,
+                settings,
                 (SEARCH_NODES - nodes).min(256),
             );
             nodes += result.outcome.nodes;
@@ -1609,18 +1838,48 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
             let visits = if group.class.is_none() {
                 2
             } else {
-                RESERVED_VISITS[group.role]
+                reserved_visits(
+                    class,
+                    Seat::ALL[group.role],
+                    settings
+                        .research_classes
+                        .get(class.name())
+                        .copied()
+                        .unwrap_or(false),
+                )
             };
             let expected = if group.class.is_none() {
                 (changes * 2) as f64
             } else {
-                changes as f64 * EXPECTED_VISITS[group.role]
+                changes as f64
+                    * expected_visits(
+                        class,
+                        Seat::ALL[group.role],
+                        settings
+                            .research_classes
+                            .get(class.name())
+                            .copied()
+                            .unwrap_or(false),
+                    )
             };
             let factor = class.resource_factor();
             let pool = &mut portfolio.pools[policy.pool];
             let seat = portfolio.roles[group.role].seat;
             let rule = &mut portfolio.roles[group.role].rules[class.index()];
             rule.row_index = Some(policy.row_index);
+            if seat == Seat::NetResearch
+                && let Some(index) = rule.research_candidates.iter().position(|candidate| {
+                    candidate.row_index == policy.row_index
+                        && candidate.provider_id == pool.provider_id
+                        && candidate.native_harness == policy.native_harness
+                })
+            {
+                for candidate in &mut rule.research_candidates {
+                    candidate.primary = false;
+                }
+                rule.research_candidates[index].primary = true;
+                rule.research_candidates.swap(0, index);
+            }
             rule.recommendation_only = false;
             rule.policy_id = format!(
                 "{}-{}-{}",
@@ -1659,7 +1918,7 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
                 } else {
                     "s"
                 },
-                crate::agent_setup::binding_id(&rows[policy.row_index])
+                crate::agent_setup::binding_id_for(&policy.native_harness, &rows[policy.row_index],)
             );
             rule.fallback_policy = "If this binding is ineligible or its native window cannot fund a fresh hold, try the listed lower-effort route, then a listed qualified substitution for the same ready job; otherwise reduce authorized scope or defer and jointly replan. Never round-robin or choose from an open model menu.".to_owned();
             rule.calibration = "Benchmark evidence is provisional for this native harness. Native consumption, duration, and role outcomes remain uncalibrated until real-job telemetry supplies an interval and provenance.".to_owned();
@@ -1814,10 +2073,11 @@ fn conditional_routes<'a>(
     policies: &'a [Policy],
     primary: &Policy,
     pool: usize,
+    research_class: Option<WorkClass>,
 ) -> Vec<&'a Policy> {
     let qualified: Vec<_> = policies
         .iter()
-        .filter(|policy| policy.pool == pool)
+        .filter(|policy| policy.pool == pool && policy.research_class == research_class)
         .collect();
     let frontier: Vec<_> = qualified
         .iter()
@@ -1893,36 +2153,55 @@ fn effort_level(row: &Row) -> Option<usize> {
     .position(|effort| Some(*effort) == row.effort.as_deref())
 }
 fn adaptive_routes(portfolio: &mut Portfolio, candidates: &[Vec<Policy>], rows: &[Row]) {
-    let advantage: Vec<Vec<f64>> = candidates
-        .iter()
-        .map(|policies| {
-            (0..portfolio.pools.len())
-                .map(|pool| {
-                    let own = policies
-                        .iter()
-                        .filter(|policy| policy.pool == pool)
-                        .map(|policy| policy.utility)
-                        .fold(0.0, f64::max);
-                    let other = policies
-                        .iter()
-                        .filter(|policy| policy.pool != pool)
-                        .map(|policy| policy.utility)
-                        .fold(0.0, f64::max);
-                    own - other
-                })
-                .collect()
-        })
-        .collect();
     for (role_index, role) in portfolio.roles.iter_mut().enumerate() {
         if role.seat == Seat::Orchestrator {
             continue;
         }
         for rule in &mut role.rules {
+            let research_class = (role.seat == Seat::NetResearch).then_some(rule.class);
+            let advantage: Vec<Vec<f64>> = candidates
+                .iter()
+                .map(|policies| {
+                    (0..portfolio.pools.len())
+                        .map(|pool| {
+                            let own = policies
+                                .iter()
+                                .filter(|policy| {
+                                    (policy.research_class.is_none()
+                                        || policy.research_class == Some(rule.class))
+                                        && policy.pool == pool
+                                })
+                                .map(|policy| policy.utility)
+                                .fold(0.0, f64::max);
+                            let other = policies
+                                .iter()
+                                .filter(|policy| {
+                                    (policy.research_class.is_none()
+                                        || policy.research_class == Some(rule.class))
+                                        && policy.pool != pool
+                                })
+                                .map(|policy| policy.utility)
+                                .fold(0.0, f64::max);
+                            own - other
+                        })
+                        .collect()
+                })
+                .collect();
             let Some(index) = rule.row_index else {
                 continue;
             };
             let Some(primary) = candidates[role_index].iter().find(|policy| {
-                policy.row_index == index && policy.attempt_limit == rule.attempt_limit
+                policy.row_index == index
+                    && policy.attempt_limit == rule.attempt_limit
+                    && policy.research_class == research_class
+                    && rule.provider_id.as_deref()
+                        == Some(portfolio.pools[policy.pool].provider_id.as_str())
+                    && (role.seat != Seat::NetResearch
+                        || rule.research_candidates.iter().any(|candidate| {
+                            candidate.primary
+                                && candidate.native_harness == policy.native_harness
+                                && candidate.row_index == policy.row_index
+                        }))
             }) else {
                 continue;
             };
@@ -1931,7 +2210,10 @@ fn adaptive_routes(portfolio: &mut Portfolio, candidates: &[Vec<Policy>], rows: 
                 let pool = &portfolio.pools[policy.pool];
                 AdaptiveRoute {
                     row_index: policy.row_index,
-                    binding_id: crate::agent_setup::binding_id(&rows[policy.row_index]),
+                    binding_id: crate::agent_setup::binding_id_for(
+                        &policy.native_harness,
+                        &rows[policy.row_index],
+                    ),
                     provider_id: pool.provider_id.clone(),
                     plan_id: pool.plan_id.clone(),
                     attempt_limit: policy.attempt_limit,
@@ -1969,6 +2251,7 @@ fn adaptive_routes(portfolio: &mut Portfolio, candidates: &[Vec<Policy>], rows: 
                 .iter()
                 .filter(|policy| {
                     policy.pool == primary.pool
+                        && policy.research_class == primary.research_class
                         && rows[policy.row_index].model == rows[index].model
                         && rows[policy.row_index].harness == rows[index].harness
                         && effort_level(&rows[policy.row_index])
@@ -1978,14 +2261,24 @@ fn adaptive_routes(portfolio: &mut Portfolio, candidates: &[Vec<Policy>], rows: 
                 })
                 .max_by(preferred)
                 .map(|policy| route(policy, "Lower effort for newly admitted work when quota pace is tight; requires fresh real-unit holds."));
-            rule.within_provider_alternatives = conditional_routes(&candidates[role_index], primary, primary.pool)
+            rule.within_provider_alternatives = conditional_routes(
+                &candidates[role_index],
+                primary,
+                primary.pool,
+                primary.research_class,
+            )
                 .into_iter()
                 .map(|policy| route(policy, "Same-account alternative for distinct work; select from utility, latency and live quota after fresh holds."))
                 .collect();
             rule.surplus_alternatives = (0..portfolio.pools.len())
                 .filter(|pool| *pool != primary.pool)
                 .flat_map(|pool| {
-                    conditional_routes(&candidates[role_index], primary, pool)
+                    conditional_routes(
+                        &candidates[role_index],
+                        primary,
+                        pool,
+                        primary.research_class,
+                    )
                         .into_iter()
                         .map(|policy| route(policy, "Competitive account for distinct useful surplus work; never duplicate an assigned job."))
                 })

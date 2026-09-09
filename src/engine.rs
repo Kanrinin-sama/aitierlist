@@ -22,16 +22,6 @@ const VENDORS: [&str; 14] = [
     "muse",
     "deepseek",
 ];
-const CODING: [(Benchmark, f64); 2] = [
-    (Benchmark::Swe, 113.0 / 202.0),
-    (Benchmark::Terminal, 89.0 / 202.0),
-];
-const DEBUGGER: [(Benchmark, f64); 4] = [
-    (Benchmark::Swe, 113.0 / 404.0),
-    (Benchmark::Terminal, 89.0 / 404.0),
-    (Benchmark::Gpqa, 0.25),
-    (Benchmark::Hle, 0.25),
-];
 const REVIEWER: [(Benchmark, f64); 3] = [
     (Benchmark::Qna, 0.5),
     (Benchmark::Gpqa, 0.25),
@@ -40,7 +30,16 @@ const REVIEWER: [(Benchmark, f64); 3] = [
 const SANITY: [(Benchmark, f64); 1] = [(Benchmark::Qna, 1.0)];
 const COMPREHENSION: [(Benchmark, f64); 2] = [(Benchmark::Lcr, 0.5), (Benchmark::Qna, 0.5)];
 const QNA: [(Benchmark, f64); 1] = [(Benchmark::Qna, 1.0)];
-const TERMINAL: [(Benchmark, f64); 1] = [(Benchmark::Terminal, 1.0)];
+
+fn coding_workload(row: &Row) -> Option<Vec<(Benchmark, f64)>> {
+    let swe = row.benchmark_tasks(Benchmark::Swe)? as f64;
+    let terminal = row.benchmark_tasks(Benchmark::Terminal)? as f64;
+    let total = swe + terminal;
+    Some(vec![
+        (Benchmark::Swe, swe / total),
+        (Benchmark::Terminal, terminal / total),
+    ])
+}
 
 fn pass(row: &Row, benchmark: Benchmark) -> Option<f64> {
     let value = match benchmark {
@@ -67,44 +66,50 @@ pub fn competence(row: &Row, seat: Seat) -> Option<f64> {
 pub fn competence_components(row: &Row, seat: Seat) -> Option<Vec<(&'static str, f64, f64)>> {
     if seat == Seat::Orchestrator {
         let smart = row.smart?;
-        let gpqa = pass(row, Benchmark::Gpqa)?;
-        return (smart.is_finite() && (0.0..=1.0).contains(&smart)).then_some(vec![
-            ("GPQA reasoning", gpqa, 0.5),
-            ("Intelligence index", smart, 0.5),
-        ]);
+        return (smart.is_finite() && (0.0..=1.0).contains(&smart)).then_some(vec![(
+            "Intelligence Index",
+            smart,
+            1.0,
+        )]);
     }
     if seat == Seat::NetResearch {
         return None;
     }
-    competence_profile(seat)
+    competence_profile(row, seat)?
         .iter()
         .map(|(benchmark, weight)| Some((benchmark.name(), pass(row, *benchmark)?, *weight)))
         .collect()
 }
 
-fn competence_profile(seat: Seat) -> &'static [(Benchmark, f64)] {
-    match seat {
-        Seat::Implementer => &CODING[..],
-        Seat::Debugger => &DEBUGGER[..],
-        Seat::Reviewer => &REVIEWER[..],
-        Seat::Sanity => &SANITY[..],
-        Seat::Comprehension => &COMPREHENSION[..],
-        Seat::NetResearch => &[],
-        Seat::Orchestrator => &[],
-    }
+fn competence_profile(row: &Row, seat: Seat) -> Option<Vec<(Benchmark, f64)>> {
+    let profile = match seat {
+        Seat::Implementer => coding_workload(row)?,
+        Seat::Debugger => coding_workload(row)?
+            .into_iter()
+            .map(|(benchmark, weight)| (benchmark, weight * 0.5))
+            .chain([(Benchmark::Gpqa, 0.25), (Benchmark::Hle, 0.25)])
+            .collect(),
+        Seat::Reviewer => REVIEWER.to_vec(),
+        Seat::Sanity => SANITY.to_vec(),
+        Seat::Comprehension => COMPREHENSION.to_vec(),
+        Seat::NetResearch | Seat::Orchestrator => Vec::new(),
+    };
+    Some(profile)
 }
 
-pub fn reference_workload(seat: Seat) -> &'static [(Benchmark, f64)] {
+pub fn reference_workload(row: &Row, seat: Seat) -> Option<Vec<(Benchmark, f64)>> {
     match seat {
-        Seat::Implementer | Seat::Debugger => &CODING,
-        _ => &QNA,
+        Seat::Implementer | Seat::Debugger => coding_workload(row),
+        Seat::Reviewer | Seat::Sanity | Seat::Comprehension => Some(QNA.to_vec()),
+        Seat::NetResearch | Seat::Orchestrator => None,
     }
 }
 
 pub fn reference_workload_name(seat: Seat) -> &'static str {
     match seat {
         Seat::Implementer | Seat::Debugger => "coding reference workload",
-        Seat::NetResearch => "provisional general-reasoning transfer",
+        Seat::NetResearch => "research class benchmark mixture",
+        Seat::Orchestrator => "coordination resource reference task",
         _ => "repository Q&A reference workload",
     }
 }
@@ -305,8 +310,17 @@ fn cycles_for(
     assumptions: &Assumptions,
     runtime_multiplier: f64,
     model_cost_multiplier: f64,
-) -> Option<[Cycle; 64]> {
-    let mut totals = [Cycle::default(); 64];
+) -> Option<Vec<Cycle>> {
+    let limit = if settings.rho_override.is_some()
+        || mix
+            .iter()
+            .all(|(benchmark, _)| row.retry.repeat_evidence(*benchmark).is_some())
+    {
+        64
+    } else {
+        1
+    };
+    let mut totals = vec![Cycle::default(); limit];
     for &(benchmark, weight) in mix {
         let metric = row
             .task_metrics
@@ -326,15 +340,11 @@ fn cycles_for(
         {
             return None;
         }
-        let resolved = match benchmark {
-            Benchmark::Swe => row.retry.deepswe,
-            Benchmark::Terminal => row.retry.terminal_bench,
-            Benchmark::Qna => row.retry.qna,
-            Benchmark::Gpqa | Benchmark::Hle | Benchmark::Lcr | Benchmark::Omniscience => {
-                return None;
-            }
-        };
-        let rho = (settings.rho_override.unwrap_or(resolved.rho) * assumptions.rho_multiplier)
+        let rho = (settings
+            .rho_override
+            .or_else(|| row.retry.repeat_evidence(benchmark).map(|value| value.rho))
+            .unwrap_or(0.0)
+            * assumptions.rho_multiplier)
             .clamp(0.0, 1.0 - f64::EPSILON);
         let ratio = rho / (1.0 - rho);
         let pass = row.retry.adjusted_pass(benchmark, metric.pass);
@@ -361,13 +371,44 @@ fn cycles_for(
     Some(totals)
 }
 
+fn role_cycles(
+    row: &Row,
+    seat: Seat,
+    settings: &Settings,
+    assumptions: &Assumptions,
+    runtime_multiplier: f64,
+    model_cost_multiplier: f64,
+) -> Option<Vec<Cycle>> {
+    if seat == Seat::Orchestrator {
+        let model_spend = row.orchestrator_usd? * assumptions.model_cost * model_cost_multiplier;
+        let wall = row.orchestrator_seconds? * assumptions.runtime * runtime_multiplier;
+        return (model_spend.is_finite() && model_spend >= 0.0 && wall.is_finite() && wall > 0.0)
+            .then_some(vec![Cycle {
+                wall,
+                spend: model_spend,
+                model_spend,
+                agent_seconds: wall,
+                ..Cycle::default()
+            }]);
+    }
+    let workload = reference_workload(row, seat)?;
+    cycles_for(
+        row,
+        &workload,
+        settings,
+        assumptions,
+        runtime_multiplier,
+        model_cost_multiplier,
+    )
+}
+
 pub fn implementation_cycle(row: &Row, settings: &Settings) -> Option<Cycle> {
     let mix = if row.harness == "model" {
-        &TERMINAL[..]
+        vec![(Benchmark::Terminal, 1.0)]
     } else {
-        &CODING[..]
+        coding_workload(row)?
     };
-    cycles_for(row, mix, settings, &baseline(TimeBasis::Token), 1.0, 1.0)?
+    cycles_for(row, &mix, settings, &baseline(TimeBasis::Token), 1.0, 1.0)?
         .into_iter()
         .reduce(|best, next| {
             if (1.0 - next.unfinished) / next.wall > (1.0 - best.unfinished) / best.wall {
@@ -385,20 +426,18 @@ pub(crate) struct DispatchCycle {
     pub nominal_seconds: f64,
     pub reserved_usage: f64,
     pub reserved_seconds: f64,
-    reference_completion: [Option<f64>; 3],
+    pub(crate) reference_completion: [Option<f64>; 3],
 }
 
 pub(crate) fn dispatch_utility(row: &Row, seat: Seat, cycle: &DispatchCycle) -> Option<f64> {
     if seat == Seat::Orchestrator {
         return competence(row, seat);
     }
-    competence_profile(seat)
+    let workload = reference_workload(row, seat)?;
+    competence_profile(row, seat)?
         .iter()
         .map(|(benchmark, weight)| {
-            let value = if reference_workload(seat)
-                .iter()
-                .any(|(reference, _)| reference == benchmark)
-            {
+            let value = if workload.iter().any(|(reference, _)| reference == benchmark) {
                 cycle.reference_completion[match benchmark {
                     Benchmark::Swe => 0,
                     Benchmark::Terminal => 1,
@@ -417,14 +456,23 @@ pub(crate) fn dispatch_cycles(
     row: &Row,
     seat: Seat,
     settings: &Settings,
-) -> Option<[DispatchCycle; 3]> {
-    let workload = reference_workload(seat);
-    let mut nominal = [Cycle::default(); 3];
-    let mut reference_completion = [[None; 3]; 3];
+) -> Option<Vec<DispatchCycle>> {
+    let workload = reference_workload(row, seat)?;
+    let limit = if settings.rho_override.is_some()
+        || workload
+            .iter()
+            .all(|(benchmark, _)| row.retry.repeat_evidence(*benchmark).is_some())
+    {
+        3
+    } else {
+        1
+    };
+    let mut nominal = vec![Cycle::default(); limit];
+    let mut reference_completion = vec![[None; 3]; limit];
     let mut full_usage = 0.0;
     let mut token_seconds = 0.0;
     let mut pooled_seconds = 0.0;
-    for (benchmark, weight) in workload {
+    for (benchmark, weight) in &workload {
         let component = cycles_for(
             row,
             &[(*benchmark, 1.0)],
@@ -439,7 +487,7 @@ pub(crate) fn dispatch_cycles(
             Benchmark::Qna => 2,
             _ => return None,
         };
-        for index in 0..3 {
+        for index in 0..limit {
             nominal[index].unfinished += weight * component[index].unfinished;
             nominal[index].model_spend += weight * component[index].model_spend;
             nominal[index].agent_seconds += weight * component[index].agent_seconds;
@@ -457,30 +505,38 @@ pub(crate) fn dispatch_cycles(
         pooled_seconds += weight * metric.pooled_seconds;
     }
     let stress = 1.0 + settings.assumption_span_pct / 100.0;
-    Some(std::array::from_fn(|index| DispatchCycle {
-        success: 1.0 - nominal[index].unfinished,
-        nominal_usage: nominal[index].model_spend,
-        nominal_seconds: nominal[index].agent_seconds,
-        reserved_usage: (index + 1) as f64 * full_usage * stress,
-        reserved_seconds: (index + 1) as f64 * token_seconds.max(pooled_seconds) * stress,
-        reference_completion: reference_completion[index],
-    }))
+    Some(
+        (0..limit)
+            .map(|index| DispatchCycle {
+                success: 1.0 - nominal[index].unfinished,
+                nominal_usage: nominal[index].model_spend,
+                nominal_seconds: nominal[index].agent_seconds,
+                reserved_usage: (index + 1) as f64 * full_usage * stress,
+                reserved_seconds: (index + 1) as f64 * token_seconds.max(pooled_seconds) * stress,
+                reference_completion: reference_completion[index],
+            })
+            .collect(),
+    )
 }
 
 pub(crate) fn orchestrator_dispatch_cycle(row: &Row, settings: &Settings) -> Option<DispatchCycle> {
-    let usage = row
-        .orchestrator_usd
-        .filter(|value| value.is_finite() && *value >= 0.0)?;
-    let seconds = row
-        .orchestrator_seconds
-        .filter(|value| value.is_finite() && *value > 0.0)?;
+    let cycle = role_cycles(
+        row,
+        Seat::Orchestrator,
+        settings,
+        &baseline(TimeBasis::Token),
+        1.0,
+        1.0,
+    )?
+    .into_iter()
+    .next()?;
     let stress = 1.0 + settings.assumption_span_pct / 100.0;
     Some(DispatchCycle {
         success: 1.0,
-        nominal_usage: usage,
-        nominal_seconds: seconds,
-        reserved_usage: usage * stress,
-        reserved_seconds: seconds * stress,
+        nominal_usage: cycle.model_spend,
+        nominal_seconds: cycle.wall,
+        reserved_usage: cycle.model_spend * stress,
+        reserved_seconds: cycle.wall * stress,
         reference_completion: [None; 3],
     })
 }
@@ -642,7 +698,13 @@ fn analyze(
             });
             continue;
         }
-        let competence = competence(row, seat);
+        let Some(competence) = competence(row, seat) else {
+            excluded.push(ExcludedCandidate {
+                row_index,
+                reason: "missing required competence evidence".to_string(),
+            });
+            continue;
+        };
         if matches!(seat, Seat::Implementer | Seat::Debugger)
             && !self::competence(row, Seat::Implementer).is_some_and(|value| value > 0.0)
         {
@@ -685,9 +747,9 @@ fn analyze(
             allowance_multiplier * if calls { model_cost_multiplier } else { 1.0 };
         range.0 *= range_multiplier;
         range.1 *= range_multiplier;
-        let Some(cycles) = cycles_for(
+        let Some(cycles) = role_cycles(
             row,
-            reference_workload(seat),
+            seat,
             settings,
             &nominal_assumptions,
             runtime_multiplier,
@@ -699,9 +761,9 @@ fn analyze(
             });
             continue;
         };
-        if cycles_for(
+        if role_cycles(
             row,
-            reference_workload(seat),
+            seat,
             settings,
             &baseline(TimeBasis::Pooled),
             runtime_multiplier,
@@ -721,7 +783,7 @@ fn analyze(
             if tier == Tier::Api || nominal > 0.0 || cycle.model_spend == 0.0 {
                 policies.push(Policy {
                     row_index,
-                    competence,
+                    competence: Some(competence),
                     range,
                     calls,
                     limit: index + 1,
@@ -741,12 +803,12 @@ fn analyze(
     let values: Vec<Vec<f64>> = scenario_defs
         .iter()
         .map(|assumptions| {
-            let mut cached: Vec<Option<[Cycle; 64]>> = vec![None; rows.len()];
+            let mut cached: Vec<Option<Vec<Cycle>>> = vec![None; rows.len()];
             for policy in &policies {
                 if cached[policy.row_index].is_none() {
-                    cached[policy.row_index] = cycles_for(
+                    cached[policy.row_index] = role_cycles(
                         &rows[policy.row_index],
-                        reference_workload(seat),
+                        seat,
                         settings,
                         assumptions,
                         adjustment

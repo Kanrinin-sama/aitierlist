@@ -104,6 +104,7 @@ fn main() -> eframe::Result<()> {
         argument == "--dump-table"
             || argument.starts_with("--export-policy=")
             || argument.starts_with("--export-orchestrator=")
+            || argument.starts_with("--compare-conductors=")
     }) {
         let outcome = (|| -> anyhow::Result<()> {
             let arguments = application_arguments.clone();
@@ -113,6 +114,11 @@ fn main() -> eframe::Result<()> {
             let comparison_request = arguments
                 .iter()
                 .find_map(|argument| argument.strip_prefix("--compare=").map(ToOwned::to_owned));
+            let conductor_comparison_path = arguments.iter().find_map(|argument| {
+                argument
+                    .strip_prefix("--compare-conductors=")
+                    .map(ToOwned::to_owned)
+            });
             let export_path = arguments.iter().find_map(|argument| {
                 argument
                     .strip_prefix("--export-policy=")
@@ -195,6 +201,17 @@ fn main() -> eframe::Result<()> {
                 aa::load_rows(false, f64::INFINITY)?
             };
             let table = engine::score(rows, &settings, state, fetched, None);
+            if let Some(path) = conductor_comparison_path {
+                std::fs::write(
+                    &path,
+                    serde_json::to_vec_pretty(&portfolio::compare_conductors(
+                        &table.rows,
+                        &settings,
+                    ))?,
+                )?;
+                println!("{path}");
+                return Ok(());
+            }
             if let Some(path) = export_path {
                 let path = std::path::Path::new(&path);
                 orchestration::write_policy(&table, path)?;

@@ -86,6 +86,10 @@ impl Benchmark {
 #[serde(rename_all = "camelCase")]
 pub struct TaskMetric {
     pub benchmark: Benchmark,
+    #[serde(default)]
+    pub dataset_id: String,
+    #[serde(default)]
+    pub task_count: usize,
     pub pass: f64,
     pub seconds: f64,
     #[serde(default)]
@@ -155,6 +159,24 @@ pub struct Row {
 }
 
 impl Row {
+    pub fn task_metric(&self, benchmark: Benchmark) -> Option<&TaskMetric> {
+        self.task_metrics
+            .iter()
+            .find(|metric| metric.benchmark == benchmark)
+    }
+
+    pub fn benchmark_tasks(&self, benchmark: Benchmark) -> Option<usize> {
+        self.task_metric(benchmark)
+            .map(|metric| metric.task_count)
+            .filter(|count| *count > 0)
+    }
+
+    pub fn benchmark_dataset(&self, benchmark: Benchmark) -> Option<&str> {
+        self.task_metric(benchmark)
+            .map(|metric| metric.dataset_id.as_str())
+            .filter(|dataset| !dataset.is_empty())
+    }
+
     pub fn display_name(&self) -> String {
         let name = if !self.display_name.is_empty() {
             self.display_name.clone()

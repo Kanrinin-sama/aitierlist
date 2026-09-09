@@ -1438,10 +1438,32 @@ fn policy_files(table: &Table, directory: &Path) -> Result<Vec<StagedFile>> {
                 let primary_route = rule
                     .row_index
                     .and_then(|index| table.rows.get(index))
-                    .map(crate::agent_setup::binding_id)
+                    .map(|row| {
+                        rule.research_candidates
+                            .iter()
+                            .find(|candidate| {
+                                candidate.primary
+                                    && candidate.row_index == rule.row_index.unwrap_or_default()
+                            })
+                            .map_or_else(
+                                || crate::agent_setup::binding_id(row),
+                                |candidate| {
+                                    crate::agent_setup::binding_id_for(
+                                        &candidate.native_harness,
+                                        row,
+                                    )
+                                },
+                            )
+                    })
                     .map(|binding| crate::team_policy::route_id(&binding));
-                let research_candidates: Vec<_> = rule.research_candidates.iter().filter_map(|candidate| table.rows.get(candidate.row_index).map(|row| serde_json::json!({"route":crate::team_policy::route_id(&candidate.binding_id),"binding_id":candidate.binding_id,"primary":candidate.primary,"benchmark":{"harness":row.harness,"model":row.model,"effort":row.effort,"source":candidate.source},"native_harness":candidate.native_harness,"provider":candidate.provider_id,"plan":candidate.plan_id,"score":candidate.score,"components":{"omniscience_accuracy":{"value":candidate.accuracy,"weight":candidate.accuracy_weight},"omniscience_non_hallucination":{"value":candidate.non_hallucination,"weight":candidate.non_hallucination_weight},"aa_lcr":{"value":candidate.lcr,"weight":candidate.lcr_weight},"hle":{"value":candidate.hle,"weight":candidate.hle_weight}},"diagnostics":{"gpqa_scientific":candidate.gpqa_diagnostic,"gdp_pdf_document":candidate.gdp_pdf_diagnostic},"api_proxy":{"expected_usd":candidate.expected_usd,"decode_hours":candidate.decode_hours},"eligibility":candidate.eligibility}))).collect();
-                let value = serde_json::json!({"policy_version":crate::team_policy::VERSION,"role":role.seat.name(),"class":rule.class.name(),"condition":rule.condition,"primary":{"route":primary_route,"recommendation_only":rule.recommendation_only,"attempt_limit":rule.attempt_limit,"utility":rule.utility,"competence":rule.competence,"weekly_expected_usage":rule.nominal_usage,"weekly_expected_hours":rule.nominal_hours,"weekly_reserved_usage":rule.reserved_usage,"weekly_reserved_hours":rule.reserved_hours,"expected_usage":rule.per_call_expected_usage,"expected_hours":rule.per_call_expected_hours,"per_call_reserved_usage":rule.per_call_reserved_usage,"per_call_reserved_hours":rule.per_call_reserved_hours,"provider":rule.provider_id},"research_candidates":research_candidates,"lower_effort":rule.lower_effort.as_ref().map(adaptive),"same_account":rule.within_provider_alternatives.iter().map(adaptive).collect::<Vec<_>>(),"other_accounts":rule.surplus_alternatives.iter().map(adaptive).collect::<Vec<_>>(),"fallback":rule.fallback_policy,"calibration":rule.calibration,"failure_action":rule.failure_action});
+                let research_candidates: Vec<_> = rule.research_candidates.iter().filter_map(|candidate| table.rows.get(candidate.row_index).map(|row| serde_json::json!({"route":crate::team_policy::route_id(&candidate.binding_id),"binding_id":candidate.binding_id,"primary":candidate.primary,"benchmark":{"harness":row.harness,"model":row.model,"effort":row.effort,"source":candidate.source},"native_harness":candidate.native_harness,"provider":candidate.provider_id,"plan":candidate.plan_id,"score":candidate.score,"components":{"omniscience_accuracy":{"value":candidate.accuracy,"weight":candidate.accuracy_weight},"omniscience_no_incorrect_answer":{"value":candidate.non_wrong,"weight":candidate.non_wrong_weight},"aa_lcr":{"value":candidate.lcr,"weight":candidate.lcr_weight},"hle":{"value":candidate.hle,"weight":candidate.hle_weight}},"diagnostics":{"omniscience_conditional_hallucination":candidate.conditional_hallucination,"gpqa_scientific":candidate.gpqa_diagnostic,"gdp_pdf_document":candidate.gdp_pdf_diagnostic},"api_proxy":{"expected_usd":candidate.expected_usd,"decode_hours":candidate.decode_hours},"eligibility":candidate.eligibility}))).collect();
+                let research_included = portfolio
+                    .dispatch
+                    .classes
+                    .iter()
+                    .find(|demand| demand.class == rule.class)
+                    .is_some_and(|demand| demand.research_included);
+                let value = serde_json::json!({"policy_version":crate::team_policy::VERSION,"role":role.seat.name(),"class":rule.class.name(),"condition":rule.condition,"research_reference_included":research_included,"primary":{"route":primary_route,"recommendation_only":rule.recommendation_only,"attempt_limit":rule.attempt_limit,"utility":rule.utility,"competence":rule.competence,"weekly_expected_usage":rule.nominal_usage,"weekly_expected_hours":rule.nominal_hours,"weekly_reserved_usage":rule.reserved_usage,"weekly_reserved_hours":rule.reserved_hours,"expected_usage":rule.per_call_expected_usage,"expected_hours":rule.per_call_expected_hours,"per_call_reserved_usage":rule.per_call_reserved_usage,"per_call_reserved_hours":rule.per_call_reserved_hours,"provider":rule.provider_id},"research_candidates":research_candidates,"lower_effort":rule.lower_effort.as_ref().map(adaptive),"same_account":rule.within_provider_alternatives.iter().map(adaptive).collect::<Vec<_>>(),"other_accounts":rule.surplus_alternatives.iter().map(adaptive).collect::<Vec<_>>(),"fallback":rule.fallback_policy,"calibration":rule.calibration,"failure_action":rule.failure_action});
                 index.push(serde_json::json!({"role":role.seat.name(),"class":rule.class.name(),"file":name}));
                 files.push(StagedFile {
                     path: directory.join(&name),

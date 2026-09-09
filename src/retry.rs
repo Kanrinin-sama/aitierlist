@@ -23,22 +23,32 @@ impl Layer {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Resolved {
     pub rho: f64,
     pub layer: Layer,
+    pub evidence_dataset: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RowRetry {
-    pub deepswe: Resolved,
-    pub terminal_bench: Resolved,
-    pub qna: Resolved,
+    pub deepswe: Option<Resolved>,
+    pub terminal_bench: Option<Resolved>,
+    pub qna: Option<Resolved>,
     pub difficulty_ratio: f64,
 }
 
 impl RowRetry {
+    pub fn repeat_evidence(&self, benchmark: Benchmark) -> Option<&Resolved> {
+        match benchmark {
+            Benchmark::Swe => self.deepswe.as_ref(),
+            Benchmark::Terminal => self.terminal_bench.as_ref(),
+            Benchmark::Qna => self.qna.as_ref(),
+            _ => None,
+        }
+    }
+
     pub fn adjusted_pass(&self, benchmark: Benchmark, pass: f64) -> f64 {
         if benchmark == Benchmark::Swe {
             (pass * self.difficulty_ratio).clamp(0.0, 1.0)
@@ -49,13 +59,34 @@ impl RowRetry {
 
     pub fn description(&self) -> String {
         format!(
-            "DeepSWE rho: {:.6} ({})\nTerminal-Bench 2.1 rho: {:.6} ({})\nRepository Q&A rho: {:.6} ({})\nDeepSWE difficulty multiplier: {:.6}",
-            self.deepswe.rho,
-            self.deepswe.layer.name(),
-            self.terminal_bench.rho,
-            self.terminal_bench.layer.name(),
-            self.qna.rho,
-            self.qna.layer.name(),
+            "DeepSWE rho: {}\nTerminal-Bench rho: {}\nRepository Q&A rho: {}\nDeepSWE difficulty multiplier: {:.6}",
+            self.deepswe
+                .as_ref()
+                .map(|value| format!(
+                    "{:.6} ({}, {})",
+                    value.rho,
+                    value.layer.name(),
+                    value.evidence_dataset
+                ))
+                .unwrap_or_else(|| "No matching published repeat evidence".to_string()),
+            self.terminal_bench
+                .as_ref()
+                .map(|value| format!(
+                    "{:.6} ({}, {})",
+                    value.rho,
+                    value.layer.name(),
+                    value.evidence_dataset
+                ))
+                .unwrap_or_else(|| "No matching published repeat evidence".to_string()),
+            self.qna
+                .as_ref()
+                .map(|value| format!(
+                    "{:.6} ({}, {})",
+                    value.rho,
+                    value.layer.name(),
+                    value.evidence_dataset
+                ))
+                .unwrap_or_else(|| "No published repeat evidence".to_string()),
             self.difficulty_ratio,
         )
     }
@@ -63,18 +94,10 @@ impl RowRetry {
 
 impl Default for RowRetry {
     fn default() -> Self {
-        let table = table();
-        let deepswe = Resolved {
-            rho: table.deepswe.pool_rho,
-            layer: Layer::SourcePool,
-        };
         Self {
-            deepswe,
-            terminal_bench: Resolved {
-                rho: table.terminal_bench.pool_rho,
-                layer: Layer::SourcePool,
-            },
-            qna: deepswe,
+            deepswe: None,
+            terminal_bench: None,
+            qna: None,
             difficulty_ratio: 1.0,
         }
     }
@@ -84,6 +107,7 @@ impl Default for RowRetry {
 struct RetryTable {
     deepswe: DeepSwe,
     terminal_bench: TerminalBench,
+    terminal_bench_v4: TerminalBench,
 }
 
 #[derive(Deserialize)]
@@ -108,14 +132,12 @@ struct Config {
 
 #[derive(Deserialize)]
 struct TerminalBench {
-    pool_rho: f64,
     harnesses: Vec<Harness>,
 }
 
 #[derive(Deserialize)]
 struct Harness {
     harness_label: String,
-    rho: f64,
     submissions: Vec<Submission>,
 }
 
@@ -204,59 +226,73 @@ pub fn resolve(row: &Row, rho_override: Option<f64>) -> RowRetry {
     let table = table();
     let mut resolved = RowRetry::default();
     if identity.effort != Some("none") {
-        if let Some(model) = identity.deepswe.and_then(|name| {
-            table
-                .deepswe
-                .models
-                .iter()
-                .find(|model| model.model == name)
-        }) {
-            resolved.deepswe = Resolved {
+        if row.benchmark_dataset(Benchmark::Swe) == Some("deep-swe-v1.1") {
+            resolved.deepswe = Some(Resolved {
+                rho: table.deepswe.pool_rho,
+                layer: Layer::SourcePool,
+                evidence_dataset: "deep-swe-v1.1".to_string(),
+            });
+        }
+        if row.benchmark_dataset(Benchmark::Swe) == Some("deep-swe-v1.1")
+            && let Some(model) = identity.deepswe.and_then(|name| {
+                table
+                    .deepswe
+                    .models
+                    .iter()
+                    .find(|model| model.model == name)
+            })
+        {
+            resolved.deepswe = Some(Resolved {
                 rho: model.rho,
                 layer: Layer::ModelPool,
-            };
+                evidence_dataset: "deep-swe-v1.1".to_string(),
+            });
             if let Some(config) = model
                 .configs
                 .iter()
                 .find(|config| config.reasoning_effort.as_deref() == identity.effort)
             {
-                resolved.deepswe = Resolved {
+                resolved.deepswe = Some(Resolved {
                     rho: config.rho_shrunk,
                     layer: Layer::Exact,
-                };
+                    evidence_dataset: "deep-swe-v1.1".to_string(),
+                });
                 resolved.difficulty_ratio = config.difficulty_ratio;
             }
         }
-        if let Some(harness) = identity.terminal_harness.and_then(|name| {
-            table
-                .terminal_bench
-                .harnesses
-                .iter()
-                .find(|harness| harness.harness_label == name)
-        }) {
-            resolved.terminal_bench = Resolved {
-                rho: harness.rho,
-                layer: Layer::HarnessPool,
-            };
-            if let Some(submission) = harness.submissions.iter().find(|submission| {
+        let terminal_table = match row.benchmark_dataset(Benchmark::Terminal) {
+            Some("terminal-bench-v4") => Some((&table.terminal_bench_v4, "terminal-bench-v4")),
+            Some("terminal-bench-v2.1") => Some((&table.terminal_bench, "terminal-bench-v2.1")),
+            _ => None,
+        };
+        if let Some((terminal_table, dataset)) = terminal_table
+            && let Some(harness) = identity.terminal_harness.and_then(|name| {
+                terminal_table
+                    .harnesses
+                    .iter()
+                    .find(|harness| harness.harness_label == name)
+            })
+            && let Some(submission) = harness.submissions.iter().find(|submission| {
                 submission.model_display == identity.terminal_model
                     && submission.reasoning_effort.as_deref() == identity.effort
-            }) {
-                resolved.terminal_bench = Resolved {
-                    rho: submission.rho,
-                    layer: Layer::Exact,
-                };
-            }
+            })
+        {
+            resolved.terminal_bench = Some(Resolved {
+                rho: submission.rho,
+                layer: Layer::Exact,
+                evidence_dataset: dataset.to_string(),
+            });
         }
     }
     if let Some(rho) = rho_override {
         let value = Resolved {
             rho,
             layer: Layer::Override,
+            evidence_dataset: "user-rho-override".to_string(),
         };
-        resolved.deepswe = value;
-        resolved.terminal_bench = value;
-        resolved.qna = value;
+        resolved.deepswe = Some(value.clone());
+        resolved.terminal_bench = Some(value.clone());
+        resolved.qna = Some(value);
     }
     resolved
 }

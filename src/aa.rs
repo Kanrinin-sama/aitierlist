@@ -433,14 +433,18 @@ fn apply_orchestrator_resources(row: &mut Value, item: &Value, hosts: &[&Value])
 
 fn task_metric(
     benchmark: &str,
+    dataset: (&str, usize),
     pass: f64,
     seconds: f64,
     usd: f64,
     time_basis: &str,
     cost_basis: &str,
 ) -> Value {
+    let (dataset_id, task_count) = dataset;
     json!({
         "benchmark": benchmark,
+        "datasetId": dataset_id,
+        "taskCount": task_count,
         "pass": pass,
         "seconds": seconds,
         "pooledSeconds": seconds,
@@ -631,6 +635,7 @@ pub fn agent_row(raw: &Value, item: Option<&Value>, hosts: &[&Value]) -> Option<
     let mut metrics = vec![
         task_metric(
             "swe",
+            (&swe_dataset, swe_tasks as usize),
             number(&swe["reward"]),
             swe_seconds,
             swe_usd,
@@ -639,6 +644,7 @@ pub fn agent_row(raw: &Value, item: Option<&Value>, hosts: &[&Value]) -> Option<
         ),
         task_metric(
             "terminal",
+            (&term_dataset, terminal_tasks as usize),
             number(&term["reward"]),
             term_seconds,
             term_usd,
@@ -647,6 +653,7 @@ pub fn agent_row(raw: &Value, item: Option<&Value>, hosts: &[&Value]) -> Option<
         ),
         task_metric(
             "qna",
+            (&qna_dataset, qna_tasks as usize),
             number(&qna["reward"]),
             qna_seconds,
             qna_usd,
@@ -678,9 +685,15 @@ pub fn agent_row(raw: &Value, item: Option<&Value>, hosts: &[&Value]) -> Option<
 pub fn model_row(item: &Value, hosts: &[&Value]) -> Value {
     let prices = model_prices(item, hosts);
     let speed = model_speed(item, hosts);
+    let terminal_complete = |score_key: &str, token_key: &str| {
+        item[score_key]
+            .as_f64()
+            .is_some_and(|score| score.is_finite() && (0.0..=1.0).contains(&score))
+            && !item["canonicalEvalTokenCounts"][token_key].is_null()
+    };
     let coding_rankable = !item["deprecated"].as_bool().unwrap_or(false)
-        && fallback(&item["terminalbenchV21"], 0.0) > 0.0
-        && !item["canonicalEvalTokenCounts"]["terminalbenchV21"].is_null()
+        && (terminal_complete("terminalbenchV40", "terminalbenchV40")
+            || terminal_complete("terminalbenchV21", "terminalbenchV21"))
         && item["gpqa"].is_number()
         && item["hle"].is_number()
         && prices.is_some()
@@ -703,17 +716,42 @@ pub fn model_row(item: &Value, hosts: &[&Value]) -> Value {
     let mut metrics = Vec::new();
     if let Some(prices) = prices {
         let mut terminal_proxy = None;
-        for (benchmark, score_key, token_key, tasks) in [
+        for (dataset_id, score_key, token_key, tasks) in [
             (
-                "terminal",
+                "terminal-bench-v4",
+                "terminalbenchV40",
+                "terminalbenchV40",
+                66.0,
+            ),
+            (
+                "terminal-bench-v2.1",
                 "terminalbenchV21",
                 "terminalbenchV21",
                 TERMINAL_TASKS,
             ),
-            ("gpqa", "gpqa", "gpqa", GPQA_TASKS),
-            ("hle", "hle", "hle", HLE_TASKS),
-            ("lcr", "lcr", "lcr", LCR_TASKS),
+        ] {
+            let Some(pass) = item[score_key]
+                .as_f64()
+                .filter(|score| score.is_finite() && (0.0..=1.0).contains(score))
+            else {
+                continue;
+            };
+            if let Some((Some(seconds), Some(usd))) =
+                canonical_resources(item, token_key, tasks, Some(prices), speed)
+            {
+                terminal_proxy = Some((seconds, usd));
+                metrics.push(task_metric("terminal", (dataset_id, tasks as usize), pass, seconds, usd,
+                    "Canonical output decode estimate per benchmark task",
+                    "Canonical token-price estimate per benchmark task; cache misses priced as writes"));
+                break;
+            }
+        }
+        for (benchmark, dataset_id, score_key, token_key, tasks) in [
+            ("gpqa", "gpqa", "gpqa", "gpqa", GPQA_TASKS),
+            ("hle", "hle", "hle", "hle", HLE_TASKS),
+            ("lcr", "lcr", "lcr", "lcr", LCR_TASKS),
             (
+                "omniscience",
                 "omniscience",
                 "omniscienceBreakdown.accuracy",
                 "omniscience",
@@ -731,11 +769,9 @@ pub fn model_row(item: &Value, hosts: &[&Value]) -> Value {
             if let Some((Some(seconds), Some(usd))) =
                 canonical_resources(item, token_key, tasks, Some(prices), speed)
             {
-                if benchmark == "terminal" {
-                    terminal_proxy = Some((seconds, usd));
-                }
                 metrics.push(task_metric(
                     benchmark,
+                    (dataset_id, tasks as usize),
                     pass,
                     seconds,
                     usd,
@@ -745,6 +781,7 @@ pub fn model_row(item: &Value, hosts: &[&Value]) -> Value {
             } else if let Some((seconds, usd)) = terminal_proxy {
                 metrics.push(task_metric(
                     benchmark,
+                    (dataset_id, tasks as usize),
                     pass,
                     seconds,
                     usd,
@@ -763,7 +800,8 @@ pub fn model_row(item: &Value, hosts: &[&Value]) -> Value {
     let terminal_usd = terminal_metric
         .and_then(|metric| metric["usd"].as_f64())
         .unwrap_or(0.0);
-    let mut row = json!({"name":name,"rawName":item["name"],"model":name,"modelKey":key,"harness":"model","family":family_key("model",&key),"vendor":vendor_key("model",&key),"term":item["terminalbenchV21"],"gpqa":item["gpqa"],"hle":item["hle"],"logic":if item["gpqa"].is_number() && item["hle"].is_number() { Some((number(&item["gpqa"])+number(&item["hle"]))/2.0) } else { None },"pass":item["terminalbenchV21"],"rankable":rankable,"speed":speed,"waitSeconds":terminal_seconds,"attemptUsd":terminal_usd,"readSeconds":terminal_seconds,"readUsd":terminal_usd,"taskMetrics":metrics});
+    let term = terminal_metric.and_then(|metric| metric["pass"].as_f64());
+    let mut row = json!({"name":name,"rawName":item["name"],"model":name,"modelKey":key,"harness":"model","family":family_key("model",&key),"vendor":vendor_key("model",&key),"term":term,"gpqa":item["gpqa"],"hle":item["hle"],"logic":if item["gpqa"].is_number() && item["hle"].is_number() { Some((number(&item["gpqa"])+number(&item["hle"]))/2.0) } else { None },"pass":term,"rankable":rankable,"speed":speed,"waitSeconds":terminal_seconds,"attemptUsd":terminal_usd,"readSeconds":terminal_seconds,"readUsd":terminal_usd,"taskMetrics":metrics});
     row["deprecated"] = json!(item["deprecated"].as_bool().unwrap_or(false));
     apply_model_quality(&mut row, item);
     apply_orchestrator_resources(&mut row, item, hosts);

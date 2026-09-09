@@ -49,6 +49,8 @@ pub struct Settings {
     pub vendor_overrides: BTreeMap<String, Option<f64>>,
     pub cache_hours: u32,
     pub show_hallucination: bool,
+    pub research_classes: BTreeMap<String, bool>,
+    pub monotonic_class_competence: bool,
 }
 
 impl Default for Settings {
@@ -94,6 +96,11 @@ impl Default for Settings {
             vendor_overrides,
             cache_hours: 1,
             show_hallucination: false,
+            research_classes: crate::portfolio::WorkClass::ALL
+                .into_iter()
+                .map(|class| (class.name().to_owned(), false))
+                .collect(),
+            monotonic_class_competence: false,
         }
     }
 }
@@ -156,6 +163,11 @@ impl Settings {
         self.plan_prices.t20 =
             finite(self.plan_prices.t20, defaults.plan_prices.t20).clamp(1.0, 1000.0);
         self.cache_hours = self.cache_hours.clamp(1, 48);
+        self.research_classes.retain(|class, _| {
+            crate::portfolio::WorkClass::ALL
+                .into_iter()
+                .any(|known| known.name() == class)
+        });
         for allowance in self.vendor_overrides.values_mut() {
             if allowance.is_some_and(|value| !value.is_finite() || value < 0.0) {
                 *allowance = None;
