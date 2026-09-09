@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 aes-gcm = "0.11.1"
 anyhow = "1.0.104"
-blockitall-update = { path = "../blockitall-update" }
+blockitall-update = { git = "https://github.com/Kanrinin-sama/blockitall-update.git", rev = "4259685e327a06d1fa599d658f06dcccd00ed77a" }
 directories = "6.0.0"
 eframe = { version = "0.36.1", features = ["persistence"] }
 flate2 = "1.1.10"
