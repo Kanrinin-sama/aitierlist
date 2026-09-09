@@ -1,11 +1,16 @@
-use crate::settings::{Settings, load_settings, save_settings};
+use crate::settings::{BestInHouseMode, Settings, load_settings, save_settings};
 use crate::types::{CacheState, Seat, Table, Tier};
 use eframe::egui;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{
+    Arc, Mutex,
+    mpsc::{Receiver, Sender, channel},
+};
 use std::time::{Duration, Instant};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const REFRESH_COOLDOWN_SECONDS: u64 = 16;
+const AA_INTELLIGENCE_METHODOLOGY_URL: &str =
+    "https://artificialanalysis.ai/methodology/intelligence-benchmarking";
 const VENDOR_TABS: [(&str, &str); 5] = [
     ("Codex", "openai"),
     ("Claude", "anthropic"),
@@ -14,10 +19,28 @@ const VENDOR_TABS: [(&str, &str); 5] = [
     ("Grok", "xai"),
 ];
 
+type InstallResult = (
+    Result<(), String>,
+    Option<blockitall_update::StagedArtifact>,
+);
+
 fn competence_text(value: Option<f64>) -> String {
     value
         .map(|value| format!("{value:.3}"))
         .unwrap_or_else(|| "Unknown".to_string())
+}
+
+fn research_route_name(row: &crate::types::Row, native_harness: &str) -> String {
+    if native_harness
+        .to_ascii_lowercase()
+        .starts_with("antigravity")
+    {
+        return match row.effort.as_deref() {
+            Some(effort) if !effort.is_empty() => format!("AGY - {} ({effort})", row.model),
+            _ => format!("AGY - {}", row.model),
+        };
+    }
+    row.display_name()
 }
 
 type ComparisonResponse = (
@@ -28,13 +51,391 @@ type ComparisonResponse = (
     crate::comparison::CounterfactualReport,
 );
 
+type SetupResponse = Result<(Option<String>, crate::host_install::Discovery), String>;
+
+struct Generator {
+    open: bool,
+    response: Option<Receiver<SetupResponse>>,
+    discovery: Option<crate::host_install::Discovery>,
+    markdown: Option<String>,
+    table: Option<Table>,
+    isolated: bool,
+    settings: Option<Settings>,
+    revision: u64,
+    selected: std::collections::BTreeSet<String>,
+    add_to_path: bool,
+    error: String,
+    preview_rx: Option<Receiver<Result<crate::host_install::InstallPreview, String>>>,
+    preview: Option<crate::host_install::InstallPreview>,
+    preview_dirty: bool,
+    install_rx: Option<Receiver<Result<crate::host_install::InstallResult, String>>>,
+    installed: Option<crate::host_install::InstallResult>,
+    native_horizon: String,
+}
+
+impl Generator {
+    fn new(context: egui::Context) -> Self {
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let result = crate::host_install::discover(&Table::empty())
+                .map(|discovery| (None, discovery))
+                .map_err(|error| format!("{error:#}"));
+            let _ = tx.send(result);
+            context.request_repaint();
+        });
+        Self {
+            open: false,
+            response: Some(rx),
+            discovery: None,
+            markdown: None,
+            table: None,
+            isolated: true,
+            settings: None,
+            revision: 0,
+            selected: std::collections::BTreeSet::new(),
+            add_to_path: false,
+            error: String::new(),
+            preview_rx: None,
+            preview: None,
+            preview_dirty: false,
+            install_rx: None,
+            installed: None,
+            native_horizon: String::new(),
+        }
+    }
+
+    fn prepare(&mut self, table: Table, settings: Settings, revision: u64, context: egui::Context) {
+        if self.install_rx.is_some() {
+            return;
+        }
+        self.open = true;
+        self.settings = Some(settings);
+        self.table = Some(table.clone());
+        self.isolated = true;
+        self.revision = revision;
+        self.error.clear();
+        self.markdown = None;
+        self.installed = None;
+        self.preview = None;
+        self.preview_rx = None;
+        self.preview_dirty = false;
+        self.add_to_path = false;
+        let (tx, rx) = channel();
+        self.response = Some(rx);
+        std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<_> {
+                let discovery = crate::host_install::discover(&table)?;
+                let markdown = crate::orchestration::render_with_discovery(&table, &discovery)?;
+                Ok((Some(markdown), discovery))
+            })()
+            .map_err(|error| format!("{error:#}"));
+            let _ = tx.send(result);
+            context.request_repaint();
+        });
+    }
+
+    fn pump(&mut self) {
+        if let Some(rx) = &self.response
+            && let Ok(result) = rx.try_recv()
+        {
+            self.response = None;
+            match result {
+                Ok((markdown, discovery)) => {
+                    self.selected.clear();
+                    if let Some(host) = &discovery.recommended_host
+                        && discovery.hosts.iter().any(|candidate| {
+                            candidate.id == *host
+                                && candidate.installed
+                                && candidate.executable.is_some()
+                                && (!self.isolated || candidate.isolation_supported)
+                        })
+                    {
+                        self.selected.insert(host.clone());
+                    }
+                    self.preview_dirty = markdown.is_some();
+                    self.markdown = markdown;
+                    self.discovery = Some(discovery);
+                }
+                Err(error) => self.error = error,
+            }
+        }
+        if let Some(rx) = &self.preview_rx
+            && let Ok(result) = rx.try_recv()
+        {
+            self.preview_rx = None;
+            match result {
+                Ok(preview) => self.preview = Some(preview),
+                Err(error) => self.error = error,
+            }
+        }
+        if let Some(rx) = &self.install_rx
+            && let Ok(result) = rx.try_recv()
+        {
+            self.install_rx = None;
+            self.preview = None;
+            match result {
+                Ok(mut result) => {
+                    if let Some(previous) = self.installed.take() {
+                        for launcher in previous.launchers {
+                            if !result
+                                .launchers
+                                .iter()
+                                .any(|current| current.host_id == launcher.host_id)
+                            {
+                                result.launchers.push(launcher);
+                            }
+                        }
+                    }
+                    self.installed = Some(result);
+                }
+                Err(error) => self.error = error,
+            }
+        }
+    }
+    fn show(
+        &mut self,
+        context: &egui::Context,
+        table: &Table,
+        settings: &Settings,
+        revision: u64,
+        score_current: bool,
+    ) {
+        if !self.open {
+            return;
+        }
+        let mut open = self.open;
+        let mut regenerate = false;
+        let mut retry_failed = false;
+        let current = score_current
+            && self.revision == revision
+            && self
+                .settings
+                .as_ref()
+                .is_some_and(|prepared| prepared.scoring_matches(settings));
+        egui::Window::new("Generate Orchestrator").open(&mut open).default_width(660.0).resizable(true).show(context, |ui| {
+            egui::ScrollArea::vertical().max_height(650.0).show(ui, |ui| {
+                if self.response.is_some() {
+                    ui.spinner();
+                    ui.label("Preparing the conductor and discovering local hosts...");
+                }
+                if !current && self.response.is_none() {
+                    ui.label("Settings changed. Generate again to use the current role policy.");
+                    regenerate = ui.add_enabled(score_current && self.install_rx.is_none(), egui::Button::new("Generate again")).clicked();
+                }
+                if !self.error.is_empty() {
+                    ui.colored_label(egui::Color32::LIGHT_RED, &self.error);
+                    if ui.add_enabled(score_current && self.install_rx.is_none() && self.installed.is_none(), egui::Button::new("Retry preparation")).clicked() { regenerate = true; }
+                }
+                if let Some(discovery) = &self.discovery {
+                    ui.strong("Create an isolated orchestrator system?");
+                    ui.add_enabled_ui(self.install_rx.is_none() && self.installed.is_none() && self.response.is_none() && self.preview_rx.is_none(), |ui| {
+                        let previous = self.isolated;
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(&mut self.isolated, true, "Yes (recommended)");
+                            ui.selectable_value(&mut self.isolated, false, "No - normal tool setup");
+                        });
+                        if previous != self.isolated {
+                            self.selected.retain(|id| discovery.hosts.iter().any(|host| host.id == *id && host.executable.is_some() && (!self.isolated || host.isolation_supported)));
+                            if self.selected.is_empty()
+                                && let Some(recommended) = &discovery.recommended_host
+                                && discovery.hosts.iter().any(|host| host.id == *recommended && host.executable.is_some() && (!self.isolated || host.isolation_supported)) {
+                                self.selected.insert(recommended.clone());
+                            }
+                            self.preview_dirty = true;
+                        }
+                    });
+                    ui.label(if self.isolated { "Separate generated runtime and dispatcher. Only tools with enforceable isolation can be selected; authentication requirements are shown below." } else { "Use existing tool configuration and the portable conductor document." });
+                    if self.isolated {
+                        match crate::workspace::resolve(settings) {
+                            Ok(paths) => ui.label(format!("Collaboration workspace: {}", paths.root.display())),
+                            Err(error) => ui.colored_label(egui::Color32::LIGHT_RED, format!("Collaboration workspace unavailable: {error:#}")),
+                        };
+                        ui.small("Change or browse this root in Settings. Isolated workers use it for user work; private fleet state remains in app data.");
+                    }
+                    ui.label("Choose hosts to install. The recommended orchestrator is selected by default when available.");
+                    if let Some(route) = crate::orchestration::recommended_route(table) {
+                        ui.small(format!("Fixed orchestrator allocation: {} / {}.", route.provider_id, route.plan_id));
+                    }
+                    ui.label("Multi-provider tools use their configured connection and billing; onboarding verifies the model and funded account.");
+                    ui.add_enabled_ui(self.install_rx.is_none() && self.installed.is_none() && self.response.is_none() && self.preview_rx.is_none(), |ui| {
+                        for host in discovery.hosts.iter().filter(|host| !host.kind.is_multi_provider() || host.detection != "absent") {
+                            let mut selected = self.selected.contains(&host.id);
+                            let status = match host.detection.as_str() {
+                                "desktop_only" => "desktop app detected; CLI unverified",
+                                "config_only" => "configuration found; CLI needs setup",
+                                "invalid_override" => "configured path needs setup",
+                                "absent" => "not detected",
+                                _ if host.executable.is_none() => "CLI detected; launch setup needed",
+                                _ => host.auth_status.as_str(),
+                            };
+                            let recommended = discovery.recommended_host.as_deref() == Some(host.id.as_str());
+                            let multi_provider = host.kind.is_multi_provider();
+                            let label = format!("{}{}{} - {}", host.name, if multi_provider { " (multi-provider harness)" } else { "" }, if recommended { " (recommended orchestrator)" } else { "" }, status);
+                            if ui.add_enabled(host.installed && host.executable.is_some() && (!self.isolated || host.isolation_supported), egui::Checkbox::new(&mut selected, label)).changed() {
+                                if selected { self.selected.insert(host.id.clone()); } else { self.selected.remove(&host.id); }
+                                self.preview_dirty = true;
+                            }
+                            if !host.message.is_empty() { ui.small(&host.message); }
+                            if self.isolated { ui.small(&host.isolation_message); }
+                        }
+                        let absent = discovery.hosts.iter().filter(|host| host.kind.is_multi_provider() && host.detection == "absent")
+                            .map(|host| host.name.as_str()).collect::<Vec<_>>();
+                        if !absent.is_empty() {
+                            ui.small(format!("Checked for, not found: {}", absent.join(", ")));
+                        }
+                        if ui.checkbox(&mut self.add_to_path, "Add launcher directory to my user PATH").changed() {
+                            self.preview_dirty = true;
+                        }
+                    });
+                    if !discovery.setup.message.is_empty() { ui.label(&discovery.setup.message); }
+                    for issue in &discovery.setup.issues { ui.label(issue); }
+                    for note in &discovery.notes {
+                        if self.isolated && note.starts_with("Launchers preserve the caller's working directory.") {
+                            ui.small("Isolated launchers use a generated clean workspace and approved model bindings.");
+                        } else {
+                            ui.small(note);
+                        }
+                    }
+                }
+                if self.markdown.is_some() {
+                    ui.label(if self.isolated { "Leaving hosts unchecked saves an isolated runtime bundle without a conductor launcher." } else { "Leaving all hosts unchecked exports portable Markdown only. Launch commands use absolute paths unless PATH is explicitly added." });
+                }
+                if self.preview_rx.is_some() || self.preview_dirty {
+                    ui.spinner(); ui.label("Preparing exact destinations...");
+                } else if let Some(preview) = &self.preview {
+                    ui.separator();
+                    ui.strong("Review before installing");
+                    for destination in &preview.destinations { ui.label(destination.display().to_string()); }
+                    for impact in &preview.impacts { ui.add(egui::Label::new(impact).wrap()); }
+                    for command in &preview.commands { ui.monospace(command); }
+                    if (self.installed.is_none() || self.installed.as_ref().is_some_and(|result| !result.failures.is_empty() && preview.host_ids.iter().all(|host| result.failures.iter().any(|failure| failure.host_id == *host)))) && ui.add_enabled(current && self.install_rx.is_none(), egui::Button::new(if preview.host_ids.is_empty() { if preview.isolated { "Save isolated runtime" } else { "Save portable Markdown" } } else { "OK - generate and install selected hosts" })).clicked() {
+                        let preview = preview.clone();
+                        let (tx, rx) = channel();
+                        self.install_rx = Some(rx);
+                        self.error.clear();
+                        let context = context.clone();
+                        std::thread::spawn(move || {
+                            let _ = tx.send(crate::host_install::install(preview).map_err(|error| format!("{error:#}")));
+                            context.request_repaint();
+                        });
+                    }
+                }
+                if self.install_rx.is_some() { ui.spinner(); ui.label("Installing..."); }
+                if let Some(installed) = &self.installed {
+                    ui.label(format!("Installed generation: {}", installed.directory.display()));
+                    ui.label(if installed.isolated { "Isolated runtime generated" } else { "Normal tool setup generated" });
+                    let document_path = if installed.isolated { installed.directory.join("runtime.md") } else { installed.policy_path.clone() };
+                    ui.colored_label(egui::Color32::GREEN, format!("Generated {}", document_path.display()));
+                    if ui.button("Refresh native horizon").clicked() {
+                        let generation_id = installed.directory.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+                        self.native_horizon = crate::agent_setup::paths()
+                            .and_then(|paths| std::fs::read(&paths.ledger).map_err(anyhow::Error::from))
+                            .and_then(|bytes| serde_json::from_slice::<crate::agent_setup::Ledger>(&bytes).map_err(anyhow::Error::from))
+                            .and_then(|ledger| {
+                                let pointer = ledger.horizons.iter().find(|pointer| pointer.generation_id == generation_id).ok_or_else(|| anyhow::anyhow!("No committed horizon for this generation"))?;
+                                let bytes = std::fs::read(&pointer.artifact_path)?;
+                                let horizon: crate::native_scheduler::NativeHorizon = serde_json::from_slice(&bytes)?;
+                                anyhow::ensure!(horizon.horizon_id == pointer.id && horizon.policy_version == pointer.policy_version && horizon.profile_identity == pointer.profile_identity && horizon.ledger_revision == pointer.committed_revision, "Committed horizon pointer and artifact differ");
+                                crate::orchestration::render_native_horizon(&horizon)
+                            })
+                            .unwrap_or_else(|error| format!("Committed native horizon unavailable: {error:#}"));
+                    }
+                    if !self.native_horizon.is_empty() {
+                        egui::CollapsingHeader::new("Live native allocation")
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                ui.monospace(&self.native_horizon);
+                            });
+                    }
+                    if ui.button(if installed.isolated { "Copy runtime path" } else { "Copy Markdown path" }).clicked() { ui.ctx().copy_text(document_path.display().to_string()); }
+                    for launcher in &installed.launchers {
+                        ui.colored_label(egui::Color32::GREEN, format!("{}: Installed", launcher.host_id));
+                        ui.label(&launcher.adapter);
+                        ui.label(launcher.path.display().to_string());
+                        ui.horizontal(|ui| {
+                            ui.monospace(&launcher.command);
+                            if ui.button("Copy command").clicked() { ui.ctx().copy_text(launcher.command.clone()); }
+                        });
+                    }
+                    for failure in &installed.failures {
+                        ui.colored_label(egui::Color32::LIGHT_RED, format!("{}: {}", failure.host_id, failure.message));
+                    }
+                    if !installed.failures.is_empty() && ui.add_enabled(current && self.install_rx.is_none(), egui::Button::new("Prepare retry for failed hosts only")).clicked() {
+                        retry_failed = true;
+                    }
+                    for note in &installed.notes { ui.add(egui::Label::new(note).wrap()); }
+                    ui.label(if installed.launchers.is_empty() { "Bundle saved without a conductor launcher. Generate with a host to launch." } else { "Run the copied command from any working directory. First launch verifies the machine profile and asks consolidated onboarding questions before paid delegation." });
+                    if ui.add_enabled(score_current && self.install_rx.is_none(), egui::Button::new("Generate another setup")).clicked() { regenerate = true; }
+                }
+            });
+        });
+        self.open = open;
+        if retry_failed && let Some(installed) = &self.installed {
+            self.selected = installed
+                .failures
+                .iter()
+                .map(|failure| failure.host_id.clone())
+                .collect();
+            self.add_to_path = false;
+            self.preview_dirty = true;
+        }
+        if regenerate {
+            self.prepare(table.clone(), settings.clone(), revision, context.clone());
+        }
+        if self.preview_dirty
+            && self.install_rx.is_none()
+            && self.preview_rx.is_none()
+            && self.response.is_none()
+            && let (Some(markdown), Some(discovery), Some(table)) =
+                (&self.markdown, &self.discovery, &self.table)
+        {
+            self.preview_dirty = false;
+            self.preview = None;
+            let markdown = markdown.clone();
+            let discovery = discovery.clone();
+            let table = table.clone();
+            let options = crate::host_install::InstallOptions {
+                isolated: self.isolated,
+            };
+            let hosts = self.selected.iter().cloned().collect::<Vec<_>>();
+            let add_to_path = self.add_to_path;
+            let installed = self.installed.clone();
+            let (tx, rx) = channel();
+            self.preview_rx = Some(rx);
+            let context = context.clone();
+            std::thread::spawn(move || {
+                let result = if let Some(installed) = installed {
+                    crate::host_install::prepare_retry(&discovery, &hosts, &installed)
+                } else {
+                    crate::host_install::prepare_install(
+                        &markdown,
+                        &discovery,
+                        &hosts,
+                        add_to_path,
+                        &table,
+                        options,
+                    )
+                };
+                let _ = tx.send(result.map_err(|error| format!("{error:#}")));
+                context.request_repaint();
+            });
+        }
+    }
+}
+
 pub struct App {
     table: Table,
     vendor_tables: [Table; 5],
     selected_tab: usize,
+    table_revision: u64,
+    generator: Generator,
     panel_widths: std::collections::HashMap<(Seat, Tier), f32>,
     agent_hours_text: String,
     rho_override_text: String,
+    collaboration_root_text: String,
+    subscription_count_text: std::collections::BTreeMap<String, String>,
+    workspace_status: String,
+    workspace_picker: Option<Receiver<Result<Option<std::path::PathBuf>, String>>>,
     agent_hours_invalid: bool,
     refresh_in_flight: bool,
     retry_after: Option<Instant>,
@@ -51,10 +452,13 @@ pub struct App {
     side_panel_open: bool,
     update_status: String,
     handoff_status: String,
-    update_rx: Option<Receiver<Result<crate::update::Checked, String>>>,
-    available_update: Option<crate::update::Available>,
-    staged_update: Option<crate::update::StagedUpdate>,
-    install_rx: Option<Receiver<(String, Option<crate::update::StagedUpdate>)>>,
+    updater: Arc<Mutex<blockitall_update::Updater>>,
+    health_guard: Option<blockitall_update::HealthGuard>,
+    close_after_handoff: bool,
+    update_rx: Option<Receiver<Result<blockitall_update::Checked, String>>>,
+    available_update: Option<blockitall_update::Available>,
+    staged_update: Option<blockitall_update::StagedArtifact>,
+    install_rx: Option<Receiver<InstallResult>>,
     comparison_choice: std::collections::HashMap<(Seat, Tier), usize>,
     comparison_generation: u64,
     comparison_pending: Option<(u64, Seat, Tier, usize)>,
@@ -64,7 +468,12 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        updater: blockitall_update::Updater,
+        health_guard: blockitall_update::HealthGuard,
+        handoff_status: String,
+    ) -> Self {
         let (table_tx, table_rx) = channel();
         let settings = load_settings();
         let table = Table::empty();
@@ -134,12 +543,28 @@ impl App {
             table,
             vendor_tables: std::array::from_fn(|_| Table::empty()),
             selected_tab: 0,
+            table_revision: 0,
+            generator: Generator::new(cc.egui_ctx.clone()),
             panel_widths: std::collections::HashMap::new(),
             agent_hours_text: settings.agent_hours.to_string(),
             rho_override_text: settings
                 .rho_override
                 .map(|value| value.to_string())
                 .unwrap_or_default(),
+            collaboration_root_text: crate::workspace::resolve(&settings)
+                .map(|paths| paths.root.display().to_string())
+                .unwrap_or_default(),
+            subscription_count_text: crate::subscriptions::PROVIDERS
+                .iter()
+                .map(|provider| {
+                    (
+                        provider.id.to_string(),
+                        settings.subscription_count(provider.id).to_string(),
+                    )
+                })
+                .collect(),
+            workspace_status: String::new(),
+            workspace_picker: None,
             agent_hours_invalid: false,
             refresh_in_flight: true,
             retry_after: None,
@@ -155,14 +580,10 @@ impl App {
             selected_seat_tier: None,
             side_panel_open: false,
             update_status: String::new(),
-            handoff_status: crate::update::last_handoff_status()
-                .map(|status| {
-                    format!(
-                        "Update {}: {} — {}",
-                        status.version, status.outcome, status.detail
-                    )
-                })
-                .unwrap_or_default(),
+            handoff_status,
+            updater: Arc::new(Mutex::new(updater)),
+            health_guard: Some(health_guard),
+            close_after_handoff: false,
             update_rx: None,
             available_update: None,
             staged_update: None,
@@ -175,9 +596,16 @@ impl App {
             comparison_rx,
         };
 
-        if crate::update::due_for_check() {
+        let update_state = app.updater.lock().ok();
+        if update_state
+            .as_ref()
+            .is_some_and(|updater| updater.due_for_check())
+        {
+            drop(update_state);
             app.trigger_update_check(cc.egui_ctx.clone());
-        } else if let Some(version) = crate::update::cached_published_version() {
+        } else if let Some(version) =
+            update_state.and_then(|updater| updater.cached_published_version().ok().flatten())
+        {
             app.update_status = format!("Last seen: {version}");
         }
         app
@@ -189,6 +617,300 @@ impl App {
         } else {
             &self.vendor_tables[self.selected_tab - 1]
         }
+    }
+
+    fn portfolio_content(&mut self, ui: &mut egui::Ui) {
+        ui.label("One fixed orchestrator binding coordinates the whole plan. Every worker seat has four risk-qualified workflow policies. Forecast figures are proxy capacity, not native admission.");
+        if self.settings.subscriptions.is_empty() {
+            ui.add_space(8.0);
+            ui.strong("Choose your subscriptions to build a weekly schedule.");
+            if ui.button("Open settings").clicked() {
+                self.settings_open = true;
+            }
+            return;
+        }
+        if !self.refresh_warning.is_empty() {
+            ui.colored_label(egui::Color32::YELLOW, &self.refresh_warning);
+        }
+        if !self
+            .scored_settings
+            .as_ref()
+            .is_some_and(|scored| scored.scoring_matches(&self.settings))
+            || self.refresh_in_flight
+        {
+            if self.refresh_in_flight || !self.engine_status.is_empty() {
+                ui.spinner();
+                ui.label(if self.engine_status.is_empty() {
+                    "Recalculating your weekly schedule..."
+                } else {
+                    &self.engine_status
+                });
+            } else {
+                ui.label("Your current schedule is unavailable. Refresh to retry.");
+            }
+            return;
+        }
+        if self.source_expired() {
+            ui.colored_label(egui::Color32::YELLOW, "Data is stale.");
+        }
+        let Some(portfolio) = &self.table.portfolio else {
+            ui.label("No portfolio data is available. Refresh to load estimates.");
+            return;
+        };
+        let price_prefix = if portfolio.pools.iter().any(|pool| pool.price_is_estimate) {
+            "est. $"
+        } else {
+            "$"
+        };
+        let dispatch = &portfolio.dispatch;
+        let executable = dispatch.executable && portfolio.conductor.is_some();
+        ui.strong(format!("{} - {:.1} available h/account - {} proxy jobs - {} proxy-fit - {} native admitted - {price_prefix}{:.2}/month",
+            dispatch.policy_version,
+            portfolio.available_hours_per_provider, dispatch.forecast_changes, dispatch.admitted_changes,
+            dispatch.native_admission_changes, portfolio.monthly_price));
+        let status = if !executable {
+            "No executable policy".to_string()
+        } else if dispatch.solver.proven_optimal {
+            "Optimal within the declared scheduler and numerical tolerances".to_string()
+        } else if let Some(gap) = dispatch.solver.relative_gap {
+            format!(
+                "Feasible policy; role utility gap <= {:.2}% for admitted work",
+                gap * 100.0
+            )
+        } else {
+            "Feasible policy; role utility gap unavailable".to_string()
+        };
+        ui.add(egui::Label::new(status).wrap());
+        if !portfolio.message.is_empty() {
+            ui.add(egui::Label::new(&portfolio.message).wrap());
+        } else if !dispatch.solver.message.is_empty() {
+            ui.add(egui::Label::new(&dispatch.solver.message).wrap());
+        }
+        if ui
+            .add_enabled(
+                executable && self.generator.install_rx.is_none(),
+                egui::Button::new("Generate Orchestrator..."),
+            )
+            .clicked()
+        {
+            self.generator.prepare(
+                self.table.clone(),
+                self.settings.clone(),
+                self.table_revision,
+                ui.ctx().clone(),
+            );
+        }
+        egui::CollapsingHeader::new("Select a workflow from the risk vector").show(ui, |ui| {
+            for demand in dispatch.classes.iter().rev() {
+                ui.label(format!("{}: {}", demand.class.name(), demand.condition));
+            }
+            ui.label("Record consequence, uncertainty, coupling, reversibility, evidence need, tool risk, correlation, and deadline risk. Apply the first matching template from Extensive to Focused. File count informs load only.");
+            ui.label(format!("Proxy assumption: one job per {:.1} working hours; {:.0}% repair incidence. These values neither authorize jobs nor establish native feasibility.", dispatch.cadence_hours, dispatch.repair_incidence * 100.0));
+        });
+        ui.add_space(8.0);
+        ui.strong("Role policy");
+        ui.label("Recommendations compare published model/effort configurations. Efforts absent from the current evidence are not scored or invented.");
+        egui::Grid::new("portfolio_roles_grid").striped(true).spacing([12.0, 3.0]).min_col_width(50.0).show(ui, |ui| {
+            for (heading, explanation) in [
+                ("Workflow", "The orchestrator is fixed for the whole plan. Select each job's workflow from its recorded risk vector."),
+                ("Agent", "Exact native harness, model, and reasoning effort appear on hover."),
+                ("Subscription", "All routes share the same provider account and nested limits."),
+                ("Attempts", "Maximum same-model attempts per visit, stopping on acceptance."),
+                ("Competence", "Reference role competence, not actual task success probability."),
+                ("Visits/wk", "Expected visits; full reserved visits and class admissions appear on hover."),
+                ("Reserved USD", "Full weekly API-equivalent usage reservation; expected usage on hover."),
+                ("Expected / reserve h", "Conservative weekly runtime bound across all visits and capped retries, not expected work duration. Expected and per-visit hours appear on hover."),
+            ] {
+                ui.strong(heading).on_hover_text(explanation);
+            }
+            ui.end_row();
+            ui.strong("Orchestrator");
+            for _ in 1..8 { ui.label(""); }
+            ui.end_row();
+            if let Some(conductor) = &portfolio.conductor
+                && let Some(row) = self.table.rows.get(conductor.row_index)
+            {
+                ui.label("Whole plan").on_hover_text("One fixed model and effort coordinates every admitted class across all concurrent projects.");
+                ui.label(row.display_name()).on_hover_text(format!("Benchmark harness: {}\nNative harness: {}\nModel: {}\nEffort: {}", row.harness, conductor.native_harness, row.model, row.effort.as_deref().unwrap_or("unspecified")));
+                ui.label(&conductor.provider_id).on_hover_text(&conductor.plan_id);
+                ui.label(conductor.attempt_limit.to_string());
+                ui.label(competence_text(Some(conductor.competence))).on_hover_text(format!("Global orchestrator utility {:.4}.", conductor.utility));
+                ui.label(conductor.expected_visits.to_string()).on_hover_text(format!("{} coordination visits reserved across all admitted changes. Proxy cost and decode time also apply each class's declared resource factor.", conductor.reserved_visits));
+                ui.label(format!("{:.2}", conductor.reserved_usage)).on_hover_text(format!("Expected {:.2} USD; full reservation per visit {:.6} USD.", conductor.expected_usage, conductor.per_call_reserved_usage));
+                ui.label(format!("{:.2} / {:.2}", conductor.expected_hours, conductor.reserved_hours)).on_hover_text(format!("Expected weekly hours across all conductor calls; high bound per visit {:.6} hours.", conductor.per_call_reserved_hours));
+                ui.end_row();
+            } else {
+                ui.label("Whole plan");
+                ui.add(egui::Label::new("No feasible fixed Orchestrator assignment; see the policy status above.").wrap());
+                for _ in 2..8 { ui.label("-"); }
+                ui.end_row();
+            }
+            for seat in crate::orchestration::ROLE_ORDER.into_iter().filter(|seat| *seat != Seat::Orchestrator) {
+                let Some(role) = portfolio.roles.iter().find(|role| role.seat == seat) else { continue; };
+                for _ in 0..8 {
+                    ui.add(egui::Separator::default().horizontal().spacing(2.0));
+                }
+                ui.end_row();
+                ui.strong(seat.name());
+                for _ in 1..8 { ui.label(""); }
+                ui.end_row();
+                for rule in &role.rules {
+                    if seat == Seat::NetResearch {
+                        ui.label(format!("{} ({})", rule.class.name(), rule.planned_jobs))
+                        .on_hover_text(format!("Policy ID: {}\nTrigger: {}\nFallback: {}\nCalibration: {}", rule.policy_id, rule.condition, rule.fallback_policy, rule.calibration));
+                    } else {
+                        ui.label(format!("{} ({})", rule.class.name(), rule.planned_jobs)).on_hover_text(format!("Policy ID: {}\nTrigger: {}\nExact account claim: {}\nFallback: {}\nCalibration: {}{}", rule.policy_id, rule.condition, rule.account_claim, rule.fallback_policy, rule.calibration, if rule.recommendation_only { format!("\nNo allocated jobs: {}", rule.message) } else { String::new() }));
+                    }
+                    if let Some(row) = rule.row_index.and_then(|index| self.table.rows.get(index)) {
+                        ui.label(row.display_name()).on_hover_ui(|ui| {
+                            ui.label(format!("Harness: {}\nModel: {}\nEffort: {}", row.harness, row.model, row.effort.as_deref().unwrap_or("unspecified")));
+                            ui.label(&rule.failure_action);
+                            ui.separator();
+                            ui.strong("Conditional fallback policy");
+                            ui.label(&rule.fallback_policy);
+                            ui.label("Each fallback requires exact eligibility and a fresh native hold. The list is ordered policy, not a round-robin menu.");
+                            egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                            for alternative in rule.lower_effort.iter().chain(&rule.within_provider_alternatives).chain(&rule.surplus_alternatives) {
+                                if let Some(candidate) = self.table.rows.get(alternative.row_index) {
+                                    ui.label(format!("{} / {} - {}", alternative.provider_id, alternative.plan_id, candidate.display_name()));
+                                    ui.small(format!("{}; effort {}; cap {}; competence {:.3}; role utility {:.3}; expected ${:.4} / {:.4}h; reserve ${:.4} / {:.4}h per visit", candidate.harness,
+                                        candidate.effort.as_deref().unwrap_or("unspecified"), alternative.attempt_limit, alternative.competence, alternative.quality, alternative.per_call_expected_usage, alternative.per_call_expected_hours, alternative.per_call_reserved_usage, alternative.per_call_reserved_hours));
+                                }
+                            }
+                            });
+                            if rule.lower_effort.is_none() && rule.within_provider_alternatives.is_empty() && rule.surplus_alternatives.is_empty() {
+                                ui.label("No qualified alternative in the current evidence.");
+                            }
+                        });
+                        ui.label(rule.provider_id.as_deref().unwrap_or("-"))
+                            .on_hover_text(rule.plan_id.as_deref().unwrap_or("-"));
+                        ui.label(rule.attempt_limit.to_string());
+                        ui.label(competence_text(rule.competence)).on_hover_text(format!("Role utility {:.4}; weighted benchmark score, with each signal counted once.", rule.utility));
+                        ui.label(format!("{:.1}", rule.expected_visits))
+                            .on_hover_text(format!("{} visits reserved at full cap. Expected autonomous reference-equivalent service units: {:.1}.", rule.reserved_visits, rule.expected_completions));
+                        ui.label(format!("{:.2}", rule.reserved_usage))
+                            .on_hover_text(format!("Expected {:.2} USD; full reservation per visit {:.6} USD.", rule.nominal_usage, rule.per_call_reserved_usage));
+                        ui.label(format!("{:.2} / {:.2}", rule.nominal_hours, rule.reserved_hours))
+                            .on_hover_text(format!("Expected {:.2} weekly hours across visits; high bound per visit {:.6} hours.", rule.nominal_hours, rule.per_call_reserved_hours));
+                    } else {
+                        if rule.research_candidates.is_empty() {
+                            ui.add(egui::Label::new(&rule.message).wrap());
+                            for _ in 2..8 {
+                                ui.label("-");
+                            }
+                        } else {
+                            let primary = rule.research_candidates.iter().find(|candidate| candidate.primary).unwrap_or(&rule.research_candidates[0]);
+                            let primary_row = &self.table.rows[primary.row_index];
+                            ui.label(research_route_name(primary_row, &primary.native_harness)).on_hover_ui(|ui| {
+                                        ui.label(format!("Default: {} / {} / {}", primary.native_harness, primary_row.model, primary_row.effort.as_deref().unwrap_or("unspecified")));
+                                        ui.small(format!("Accuracy {:.4} × {:.2}; non-hallucination {:.4} × {:.2}; LCR {:.4} × {:.2}; HLE {} × {:.2}", primary.accuracy, primary.accuracy_weight, primary.non_hallucination, primary.non_hallucination_weight, primary.lcr, primary.lcr_weight, primary.hle.map(|value| format!("{value:.4}")).unwrap_or_else(|| "n/a".to_string()), primary.hle_weight));
+                                        ui.small(format!("Diagnostics: GPQA {}; GDP.pdf {}", primary.gpqa_diagnostic.map(|value| format!("{value:.4}")).unwrap_or_else(|| "n/a".to_string()), primary.gdp_pdf_diagnostic.map(|value| format!("{value:.4}")).unwrap_or_else(|| "n/a".to_string())));
+                                        ui.small(format!("AA reference workload: {} USD; {} decode h", primary.expected_usd.map(|value| format!("{value:.4}")).unwrap_or_else(|| "Unknown".to_string()), primary.decode_hours.map(|value| format!("{value:.4}")).unwrap_or_else(|| "Unknown".to_string())));
+                                        ui.small(&primary.source);
+                                        ui.hyperlink_to("Artificial Analysis methodology", AA_INTELLIGENCE_METHODOLOGY_URL);
+                                        ui.small("The weights express this template's policy priorities; the score is not task-success probability. Resource values are benchmark-workload proxies, not native latency or quota.");
+                                        ui.label(&primary.eligibility);
+                                        for (rank, candidate) in rule.research_candidates.iter().filter(|candidate| !candidate.primary).enumerate() {
+                                            let row = &self.table.rows[candidate.row_index];
+                                            ui.separator();
+                                            ui.strong(format!("Alternative {} · {} · score {:.4}", rank + 1, research_route_name(row, &candidate.native_harness), candidate.score));
+                                            ui.small(format!("{} / {}; accuracy {:.4}; non-hallucination {:.4}; LCR {:.4}; HLE {}; AA proxy {} USD / {} h", candidate.provider_id, candidate.plan_id, candidate.accuracy, candidate.non_hallucination, candidate.lcr, candidate.hle.map(|value| format!("{value:.4}")).unwrap_or_else(|| "n/a".to_string()), candidate.expected_usd.map(|value| format!("{value:.4}")).unwrap_or_else(|| "Unknown".to_string()), candidate.decode_hours.map(|value| format!("{value:.4}")).unwrap_or_else(|| "Unknown".to_string())));
+                                            ui.small(&candidate.eligibility);
+                                        }
+                            });
+                            ui.label(&primary.provider_id).on_hover_text(format!("Plan: {}\nNative harness: {}\nBinding: {}\nBenchmark harness: {}", primary.plan_id, primary.native_harness, primary.binding_id, primary_row.harness));
+                            ui.label("-").on_hover_text("Research attempt caps are set during task-specific native qualification.");
+                            ui.label(competence_text(Some(primary.score))).on_hover_text("Weighted AA benchmark score; policy weights, not task-success probability.");
+                            ui.label("On demand");
+                            ui.label("-").on_hover_text(format!("No native reservation. AA reference-workload proxy: {} USD.", primary.expected_usd.map(|value| format!("{value:.4}")).unwrap_or_else(|| "Unknown".to_string())));
+                            ui.label("-").on_hover_text(format!("No native reserved hours. AA reference-workload decode proxy: {} hours.", primary.decode_hours.map(|value| format!("{value:.4}")).unwrap_or_else(|| "Unknown".to_string())));
+                        }
+                    }
+                    ui.end_row();
+                }
+            }
+        });
+        ui.add_space(8.0);
+        ui.strong("Subscription budgets and time");
+        egui::Grid::new("portfolio_allowances")
+            .striped(true)
+            .spacing([12.0, 3.0])
+            .show(ui, |ui| {
+                for heading in [
+                    "Subscription",
+                    "Allowance USD",
+                    "Expected USD",
+                    "Reserved USD",
+                    "Unreserved USD",
+                    "Reserve / available h",
+                ] {
+                    ui.strong(heading);
+                }
+                ui.end_row();
+                for pool in &portfolio.pools {
+                    ui.label(format!(
+                        "{} - {} × {}",
+                        pool.provider_name, pool.plan_name, pool.subscription_count
+                    ));
+                    ui.label(format!("{:.2}", pool.weekly_capacity));
+                    ui.label(format!("{:.2}", pool.nominal_usage));
+                    ui.label(format!("{:.2}", pool.reserved_usage));
+                    ui.label(format!("{:.2}", pool.remaining_reserved_capacity));
+                    ui.label(format!(
+                        "{:.2} / {:.1}",
+                        pool.reserved_hours, pool.available_hours
+                    ))
+                    .on_hover_text(format!(
+                        "Expected weekly runtime {:.2} hours; {:.2} available hours remain outside the high reserve.",
+                        pool.scheduled_hours, pool.remaining_reserved_hours
+                    ));
+                    ui.end_row();
+                }
+            });
+        egui::CollapsingHeader::new("Math and account allocation").show(ui, |ui| {
+            ui.add(egui::Label::new(&portfolio.math_audit.objective).wrap());
+            ui.add(egui::Label::new(&portfolio.math_audit.coordination_proxy).wrap());
+            ui.label(format!("Orchestrator share of modeled spend: {:.1}% expected / {:.1}% full reserve.", portfolio.math_audit.orchestrator_expected_spend_share * 100.0, portfolio.math_audit.orchestrator_reserved_spend_share * 100.0));
+            ui.label("Task classes scale reference volume, not measured difficulty. The four-hour cadence and repair incidence are planning assumptions. Released reservations can fund qualified useful work; expected usage is not a promise to spend the full allowance in the working window.");
+            egui::Grid::new("portfolio_math_audit").striped(true).show(ui, |ui| {
+                for heading in ["Role", "Account", "Expected / reserve USD", "Expected / reserve h"] { ui.strong(heading); }
+                ui.end_row();
+                for usage in &portfolio.math_audit.role_accounts {
+                    ui.label(usage.seat.name());
+                    ui.label(&usage.provider_id);
+                    ui.label(format!("{:.2} / {:.2}", usage.expected_usage, usage.reserved_usage));
+                    ui.label(format!("{:.2} / {:.2}", usage.expected_hours, usage.reserved_hours));
+                    ui.end_row();
+                }
+            });
+        });
+        egui::CollapsingHeader::new("Workflow, forecast, and assumptions").show(ui, |ui| {
+            ui.add(egui::Label::new(format!("{}: {}", dispatch.solver.status, dispatch.solver.message)).wrap());
+            if !portfolio.message.is_empty() {
+                ui.add(egui::Label::new(&portfolio.message).wrap());
+            }
+            ui.label("The proxy forecast reserves a brief, context, implementation, checks, one repair, and close. Runtime expands each authorized task ID from its risk-qualified workflow and invokes only required seats, including Net Research when evidence is required.");
+            ui.label("The dispatcher verifies exact bindings, billing, research tools, permissions, account windows, and concurrency before native admission. Modeled USD, proxy-fit jobs, and forecast slots are not native quota or runtime launch times.");
+            ui.label(format!("Reserved workflow makespan: {:.2} / {:.1} hours. This is the static baseline feasibility estimate, not a runtime calendar to wait for.", dispatch.reserved_makespan_hours, portfolio.available_hours_per_provider));
+            ui.label(format!("Role utility {:.4}; proven optimal within declared scheduler and numerical tolerances: {}; role utility gap for admitted workload: {}.", dispatch.solver.quality, dispatch.solver.proven_optimal,
+                dispatch.solver.relative_gap.map(|gap| format!("{:.2}%", gap * 100.0)).unwrap_or_else(|| "unavailable".to_string())));
+            ui.label(format!("Role utility bound for admitted workload: {}; LP nodes: {}. Optimality is qualified by the declared scheduler and numerical tolerances.",
+                dispatch.solver.bound.map(|bound| format!("{bound:.6}")).unwrap_or_else(|| "unavailable".to_string()), dispatch.solver.nodes));
+            for demand in &dispatch.classes {
+                ui.label(format!("{}: {} forecast, {} admitted, {} deferred; resource factor {:.2}", demand.class.name(), demand.forecast_changes, demand.admitted_changes,
+                    demand.forecast_changes.saturating_sub(demand.admitted_changes), demand.resource_factor));
+            }
+            for limit in &portfolio.limits {
+                ui.label(format!("{} {}: {:.2} reserved / {:.2} allowance USD; {:.2} unreserved.", limit.provider_id, limit.name, limit.reserved_usage, limit.weekly_capacity, limit.remaining_capacity));
+            }
+            for assumption in &portfolio.assumptions {
+                ui.add(egui::Label::new(assumption).wrap());
+            }
+            for pool in &portfolio.pools {
+                ui.hyperlink_to(format!("{} {} plan source", pool.provider_name, pool.plan_name), &pool.source_url);
+                ui.add(egui::Label::new(&pool.allowance_basis).wrap());
+            }
+        });
     }
 
     fn frontier_content(&self, ui: &mut egui::Ui, seat: Seat, tier: Tier) -> Option<f64> {
@@ -266,6 +988,98 @@ impl App {
     }
 
     fn detail_content(&self, ui: &mut egui::Ui, seat: Seat, tier: Tier) -> Option<f64> {
+        if seat == Seat::NetResearch {
+            let table = self.selected_table();
+            let Some(pick) = table.research_tiers.iter().find(|pick| pick.tier == tier) else {
+                ui.label("No AA research route is available at this tier.");
+                return None;
+            };
+            ui.label(&pick.scope);
+            let Some(primary) = &pick.primary else {
+                ui.label("No eligible research configuration is available.");
+                return None;
+            };
+            let row = table.rows.get(primary.row_index)?;
+            ui.heading("Selected policy");
+            ui.label(
+                egui::RichText::new(research_route_name(row, &primary.native_harness))
+                    .strong()
+                    .size(15.0),
+            );
+            ui.label(format!(
+                "AA research score: {}",
+                competence_text(Some(primary.score))
+            ));
+            ui.label(format!(
+                "Route: {} / {} · {}",
+                primary.provider_id, primary.plan_id, primary.native_harness
+            ));
+            ui.label(format!(
+                "Accuracy {:.4} × {:.2}; non-hallucination {:.4} × {:.2}; LCR {:.4} × {:.2}",
+                primary.accuracy,
+                primary.accuracy_weight,
+                primary.non_hallucination,
+                primary.non_hallucination_weight,
+                primary.lcr,
+                primary.lcr_weight
+            ));
+            ui.label(format!(
+                "Diagnostics: GPQA {}; GDP.pdf {}",
+                primary
+                    .gpqa_diagnostic
+                    .map(|value| format!("{value:.4}"))
+                    .unwrap_or_else(|| "n/a".to_string()),
+                primary
+                    .gdp_pdf_diagnostic
+                    .map(|value| format!("{value:.4}"))
+                    .unwrap_or_else(|| "n/a".to_string())
+            ));
+            ui.label(format!(
+                "AA reference workload: {} USD · {} decode minutes",
+                primary
+                    .expected_usd
+                    .map(|value| format!("{value:.4}"))
+                    .unwrap_or_else(|| "Unknown".to_string()),
+                primary
+                    .decode_hours
+                    .map(|value| format!("{:.2}", value * 60.0))
+                    .unwrap_or_else(|| "Unknown".to_string())
+            ));
+            ui.label(&primary.eligibility);
+            ui.small(&primary.source);
+            ui.hyperlink_to(
+                "Artificial Analysis methodology",
+                AA_INTELLIGENCE_METHODOLOGY_URL,
+            );
+            egui::CollapsingHeader::new(format!("Alternatives ({})", pick.alternatives.len()))
+                .show(ui, |ui| {
+                    for candidate in &pick.alternatives {
+                        let Some(candidate_row) = table.rows.get(candidate.row_index) else {
+                            continue;
+                        };
+                        ui.strong(format!(
+                            "{} · score {}",
+                            research_route_name(candidate_row, &candidate.native_harness),
+                            competence_text(Some(candidate.score))
+                        ));
+                        ui.small(format!(
+                            "{} / {} · AA reference {} USD / {} decode min",
+                            candidate.provider_id,
+                            candidate.plan_id,
+                            candidate
+                                .expected_usd
+                                .map(|value| format!("{value:.4}"))
+                                .unwrap_or_else(|| "Unknown".to_string()),
+                            candidate
+                                .decode_hours
+                                .map(|value| format!("{:.2}", value * 60.0))
+                                .unwrap_or_else(|| "Unknown".to_string())
+                        ));
+                        ui.small(&candidate.eligibility);
+                    }
+                });
+            return None;
+        }
         let table = self.selected_table();
         let selected_floor;
         if let Some(pick) = table.get_pick(seat, tier) {
@@ -590,8 +1404,11 @@ impl App {
 
         let request = (self.comparison_generation, seat, tier, *choice);
         let pending = self.comparison_pending.is_some();
-        let score_is_current =
-            self.scored_settings.as_ref() == Some(&self.settings) && !self.refresh_in_flight;
+        let score_is_current = self
+            .scored_settings
+            .as_ref()
+            .is_some_and(|scored| scored.scoring_matches(&self.settings))
+            && !self.refresh_in_flight;
         if ui
             .add_enabled(
                 !pending && score_is_current,
@@ -655,6 +1472,14 @@ impl App {
     }
 
     fn invalidate_comparisons(&mut self) {
+        if !self
+            .scored_settings
+            .as_ref()
+            .is_some_and(|scored| scored.scoring_matches(&self.settings))
+        {
+            self.generator.markdown = None;
+        }
+
         self.comparison_generation = self.comparison_generation.wrapping_add(1);
         self.comparison_pending = None;
         self.comparison_result = None;
@@ -720,9 +1545,12 @@ impl App {
         if self.install_rx.is_none() {
             self.update_status = "Checking for updates…".to_string();
         }
+        let updater = Arc::clone(&self.updater);
         std::thread::spawn(move || {
-            let outcome =
-                crate::update::check(env!("CARGO_PKG_VERSION")).map_err(|e| format!("{e:#}"));
+            let outcome = updater
+                .lock()
+                .map_err(|_| "the updater is unavailable".to_owned())
+                .and_then(|mut updater| updater.check().map_err(|error| format!("{error:#}")));
             let _ = tx.send(outcome);
             context.request_repaint();
         });
@@ -731,6 +1559,7 @@ impl App {
     fn start_install(&mut self, context: egui::Context) {
         let staged = self.staged_update.take();
         let available = self.available_update.clone();
+        let updater = Arc::clone(&self.updater);
         let (tx, rx) = channel();
         self.install_rx = Some(rx);
         self.update_status = if staged.is_some() {
@@ -744,22 +1573,48 @@ impl App {
             let downloaded = match staged {
                 Some(staged) => Ok(staged),
                 None => available
-                    .ok_or_else(|| anyhow::anyhow!("No update is available"))
-                    .and_then(|available| crate::update::download(&available, |_, _| {})),
+                    .ok_or_else(|| "No update is available".to_owned())
+                    .and_then(|available| {
+                        updater
+                            .lock()
+                            .map_err(|_| "the updater is unavailable".to_owned())?
+                            .download(&available, |_, _| {})
+                            .map_err(|error| format!("{error:#}"))
+                    }),
             };
-            let failure = match downloaded {
-                Ok(mut staged) => match crate::update::install(&mut staged) {
-                    Ok(never) => match never {},
-                    Err(error) => (format!("{error:#}"), Some(staged)),
+            let result = match downloaded {
+                Ok(mut staged) => match updater
+                    .lock()
+                    .map_err(|_| "the updater is unavailable".to_owned())
+                    .and_then(|updater| {
+                        updater
+                            .hand_off(&mut staged, true)
+                            .map_err(|error| format!("{error:#}"))
+                    }) {
+                    Ok(()) => (Ok(()), None),
+                    Err(error) => (Err(error), Some(staged)),
                 },
-                Err(error) => (format!("{error:#}"), None),
+                Err(error) => (Err(error), None),
             };
-            let _ = tx.send(failure);
+            let _ = tx.send(result);
             context.request_repaint();
         });
     }
 
     fn pump_channels(&mut self) {
+        if let Some(result) = self
+            .workspace_picker
+            .as_ref()
+            .and_then(|receiver| receiver.try_recv().ok())
+        {
+            self.workspace_picker = None;
+            match result {
+                Ok(Some(path)) => self.collaboration_root_text = path.display().to_string(),
+                Ok(None) => {}
+                Err(error) => self.workspace_status = error,
+            }
+        }
+        self.generator.pump();
         while let Ok((new_table, vendor_tables, fetched_rows, scored_settings)) =
             self.table_rx.try_recv()
         {
@@ -785,8 +1640,13 @@ impl App {
                     self.retry_after = Some(Instant::now() + Duration::from_secs(300));
                 }
             }
+            if !scored_settings.scoring_matches(&self.settings) {
+                continue;
+            }
             self.panel_widths.clear();
             self.invalidate_comparisons();
+            self.generator.markdown = None;
+            self.table_revision = self.table_revision.wrapping_add(1);
             self.table = new_table;
             self.vendor_tables = vendor_tables;
             self.comparison_choice.clear();
@@ -817,13 +1677,16 @@ impl App {
             self.update_rx = None;
             let status = match res {
                 Ok(checked) => match checked.outcome {
-                    crate::update::Outcome::Available(av) => {
-                        let status =
-                            format!("Update {} available via {}", av.version, checked.transport);
-                        self.available_update = Some(av);
+                    blockitall_update::Outcome::Available(av) => {
+                        let status = format!(
+                            "Update {} available via {}",
+                            av.version(),
+                            checked.transport
+                        );
+                        self.available_update = Some(*av);
                         status
                     }
-                    crate::update::Outcome::UpToDate { latest } => {
+                    blockitall_update::Outcome::UpToDate { latest } => {
                         self.available_update = None;
                         format!("Up to date ({latest}) via {}", checked.transport)
                     }
@@ -835,11 +1698,17 @@ impl App {
             }
         }
         if let Some(rx) = &self.install_rx
-            && let Ok((error, staged)) = rx.try_recv()
+            && let Ok((result, staged)) = rx.try_recv()
         {
             self.install_rx = None;
             self.staged_update = staged;
-            self.update_status = error;
+            match result {
+                Ok(()) => {
+                    self.update_status = "Restarting…".to_owned();
+                    self.close_after_handoff = true;
+                }
+                Err(error) => self.update_status = error,
+            }
         }
     }
 }
@@ -848,6 +1717,9 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.pump_channels();
         let ctx = ui.ctx().clone();
+        if self.close_after_handoff {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         let mut install_clicked = false;
         if !self.refresh_in_flight
             && self.source_expired()
@@ -946,7 +1818,12 @@ impl eframe::App for App {
                         "Install"
                     };
                     install_clicked = ui
-                        .add_enabled(self.install_rx.is_none(), egui::Button::new(label))
+                        .add_enabled(
+                            self.install_rx.is_none()
+                                && !self.refresh_in_flight
+                                && self.comparison_pending.is_none(),
+                            egui::Button::new(label),
+                        )
                         .clicked();
                 }
                 if !self.handoff_status.is_empty() {
@@ -956,7 +1833,10 @@ impl eframe::App for App {
             });
         });
 
-        let panel_open = self.side_panel_open && self.selected_seat_tier.is_some();
+        let panel_open = self.side_panel_open
+            && self.selected_seat_tier.is_some()
+            && !(self.selected_tab == 0
+                && self.settings.best_in_house_mode == BestInHouseMode::PerPlan);
         let t = ctx.animate_bool(egui::Id::new("side_panel_anim"), panel_open);
         if t > 0.001 {
             let (seat, tier) = self.selected_seat_tier.unwrap();
@@ -1003,8 +1883,10 @@ impl eframe::App for App {
                             .auto_shrink([false, false])
                             .max_height(ui.available_height())
                             .show(ui, |ui| {
-                                self.counterfactual_content(ui, seat, tier);
-                                ui.separator();
+                                if seat != Seat::NetResearch {
+                                    self.counterfactual_content(ui, seat, tier);
+                                    ui.separator();
+                                }
                                 selected_floor = self.detail_content(ui, seat, tier);
                             });
                     }
@@ -1023,7 +1905,7 @@ impl eframe::App for App {
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("Workflow hours per week");
+                ui.heading("Working hours per week");
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.agent_hours_text).desired_width(80.0),
                 );
@@ -1051,8 +1933,20 @@ impl eframe::App for App {
                 if self.agent_hours_invalid {
                     ui.colored_label(egui::Color32::YELLOW, "Enter a number from 1 to 1680.");
                 }
+            ui.heading("Concurrent projects");
+                if ui.add(egui::DragValue::new(&mut self.settings.orchestrators).range(1..=64)).changed() {
+                    let _ = save_settings(&self.settings);
+                    self.invalidate_comparisons();
+                    let _ = self.settings_tx.send((self.settings.clone(), false));
+                    self.engine_status = "Scoring…".to_string();
+                }
             });
-            ui.label("Combined weekly time for agent attempts and rescue work. Example: 10 hours across 3 parallel agents = 30 workflow hours.");
+            ui.small("Enter how many project orchestrators run at the same time. They use the same fixed orchestrator model and share each subscription allowance; the count scales aggregate demand without cloning quota.");
+            if self.selected_tab == 0 && self.settings.best_in_house_mode == BestInHouseMode::PerPlan {
+                ui.label("Each selected subscription can run for these hours alongside the others. Total scheduled agent hours can exceed the working week.");
+            } else {
+                ui.label("Each independent pick uses these combined hours for agent attempts and rescue work. Example: 10 hours across 3 parallel agents = 30 workflow hours.");
+            }
             ui.add_space(8.0);
             egui::ScrollArea::both()
                 .id_salt("roles_table_scroll")
@@ -1061,6 +1955,33 @@ impl eframe::App for App {
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                 .show(ui, |ui| {
                     ui.strong("Coding Agent Tier List");
+                    let previous_tab = self.selected_tab;
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.selected_tab, 0, "Best in house");
+                        for (index, (label, _)) in VENDOR_TABS.iter().enumerate() {
+                            ui.selectable_value(&mut self.selected_tab, index + 1, *label);
+                        }
+                    });
+                    if self.selected_tab != previous_tab {
+                        self.panel_widths.clear();
+                        self.comparison_choice.clear();
+                        self.invalidate_comparisons();
+                    }
+                    if self.selected_tab == 0 {
+                        let previous_mode = self.settings.best_in_house_mode;
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(&mut self.settings.best_in_house_mode, BestInHouseMode::Absolute, "Absolute best");
+                            ui.selectable_value(&mut self.settings.best_in_house_mode, BestInHouseMode::PerPlan, "For you");
+                        });
+                        if self.settings.best_in_house_mode != previous_mode {
+                            self.side_panel_open = false;
+                            let _ = save_settings(&self.settings);
+                        }
+                        if self.settings.best_in_house_mode == BestInHouseMode::PerPlan {
+                            self.portfolio_content(ui);
+                            return;
+                        }
+                    }
                     ui.add(
                         egui::Label::new(
                             "Picks maximize nominal verified reference tasks per week, with the scenario band shown. Optional competence minimums enforce hard requirements.",
@@ -1084,18 +2005,6 @@ impl eframe::App for App {
                                 ui.add(egui::Label::new(explanation).wrap());
                             }
                         });
-                    let previous_tab = self.selected_tab;
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(&mut self.selected_tab, 0, "Best in house");
-                        for (index, (label, _)) in VENDOR_TABS.iter().enumerate() {
-                            ui.selectable_value(&mut self.selected_tab, index + 1, *label);
-                        }
-                    });
-                    if self.selected_tab != previous_tab {
-                        self.panel_widths.clear();
-                        self.comparison_choice.clear();
-                        self.invalidate_comparisons();
-                    }
                     if !self.refresh_warning.is_empty() {
                         ui.colored_label(egui::Color32::YELLOW, &self.refresh_warning);
                     }
@@ -1120,8 +2029,8 @@ impl eframe::App for App {
                             ui.strong("Capacity shortfall").on_hover_text(
                                 "Worst proportional capacity shortfall across the scenario band. Breaks exact nominal-throughput ties; per-scenario values are diagnostics.",
                             );
-                            ui.strong("Min/cycle");
-                            ui.strong("$/cycle");
+                            ui.strong("Min/reference");
+                            ui.strong("$/reference");
                             ui.strong("Agent completions/week").on_hover_text(
                                 "Estimated reference tasks completed by the agent before rescue. Rescue completions are reported separately.",
                             );
@@ -1283,6 +2192,60 @@ impl eframe::App for App {
 
                                     ui.end_row();
                                 }
+                            }
+                            for _ in 0..9 {
+                                ui.add(egui::Separator::default().horizontal().spacing(2.0));
+                            }
+                            ui.end_row();
+                            ui.strong(Seat::NetResearch.name());
+                            for _ in 1..9 {
+                                ui.label("");
+                            }
+                            ui.end_row();
+                            for tier in Tier::ALL {
+                                let is_selected = self.selected_seat_tier == Some((Seat::NetResearch, tier));
+                                let (name, score, minutes, cost, eligibility) = {
+                                    let table = self.selected_table();
+                                    let primary = table
+                                        .research_tiers
+                                        .iter()
+                                        .find(|pick| pick.tier == tier)
+                                        .and_then(|pick| pick.primary.as_ref());
+                                    if let Some(candidate) = primary {
+                                        let name = table
+                                            .rows
+                                            .get(candidate.row_index)
+                                            .map(|row| research_route_name(row, &candidate.native_harness))
+                                            .unwrap_or_else(|| "-".to_string());
+                                        (
+                                            name,
+                                            competence_text(Some(candidate.score)),
+                                            candidate.decode_hours.map(|hours| format!("{:.2}", hours * 60.0)).unwrap_or_else(|| "Unknown".to_string()),
+                                            candidate.expected_usd.map(|usd| format!("${usd:.2}")).unwrap_or_else(|| "Unknown".to_string()),
+                                            candidate.eligibility.clone(),
+                                        )
+                                    } else {
+                                        ("No eligible research configuration".to_string(), "-".to_string(), "Unknown".to_string(), "Unknown".to_string(), "No qualified route is available at this tier.".to_string())
+                                    }
+                                };
+                                let mut clicked = ui.selectable_label(is_selected, tier.name()).clicked();
+                                clicked |= ui.selectable_label(is_selected, name).on_hover_text(&eligibility).clicked();
+                                clicked |= ui.selectable_label(is_selected, score).on_hover_text("AA research score with Standard scope weights; not task-success probability.").clicked();
+                                clicked |= ui.selectable_label(is_selected, "-").on_hover_text("No research capacity shortfall is inferred.").clicked();
+                                clicked |= ui.selectable_label(is_selected, minutes).on_hover_text("AA reference-workload decode minutes; not native research latency.").clicked();
+                                clicked |= ui.selectable_label(is_selected, cost).on_hover_text("AA reference-workload USD; not native cost, quota, or a hold.").clicked();
+                                clicked |= ui.selectable_label(is_selected, "-").on_hover_text("No research completions per week are inferred.").clicked();
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    ui.label("-").on_hover_text("Native allowance use is resolved from real account meters.");
+                                });
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    clicked |= ui.selectable_label(is_selected, "-").on_hover_text("No native allowance-exhaustion time is inferred.").clicked();
+                                });
+                                if clicked {
+                                    self.selected_seat_tier = Some((Seat::NetResearch, tier));
+                                    self.side_panel_open = true;
+                                }
+                                ui.end_row();
                             }
                         });
                     ui.add_space(8.0);
@@ -1456,6 +2419,111 @@ impl eframe::App for App {
                         .id_salt("settings_scroll")
                         .show(ui, |ui| {
                     let mut changed = false;
+                    ui.heading("Collaboration workspace");
+                    ui.label("User projects, briefs, decisions, research, deliverables, and scratch files live here. Profiles, authentication, ledgers, and generated runtimes remain in private app data.");
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut self.collaboration_root_text).desired_width(300.0));
+                        if ui.add_enabled(self.workspace_picker.is_none(), egui::Button::new("Browse...")).clicked() {
+                            let (sender, receiver) = channel();
+                            self.workspace_picker = Some(receiver);
+                            let context = ctx.clone();
+                            std::thread::spawn(move || {
+                                let result = crate::workspace::pick_root().map_err(|error| format!("Browse failed: {error:#}"));
+                                let _ = sender.send(result);
+                                context.request_repaint();
+                            });
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Use default").clicked() {
+                            match crate::workspace::default_root() {
+                                Ok(path) => {
+                                    self.collaboration_root_text = path.display().to_string();
+                                    self.settings.collaboration_root = None;
+                                    changed = true;
+                                }
+                                Err(error) => self.workspace_status = format!("Default unavailable: {error:#}"),
+                            }
+                        }
+                        if ui.button("Apply and prepare").clicked() {
+                            let root = std::path::PathBuf::from(self.collaboration_root_text.trim());
+                            if !root.is_absolute() {
+                                self.workspace_status = "Choose an absolute local path.".to_owned();
+                            } else {
+                                match crate::workspace::prepare(&root) {
+                                    Ok(paths) => {
+                                        let default = crate::workspace::default_root().ok();
+                                        self.settings.collaboration_root = (default.as_ref() != Some(&paths.root)).then_some(paths.root.clone());
+                                        self.collaboration_root_text = paths.root.display().to_string();
+                                        self.workspace_status = format!("Prepared {}", paths.root.display());
+                                        changed = true;
+                                    }
+                                    Err(error) => self.workspace_status = format!("Workspace setup failed: {error:#}"),
+                                }
+                            }
+                        }
+                    });
+                    if !self.workspace_status.is_empty() {
+                        ui.label(&self.workspace_status);
+                    }
+                    ui.separator();
+                    ui.heading("My subscriptions");
+                    ui.label("Choose a plan and how many separate subscriptions you own. Each account contributes one allowance and one working-time lane shared across all seven roles.");
+                    let mut monthly_spend = 0.0;
+                    let mut estimated_price = false;
+                    for provider in crate::subscriptions::PROVIDERS {
+                        let mut selected = self.settings.subscriptions.get(provider.id).cloned().unwrap_or_default();
+                        let previous = selected.clone();
+                        let label = provider.plans.iter().find(|plan| plan.id == selected)
+                            .map(|plan| format!("{} · {}{:.2}/month", plan.name, if plan.price_is_estimate { "est. $" } else { "$" }, plan.monthly_price))
+                            .unwrap_or_else(|| "None".to_string());
+                        let count_text = self
+                            .subscription_count_text
+                            .entry(provider.id.to_string())
+                            .or_insert_with(|| self.settings.subscription_count(provider.id).to_string());
+                        let mut count_changed = false;
+                        ui.horizontal(|ui| {
+                            ui.label(provider.name);
+                            egui::ComboBox::from_id_salt(("subscription", provider.id))
+                                .selected_text(label)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut selected, String::new(), "None");
+                                    for plan in provider.plans {
+                                        ui.selectable_value(&mut selected, plan.id.to_string(),
+                                            format!("{} · {}{:.2}/month", plan.name, if plan.price_is_estimate { "est. $" } else { "$" }, plan.monthly_price));
+                                    }
+                                });
+                            ui.label("×");
+                            count_changed = ui
+                                .add(egui::TextEdit::singleline(count_text).desired_width(42.0))
+                                .changed();
+                        });
+                        let parsed_count = count_text.parse::<usize>().ok().filter(|count| *count > 0);
+                        if count_changed && let Some(count) = parsed_count {
+                            self.settings
+                                .subscription_counts
+                                .insert(provider.id.to_string(), count);
+                            changed = true;
+                        }
+                        if parsed_count.is_none() {
+                            ui.colored_label(egui::Color32::YELLOW, "Count must be a positive integer; the last saved count remains active.");
+                        }
+                        if selected != previous {
+                            if selected.is_empty() {
+                                self.settings.subscriptions.remove(provider.id);
+                            } else {
+                                self.settings.subscriptions.insert(provider.id.to_string(), selected.clone());
+                            }
+                            changed = true;
+                        }
+                        if let Some(plan) = provider.plans.iter().find(|plan| plan.id == selected) {
+                            monthly_spend += plan.monthly_price
+                                * self.settings.subscription_count(provider.id) as f64;
+                            estimated_price |= plan.price_is_estimate;
+                        }
+                    }
+                    ui.strong(format!("{}: ${monthly_spend:.2}", if estimated_price { "Estimated monthly spend" } else { "Total monthly spend" }));
+                    ui.separator();
                     ui.heading("Engine & cache configuration");
                     ui.horizontal(|ui| {
                         ui.label("Rescue time (minutes):").on_hover_text(
@@ -1508,7 +2576,7 @@ impl eframe::App for App {
                         .default_open(false)
                         .show(ui, |ui| {
                             ui.add(egui::Label::new(
-                                "The automatic choice maximizes nominal verified reference tasks per week, with the scenario band shown. Enable a minimum to enforce a hard qualification requirement.",
+                                "Enable a minimum to enforce a hard qualification requirement for a role in either recommendation mode.",
                             ).wrap());
                             for seat in Seat::ALL {
                                 let floor = self
@@ -1518,7 +2586,11 @@ impl eframe::App for App {
                                     .or_insert(None);
                                 ui.horizontal(|ui| {
                                     let mut enabled = floor.is_some();
-                                    if ui.checkbox(&mut enabled, seat.name()).changed() {
+                                    let response = ui.checkbox(&mut enabled, seat.name());
+                                    if seat == Seat::Orchestrator {
+                                        response.clone().on_hover_text("Per-plan Orchestrator competence uses the AA Intelligence Index only. Absolute tier-list Orchestrator competence retains its equal GPQA and Intelligence Index blend.");
+                                    }
+                                    if response.changed() {
                                         *floor = enabled.then_some(0.0);
                                         changed = true;
                                     }
@@ -1653,8 +2725,26 @@ impl eframe::App for App {
                 });
             self.settings_open = open;
         }
+        self.generator.show(
+            &ctx,
+            &self.table,
+            &self.settings,
+            self.table_revision,
+            !self.refresh_in_flight
+                && self
+                    .scored_settings
+                    .as_ref()
+                    .is_some_and(|scored| scored.scoring_matches(&self.settings)),
+        );
         if install_clicked {
             self.start_install(ctx);
+        }
+        if let Some(guard) = self.health_guard.take()
+            && let Err(error) = guard.confirm_healthy()
+        {
+            self.update_status = format!("Update health confirmation failed: {error:#}");
+            self.close_after_handoff = true;
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 }

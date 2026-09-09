@@ -1,6 +1,5 @@
 use anyhow::{Context, Result, bail};
-use sha2::Digest;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,9 +29,9 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 #[cfg(windows)]
 use windows_sys::Wdk::Storage::FileSystem::{
-    FILE_INFORMATION_CLASS, FILE_LINK_INFORMATION, FILE_RENAME_INFORMATION,
-    FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS, FileLinkInformation,
-    FileRenameInformation, FileRenameInformationEx, NtSetInformationFile,
+    FILE_INFORMATION_CLASS, FILE_RENAME_INFORMATION, FILE_RENAME_POSIX_SEMANTICS,
+    FILE_RENAME_REPLACE_IF_EXISTS, FileRenameInformation, FileRenameInformationEx,
+    NtSetInformationFile,
 };
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{
@@ -55,16 +54,6 @@ impl FileIdentity {
 
     pub fn file_id_hex(&self) -> String {
         format!("{:032x}", self.id)
-    }
-
-    pub fn from_recorded(volume: u64, id_hex: &str) -> Option<Self> {
-        if id_hex.len() != 32 || !id_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return None;
-        }
-        Some(FileIdentity {
-            volume,
-            id: u128::from_str_radix(id_hex, 16).ok()?,
-        })
     }
 }
 
@@ -218,14 +207,6 @@ pub fn identity_of(file: &File) -> Result<FileIdentity> {
     })
 }
 
-pub fn open_no_follow(path: &Path, share_mode: u32) -> std::io::Result<File> {
-    open_no_follow_access(
-        path,
-        FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-        share_mode,
-    )
-}
-
 #[cfg(windows)]
 fn open_no_follow_access(path: &Path, access: u32, share_mode: u32) -> std::io::Result<File> {
     OpenOptions::new()
@@ -266,60 +247,6 @@ pub fn open_launch_image(path: &Path) -> Result<File> {
     .with_context(|| format!("opening {} as a launch image", path.display()))?;
     reject_indirection(&file, path)?;
     Ok(file)
-}
-
-pub fn rename_pinned_replace(file: &File, directory: &DirectoryLease, leaf: &OsStr) -> Result<()> {
-    rename_relative_with(file, directory.file(), leaf, RenameMode::Replace).map_err(Into::into)
-}
-
-pub fn link_pinned(source: &File, directory: &DirectoryLease, leaf: &OsStr) -> Result<()> {
-    let name: Vec<u16> = leaf.encode_wide().collect();
-    if name.is_empty() || name.contains(&0) {
-        bail!("a hard link name must be nonempty and contain no embedded NUL");
-    }
-    let name_bytes = name
-        .len()
-        .checked_mul(2)
-        .context("hard link name is too long")?;
-    let total = size_of::<FILE_LINK_INFORMATION>().max(
-        offset_of!(FILE_LINK_INFORMATION, FileName)
-            .checked_add(name_bytes)
-            .context("hard link name is too long")?,
-    );
-    let length = u32::try_from(total).context("hard link name is too long")?;
-    let name_length = u32::try_from(name_bytes).context("hard link name is too long")?;
-    let mut storage = vec![0_u64; total.div_ceil(size_of::<u64>())];
-    let information = storage.as_mut_ptr().cast::<FILE_LINK_INFORMATION>();
-    unsafe {
-        (*information).Anonymous.ReplaceIfExists = false;
-        (*information).RootDirectory = directory.file().as_raw_handle() as HANDLE;
-        (*information).FileNameLength = name_length;
-        let destination = (&raw mut (*information).FileName).cast::<u16>();
-        std::ptr::copy_nonoverlapping(name.as_ptr(), destination, name.len());
-    }
-    let mut iosb = IO_STATUS_BLOCK::default();
-    let status = unsafe {
-        NtSetInformationFile(
-            source.as_raw_handle() as HANDLE,
-            &raw mut iosb,
-            storage.as_ptr().cast(),
-            length,
-            FileLinkInformation,
-        )
-    };
-    if status < 0 {
-        return Err(error_from_status(status)).context("linking the pinned file");
-    }
-    Ok(())
-}
-
-pub fn existing_identity(path: &Path) -> Result<Option<FileIdentity>> {
-    let share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-    match open_no_follow(path, share) {
-        Ok(file) => Ok(Some(identity_of(&file)?)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("inspecting {}", path.display())),
-    }
 }
 
 fn open_directory(path: &Path) -> Result<File> {
@@ -407,9 +334,7 @@ fn identify_owned_stage(stage: File) -> Result<(File, FileIdentity)> {
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RenameMode {
-    NoReplace,
     Replace,
-    LegacyNoReplace,
     LegacyReplace,
 }
 
@@ -417,32 +342,29 @@ enum RenameMode {
 impl RenameMode {
     fn class(self) -> FILE_INFORMATION_CLASS {
         match self {
-            RenameMode::NoReplace | RenameMode::Replace => FileRenameInformationEx,
-            RenameMode::LegacyNoReplace | RenameMode::LegacyReplace => FileRenameInformation,
+            RenameMode::Replace => FileRenameInformationEx,
+            RenameMode::LegacyReplace => FileRenameInformation,
         }
     }
 
     fn flags(self) -> Option<u32> {
         match self {
-            RenameMode::NoReplace => Some(FILE_RENAME_POSIX_SEMANTICS),
             RenameMode::Replace => {
                 Some(FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS)
             }
-            RenameMode::LegacyNoReplace | RenameMode::LegacyReplace => None,
+            RenameMode::LegacyReplace => None,
         }
     }
 
     fn replace_if_exists(self) -> Option<bool> {
         match self {
-            RenameMode::NoReplace | RenameMode::Replace => None,
-            RenameMode::LegacyNoReplace => Some(false),
+            RenameMode::Replace => None,
             RenameMode::LegacyReplace => Some(true),
         }
     }
 
     fn legacy(self) -> Self {
         match self {
-            RenameMode::NoReplace | RenameMode::LegacyNoReplace => RenameMode::LegacyNoReplace,
             RenameMode::Replace | RenameMode::LegacyReplace => RenameMode::LegacyReplace,
         }
     }
@@ -550,11 +472,6 @@ fn rename_relative_with(
     } else {
         Err(error_from_status(status))
     }
-}
-
-#[cfg(windows)]
-fn rename_relative(file: &File, directory: &File, leaf: &std::ffi::OsStr) -> std::io::Result<()> {
-    rename_relative_with(file, directory, leaf, RenameMode::NoReplace)
 }
 
 #[cfg(windows)]
@@ -689,15 +606,6 @@ impl OwnedStagingFile {
             .context("the staging file handle is already closed")
     }
 
-    pub fn close_handle(&mut self) {
-        self.file = None;
-    }
-
-    pub fn keep(mut self) -> PathBuf {
-        self.kept = true;
-        self.path.clone()
-    }
-
     pub fn mark_kept(&mut self) {
         self.kept = true;
     }
@@ -725,15 +633,6 @@ fn open_for_disposal(path: &Path) -> std::io::Result<File> {
         .open(path)
 }
 
-#[cfg(windows)]
-fn open_for_move(path: &Path) -> std::io::Result<File> {
-    OpenOptions::new()
-        .access_mode(DELETE | FILE_READ_ATTRIBUTES)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-}
-
 pub fn remove_recorded_object(path: &Path, expected: FileIdentity) -> Result<bool> {
     let file = match open_for_disposal(path) {
         Ok(file) => file,
@@ -746,67 +645,6 @@ pub fn remove_recorded_object(path: &Path, expected: FileIdentity) -> Result<boo
         return Ok(false);
     }
     delete_by_handle(&file).with_context(|| format!("removing {}", path.display()))?;
-    Ok(true)
-}
-
-pub fn move_recorded_object_no_replace(
-    source: &Path,
-    expected: FileIdentity,
-    destination: &Path,
-) -> Result<bool> {
-    let source_directory = source
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let destination_directory = destination
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let source_leaf = source
-        .file_name()
-        .with_context(|| format!("{} has no file name", source.display()))?;
-    let destination_leaf = destination
-        .file_name()
-        .with_context(|| format!("{} has no file name", destination.display()))?;
-    if source_leaf == destination_leaf && source_directory == destination_directory {
-        bail!("the recorded move source and destination are the same name");
-    }
-
-    let source_parent = lease_directory(source_directory)?;
-    let destination_parent = lease_directory(destination_directory)?;
-    if identity_of(source_parent.file())? != identity_of(destination_parent.file())? {
-        bail!("the recorded move source and destination are not in one directory");
-    }
-    let source_child = source_parent.resolved_path().join(source_leaf);
-    let destination_child = destination_parent.resolved_path().join(destination_leaf);
-
-    let file = match open_for_move(&source_child) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("opening {} to restore it", source.display()));
-        }
-    };
-    reject_indirection(&file, &source_child)?;
-    if identity_of(&file)? != expected {
-        return Ok(false);
-    }
-    rename_relative(&file, destination_parent.file(), destination_leaf).with_context(|| {
-        format!(
-            "restoring {} to {}",
-            source.display(),
-            destination.display()
-        )
-    })?;
-    if identity_of(&file)? != expected {
-        bail!("the restored object's live identity changed during its rename");
-    }
-    match existing_identity(&destination_child)? {
-        Some(identity) if identity == expected => {}
-        Some(_) => bail!("the restored destination names a different object"),
-        None => bail!("the restored destination is absent after its rename"),
-    }
     Ok(true)
 }
 
@@ -849,33 +687,4 @@ fn publish_over(stage: &mut OwnedStagingFile, leaf: &std::ffi::OsStr) -> Result<
 #[cfg(windows)]
 fn replace_relative(file: &File, directory: &File, leaf: &std::ffi::OsStr) -> std::io::Result<()> {
     rename_relative_with(file, directory, leaf, RenameMode::Replace)
-}
-
-pub fn hash_reader_with(
-    reader: &mut impl std::io::Read,
-    overflow: &'static str,
-    mut visit: impl FnMut(&[u8]) -> std::io::Result<()>,
-) -> std::io::Result<(u64, [u8; 32])> {
-    let mut hasher = sha2::Sha256::new();
-    let mut copied = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        copied = copied
-            .checked_add(read as u64)
-            .ok_or_else(|| std::io::Error::other(overflow))?;
-        sha2::Digest::update(&mut hasher, &buffer[..read]);
-        visit(&buffer[..read])?;
-    }
-    Ok((copied, sha2::Digest::finalize(hasher).into()))
-}
-
-pub fn hash_reader(
-    reader: &mut impl std::io::Read,
-    overflow: &'static str,
-) -> std::io::Result<(u64, [u8; 32])> {
-    hash_reader_with(reader, overflow, |_| Ok(()))
 }

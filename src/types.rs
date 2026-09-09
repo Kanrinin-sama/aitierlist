@@ -8,16 +8,18 @@ pub enum Seat {
     Orchestrator,
     Sanity,
     Comprehension,
+    NetResearch,
 }
 
 impl Seat {
-    pub const ALL: [Seat; 6] = [
+    pub const ALL: [Seat; 7] = [
         Seat::Implementer,
         Seat::Debugger,
         Seat::Reviewer,
         Seat::Orchestrator,
         Seat::Sanity,
         Seat::Comprehension,
+        Seat::NetResearch,
     ];
 
     pub fn name(self) -> &'static str {
@@ -28,6 +30,7 @@ impl Seat {
             Seat::Orchestrator => "Orchestrator",
             Seat::Sanity => "Sanity",
             Seat::Comprehension => "Comprehension",
+            Seat::NetResearch => "Net Research",
         }
     }
 }
@@ -62,6 +65,7 @@ pub enum Benchmark {
     Gpqa,
     Hle,
     Lcr,
+    Omniscience,
 }
 
 impl Benchmark {
@@ -73,6 +77,7 @@ impl Benchmark {
             Benchmark::Gpqa => "GPQA reasoning",
             Benchmark::Hle => "Humanity's Last Exam",
             Benchmark::Lcr => "Long-context reasoning",
+            Benchmark::Omniscience => "Omniscience",
         }
     }
 }
@@ -121,8 +126,11 @@ pub struct Row {
     pub swe: Option<f64>,
     pub qna: Option<f64>,
     pub lcr: Option<f64>,
+    pub omniscience_accuracy: Option<f64>,
+    pub omniscience_attempt_rate: Option<f64>,
     #[serde(rename = "hallucination")]
     pub halluc: Option<f64>,
+    pub gdp_pdf: Option<f64>,
     pub wait_seconds: f64,
     pub read_seconds: f64,
     pub pooled_seconds: f64,
@@ -140,17 +148,30 @@ pub struct Row {
     pub retry: crate::retry::RowRetry,
     pub usd_per_step: Option<f64>,
     pub speed: Option<f64>,
+    pub orchestrator_usd: Option<f64>,
+    pub orchestrator_seconds: Option<f64>,
+    pub orchestrator_cost_basis: Option<String>,
+    pub orchestrator_time_basis: Option<String>,
 }
 
 impl Row {
     pub fn display_name(&self) -> String {
-        if !self.display_name.is_empty() {
-            return self.display_name.clone();
+        let name = if !self.display_name.is_empty() {
+            self.display_name.clone()
+        } else {
+            match &self.effort {
+                Some(effort) if !effort.is_empty() => format!("{} ({})", self.model, effort),
+                _ => self.model.clone(),
+            }
+        };
+        if self.harness.to_ascii_lowercase().starts_with("antigravity")
+            && name.to_ascii_lowercase().starts_with("antigravity")
+        {
+            return name
+                .split_once(" - ")
+                .map_or_else(|| "AGY".to_owned(), |(_, model)| format!("AGY - {model}"));
         }
-        match &self.effort {
-            Some(effort) if !effort.is_empty() => format!("{} ({})", self.model, effort),
-            _ => self.model.clone(),
-        }
+        name
     }
 }
 
@@ -261,12 +282,16 @@ pub struct SeatTierFrontier {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Table {
+    #[serde(default)]
+    pub portfolio: Option<crate::portfolio::Portfolio>,
     pub picks: Vec<SeatTierPick>,
     #[serde(default)]
     pub frontiers: Vec<SeatTierFrontier>,
     #[serde(default)]
     pub plan_comparisons: Vec<crate::comparison::PlanComparison>,
     pub rows: Vec<Row>,
+    #[serde(default)]
+    pub research_tiers: Vec<crate::portfolio::ResearchTierPick>,
     pub generated_at: String,
     pub source_fetched_at: String,
     pub cache_state: CacheState,
@@ -282,10 +307,12 @@ impl Table {
 
     pub fn empty() -> Self {
         Self {
+            portfolio: None,
             picks: Vec::new(),
             frontiers: Vec::new(),
             plan_comparisons: Vec::new(),
             rows: Vec::new(),
+            research_tiers: Vec::new(),
             generated_at: String::new(),
             source_fetched_at: String::new(),
             cache_state: CacheState::Baked,

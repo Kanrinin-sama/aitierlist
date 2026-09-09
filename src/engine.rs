@@ -50,6 +50,7 @@ fn pass(row: &Row, benchmark: Benchmark) -> Option<f64> {
         Benchmark::Gpqa => row.gpqa,
         Benchmark::Hle => row.hle,
         Benchmark::Lcr => row.lcr,
+        Benchmark::Omniscience => row.omniscience_accuracy,
     }?;
     (value.is_finite() && (0.0..=1.0).contains(&value))
         .then(|| row.retry.adjusted_pass(benchmark, value))
@@ -72,18 +73,25 @@ pub fn competence_components(row: &Row, seat: Seat) -> Option<Vec<(&'static str,
             ("Intelligence index", smart, 0.5),
         ]);
     }
-    let profile = match seat {
+    if seat == Seat::NetResearch {
+        return None;
+    }
+    competence_profile(seat)
+        .iter()
+        .map(|(benchmark, weight)| Some((benchmark.name(), pass(row, *benchmark)?, *weight)))
+        .collect()
+}
+
+fn competence_profile(seat: Seat) -> &'static [(Benchmark, f64)] {
+    match seat {
         Seat::Implementer => &CODING[..],
         Seat::Debugger => &DEBUGGER[..],
         Seat::Reviewer => &REVIEWER[..],
         Seat::Sanity => &SANITY[..],
         Seat::Comprehension => &COMPREHENSION[..],
-        Seat::Orchestrator => unreachable!(),
-    };
-    profile
-        .iter()
-        .map(|(benchmark, weight)| Some((benchmark.name(), pass(row, *benchmark)?, *weight)))
-        .collect()
+        Seat::NetResearch => &[],
+        Seat::Orchestrator => &[],
+    }
 }
 
 pub fn reference_workload(seat: Seat) -> &'static [(Benchmark, f64)] {
@@ -96,6 +104,7 @@ pub fn reference_workload(seat: Seat) -> &'static [(Benchmark, f64)] {
 pub fn reference_workload_name(seat: Seat) -> &'static str {
     match seat {
         Seat::Implementer | Seat::Debugger => "coding reference workload",
+        Seat::NetResearch => "provisional general-reasoning transfer",
         _ => "repository Q&A reference workload",
     }
 }
@@ -321,7 +330,9 @@ fn cycles_for(
             Benchmark::Swe => row.retry.deepswe,
             Benchmark::Terminal => row.retry.terminal_bench,
             Benchmark::Qna => row.retry.qna,
-            _ => return None,
+            Benchmark::Gpqa | Benchmark::Hle | Benchmark::Lcr | Benchmark::Omniscience => {
+                return None;
+            }
         };
         let rho = (settings.rho_override.unwrap_or(resolved.rho) * assumptions.rho_multiplier)
             .clamp(0.0, 1.0 - f64::EPSILON);
@@ -365,6 +376,113 @@ pub fn implementation_cycle(row: &Row, settings: &Settings) -> Option<Cycle> {
                 best
             }
         })
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct DispatchCycle {
+    pub success: f64,
+    pub nominal_usage: f64,
+    pub nominal_seconds: f64,
+    pub reserved_usage: f64,
+    pub reserved_seconds: f64,
+    reference_completion: [Option<f64>; 3],
+}
+
+pub(crate) fn dispatch_utility(row: &Row, seat: Seat, cycle: &DispatchCycle) -> Option<f64> {
+    if seat == Seat::Orchestrator {
+        return competence(row, seat);
+    }
+    competence_profile(seat)
+        .iter()
+        .map(|(benchmark, weight)| {
+            let value = if reference_workload(seat)
+                .iter()
+                .any(|(reference, _)| reference == benchmark)
+            {
+                cycle.reference_completion[match benchmark {
+                    Benchmark::Swe => 0,
+                    Benchmark::Terminal => 1,
+                    Benchmark::Qna => 2,
+                    _ => return None,
+                }]?
+            } else {
+                pass(row, *benchmark)?
+            };
+            Some(value * weight)
+        })
+        .sum()
+}
+
+pub(crate) fn dispatch_cycles(
+    row: &Row,
+    seat: Seat,
+    settings: &Settings,
+) -> Option<[DispatchCycle; 3]> {
+    let workload = reference_workload(seat);
+    let mut nominal = [Cycle::default(); 3];
+    let mut reference_completion = [[None; 3]; 3];
+    let mut full_usage = 0.0;
+    let mut token_seconds = 0.0;
+    let mut pooled_seconds = 0.0;
+    for (benchmark, weight) in workload {
+        let component = cycles_for(
+            row,
+            &[(*benchmark, 1.0)],
+            settings,
+            &baseline(TimeBasis::Token),
+            1.0,
+            1.0,
+        )?;
+        let benchmark_index = match benchmark {
+            Benchmark::Swe => 0,
+            Benchmark::Terminal => 1,
+            Benchmark::Qna => 2,
+            _ => return None,
+        };
+        for index in 0..3 {
+            nominal[index].unfinished += weight * component[index].unfinished;
+            nominal[index].model_spend += weight * component[index].model_spend;
+            nominal[index].agent_seconds += weight * component[index].agent_seconds;
+            reference_completion[index][benchmark_index] = Some(1.0 - component[index].unfinished);
+        }
+        let metric = row
+            .task_metrics
+            .iter()
+            .find(|metric| metric.benchmark == *benchmark)?;
+        if !metric.pooled_seconds.is_finite() || metric.pooled_seconds <= 0.0 {
+            return None;
+        }
+        full_usage += weight * metric.usd;
+        token_seconds += weight * metric.seconds;
+        pooled_seconds += weight * metric.pooled_seconds;
+    }
+    let stress = 1.0 + settings.assumption_span_pct / 100.0;
+    Some(std::array::from_fn(|index| DispatchCycle {
+        success: 1.0 - nominal[index].unfinished,
+        nominal_usage: nominal[index].model_spend,
+        nominal_seconds: nominal[index].agent_seconds,
+        reserved_usage: (index + 1) as f64 * full_usage * stress,
+        reserved_seconds: (index + 1) as f64 * token_seconds.max(pooled_seconds) * stress,
+        reference_completion: reference_completion[index],
+    }))
+}
+
+pub(crate) fn orchestrator_dispatch_cycle(row: &Row, settings: &Settings) -> Option<DispatchCycle> {
+    let usage = row
+        .orchestrator_usd
+        .filter(|value| value.is_finite() && *value >= 0.0)?;
+    let seconds = row
+        .orchestrator_seconds
+        .filter(|value| value.is_finite() && *value > 0.0)?;
+    let stress = 1.0 + settings.assumption_span_pct / 100.0;
+    Some(DispatchCycle {
+        success: 1.0,
+        nominal_usage: usage,
+        nominal_seconds: seconds,
+        reserved_usage: usage * stress,
+        reserved_seconds: seconds * stress,
+        reference_completion: [None; 3],
+    })
 }
 
 fn allowance(row: &Row, plan: Option<Allowance>, override_amount: Option<f64>) -> (f64, f64) {
@@ -1004,10 +1122,17 @@ pub fn score(
         })
         .collect();
     let (picks, frontiers) = analyses.into_iter().unzip();
+    let portfolio = vendor_filter
+        .is_none()
+        .then(|| crate::portfolio::allocate(&rows, settings))
+        .flatten();
+    let research_tiers = crate::portfolio::research_tier_picks(&rows, settings, vendor_filter);
     let mut table = Table {
+        portfolio,
         picks,
         frontiers,
         rows,
+        research_tiers,
         generated_at: OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .unwrap_or_default(),

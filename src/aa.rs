@@ -19,6 +19,7 @@ const QNA_TASKS: f64 = 124.0;
 const GPQA_TASKS: f64 = 198.0;
 const HLE_TASKS: f64 = 2158.0;
 const LCR_TASKS: f64 = 100.0;
+const OMNISCIENCE_TASKS: f64 = 6000.0;
 pub const EXCLUDED_EFFORTS: [&str; 1] = ["none"];
 const SITE: &str = "https://artificialanalysis.ai";
 
@@ -76,6 +77,28 @@ fn effort_of(model_key: &str) -> Option<String> {
         .map(|capture| capture[1].to_owned())
 }
 
+fn configured_effort(value: &str) -> Option<String> {
+    regex(r#"(?i)\{\s*['\"]reasoning_effort['\"]\s*:\s*['\"](max|xhigh|high|medium|low|minimal|none)['\"]\s*\}"#)
+        .captures(value)
+        .map(|capture| capture[1].to_ascii_lowercase())
+}
+
+fn agent_model(raw: &Value) -> Option<String> {
+    let model = display_name(label(&raw["display"]["model"]));
+    let embedded = effort_of(&harness_key(&model));
+    let configured = configured_effort(label(&raw["displayLabel"]));
+    if embedded.is_some() && configured.is_some() && embedded != configured {
+        return None;
+    }
+    Some(if embedded.is_none() {
+        configured
+            .as_deref()
+            .map_or(model.clone(), |effort| format!("{model} ({effort})"))
+    } else {
+        model
+    })
+}
+
 pub fn display_name(raw_name: &str) -> String {
     let groups: Vec<_> = regex(r"\(([^)]*)\)")
         .captures_iter(raw_name)
@@ -103,6 +126,7 @@ pub fn display_name(raw_name: &str) -> String {
 
 fn clean_label(name: &str) -> String {
     let name = regex(r"(?i)\s*with fallback").replace(name, "");
+    let name = regex(r#"(?i)\s*\(\s*\{\s*['\"]reasoning_effort['\"]\s*:\s*['\"](?:max|xhigh|high|medium|low|minimal|none)['\"]\s*\}\s*\)\s*$"#).replace(&name, "");
     regex(r"\s*\(\s*\)").replace(&name, "").trim().to_owned()
 }
 
@@ -371,6 +395,42 @@ fn model_speed(item: &Value, hosts: &[&Value]) -> Option<f64> {
     .filter(|speed| speed.is_finite() && *speed > 0.0)
 }
 
+fn orchestrator_resources(item: &Value, hosts: &[&Value]) -> Option<(f64, f64)> {
+    let host = hosts
+        .iter()
+        .copied()
+        .filter(|host| host["host"]["name"] == item["creator"]["name"])
+        .filter_map(|host| {
+            let total = finite_number(&host["intelligenceIndexCostPerTask"]["cost"]["total"])?;
+            let output = finite_number(&host["intelligenceIndexCostPerTask"]["cost"]["output"])?;
+            let output_price = finite_number(&host["price1mOutputTokens"])?;
+            (total >= 0.0 && output >= 0.0 && output_price > 0.0).then_some((
+                label(&host["slug"]),
+                total,
+                output,
+                output_price,
+            ))
+        })
+        .min_by(|left, right| left.0.cmp(right.0))?;
+    let speed =
+        finite_number(&item["medianCanonicalAnswerOutputSpeed"]).filter(|speed| *speed > 0.0)?;
+    let output_tokens = host.2 / host.3 * 1_000_000.0;
+    Some((host.1, output_tokens / speed))
+}
+
+fn apply_orchestrator_resources(row: &mut Value, item: &Value, hosts: &[&Value]) {
+    if let Some((usd, seconds)) = orchestrator_resources(item, hosts) {
+        row["orchestratorUsd"] = json!(usd);
+        row["orchestratorSeconds"] = json!(seconds);
+        row["orchestratorCostBasis"] = json!(
+            "Artificial Analysis Intelligence Index benchmark-task-equivalent cost on the first-party endpoint"
+        );
+        row["orchestratorTimeBasis"] = json!(
+            "Artificial Analysis Intelligence Index benchmark-task-equivalent weighted output tokens divided by canonical answer output speed"
+        );
+    }
+}
+
 fn task_metric(
     benchmark: &str,
     pass: f64,
@@ -422,28 +482,42 @@ fn canonical_resources(
 }
 
 pub fn agent_row(raw: &Value, item: Option<&Value>, hosts: &[&Value]) -> Option<Value> {
+    let raw_label = label(&raw["displayLabel"]);
+    let configured = configured_effort(raw_label);
     if raw["isUnavailable"].as_bool().unwrap_or(false)
         || EXCLUDED_EFFORTS.iter().any(|effort| {
-            label(&raw["displayLabel"])
-                .to_lowercase()
-                .contains(&format!("({effort})"))
+            display_name(label(&raw["display"]["model"])).ends_with(&format!("({effort})"))
+                || configured.as_deref() == Some(*effort)
         })
     {
         return None;
     }
-    let evaluations: serde_json::Map<String, Value> = array(&raw["evals"])
-        .iter()
-        .map(|evaluation| {
-            (
-                label(&evaluation["datasetIndexName"]).to_owned(),
-                evaluation["mean"].clone(),
-            )
+    let evaluations = array(&raw["evals"]);
+    let evaluation = |names: &[&str]| {
+        names.iter().find_map(|name| {
+            evaluations
+                .iter()
+                .find(|value| label(&value["datasetIndexName"]) == *name)
+                .map(|value| ((*name).to_owned(), value))
         })
-        .collect();
-    let evaluations = Value::Object(evaluations);
-    let swe = &evaluations["deep-swe"];
-    let term = &evaluations["terminal-bench-v2.1"];
-    let qna = &evaluations["swe-atlas-qna"];
+    };
+    let (swe_dataset, swe_evaluation) = evaluation(&["deep-swe-v1.1", "deep-swe"])?;
+    let (term_dataset, term_evaluation) =
+        evaluation(&["terminal-bench-v4", "terminal-bench-v2.1"])?;
+    let (qna_dataset, qna_evaluation) = evaluation(&["swe-atlas-qna"])?;
+    let swe = &swe_evaluation["mean"];
+    let term = &term_evaluation["mean"];
+    let qna = &qna_evaluation["mean"];
+    let task_count = |dataset: &str| match dataset {
+        "deep-swe-v1.1" | "deep-swe" => SWE_TASKS,
+        "terminal-bench-v4" => 66.0,
+        "terminal-bench-v2.1" => TERMINAL_TASKS,
+        "swe-atlas-qna" => QNA_TASKS,
+        _ => 0.0,
+    };
+    let swe_tasks = task_count(&swe_dataset);
+    let terminal_tasks = task_count(&term_dataset);
+    let qna_tasks = task_count(&qna_dataset);
     let mean = &raw["mean"];
     if [swe, term, qna, &mean["costUsd"], &mean["agentWallTimeSec"]]
         .iter()
@@ -476,8 +550,8 @@ pub fn agent_row(raw: &Value, item: Option<&Value>, hosts: &[&Value]) -> Option<
         return None;
     }
     let implementation_mean = |key: &str| {
-        (number(&swe[key]) * SWE_TASKS + number(&term[key]) * TERMINAL_TASKS)
-            / (SWE_TASKS + TERMINAL_TASKS)
+        (number(&swe[key]) * swe_tasks + number(&term[key]) * terminal_tasks)
+            / (swe_tasks + terminal_tasks)
     };
     let pass = finite_number(&swe["reward"])
         .zip(finite_number(&term["reward"]))
@@ -485,10 +559,10 @@ pub fn agent_row(raw: &Value, item: Option<&Value>, hosts: &[&Value]) -> Option<
         .map(|_| implementation_mean("reward"));
     let pooled_seconds = number(&mean["agentWallTimeSec"]);
     let pooled_usd = number(&mean["costUsd"]);
-    let weighted_mean_output = (number(&swe["outputTokens"]) * SWE_TASKS
-        + number(&term["outputTokens"]) * TERMINAL_TASKS
-        + number(&qna["outputTokens"]) * QNA_TASKS)
-        / (SWE_TASKS + TERMINAL_TASKS + QNA_TASKS);
+    let weighted_mean_output = (number(&swe["outputTokens"]) * swe_tasks
+        + number(&term["outputTokens"]) * terminal_tasks
+        + number(&qna["outputTokens"]) * qna_tasks)
+        / (swe_tasks + terminal_tasks + qna_tasks);
     let seconds_for = |evaluation: &Value| {
         if weighted_mean_output > 0.0 {
             pooled_seconds * number(&evaluation["outputTokens"]) / weighted_mean_output
@@ -518,11 +592,11 @@ pub fn agent_row(raw: &Value, item: Option<&Value>, hosts: &[&Value]) -> Option<
                 / 1e6,
         )
     };
-    let direct_unanchored = [(swe, SWE_TASKS), (term, TERMINAL_TASKS), (qna, QNA_TASKS)]
+    let direct_unanchored = [(swe, swe_tasks), (term, terminal_tasks), (qna, qna_tasks)]
         .into_iter()
         .map(|(evaluation, tasks)| token_cost(evaluation).map(|cost| cost * tasks))
         .collect::<Option<Vec<_>>>()
-        .map(|costs| costs.into_iter().sum::<f64>() / (SWE_TASKS + TERMINAL_TASKS + QNA_TASKS));
+        .map(|costs| costs.into_iter().sum::<f64>() / (swe_tasks + terminal_tasks + qna_tasks));
     let anchor = direct_unanchored
         .filter(|cost| *cost > 0.0)
         .map(|cost| pooled_usd / cost);
@@ -532,11 +606,17 @@ pub fn agent_row(raw: &Value, item: Option<&Value>, hosts: &[&Value]) -> Option<
             .map(|(cost, anchor)| cost * anchor)
             .unwrap_or(pooled_usd)
     };
-    let time_basis = "Pooled observed wall time allocated in proportion to task output tokens";
+    let time_basis = format!(
+        "Pooled observed wall time allocated in proportion to task output tokens across {swe_dataset}, {term_dataset}, and {qna_dataset}"
+    );
     let cost_basis = if priced && anchor.is_some() {
-        "Token-price estimate anchored to pooled observed cost; cache mix transferred"
+        format!(
+            "Token-price estimate anchored to pooled observed cost across {swe_dataset}, {term_dataset}, and {qna_dataset}; cache mix transferred"
+        )
     } else {
-        "Pooled cost; token prices unavailable"
+        format!(
+            "Pooled observed cost across {swe_dataset}, {term_dataset}, and {qna_dataset}; token prices unavailable"
+        )
     };
     let swe_seconds = seconds_for(swe);
     let term_seconds = seconds_for(term);
@@ -545,33 +625,33 @@ pub fn agent_row(raw: &Value, item: Option<&Value>, hosts: &[&Value]) -> Option<
     let term_usd = cost_for(term);
     let qna_usd = cost_for(qna);
     let wait =
-        (swe_seconds * SWE_TASKS + term_seconds * TERMINAL_TASKS) / (SWE_TASKS + TERMINAL_TASKS);
+        (swe_seconds * swe_tasks + term_seconds * terminal_tasks) / (swe_tasks + terminal_tasks);
     let attempt_usd =
-        (swe_usd * SWE_TASKS + term_usd * TERMINAL_TASKS) / (SWE_TASKS + TERMINAL_TASKS);
+        (swe_usd * swe_tasks + term_usd * terminal_tasks) / (swe_tasks + terminal_tasks);
     let mut metrics = vec![
         task_metric(
             "swe",
             number(&swe["reward"]),
             swe_seconds,
             swe_usd,
-            time_basis,
-            cost_basis,
+            &time_basis,
+            &cost_basis,
         ),
         task_metric(
             "terminal",
             number(&term["reward"]),
             term_seconds,
             term_usd,
-            time_basis,
-            cost_basis,
+            &time_basis,
+            &cost_basis,
         ),
         task_metric(
             "qna",
             number(&qna["reward"]),
             qna_seconds,
             qna_usd,
-            time_basis,
-            cost_basis,
+            &time_basis,
+            &cost_basis,
         ),
     ];
     metrics.retain(|metric| {
@@ -580,15 +660,17 @@ pub fn agent_row(raw: &Value, item: Option<&Value>, hosts: &[&Value]) -> Option<
     for metric in &mut metrics {
         metric["pooledSeconds"] = json!(pooled_seconds);
     }
-    let model_key = harness_key(label(&raw["display"]["model"]));
+    let display_model = agent_model(raw)?;
+    let model_key = harness_key(&display_model);
     let harness = label(&raw["agentName"]);
     let mut row = json!({
-        "name":clean_label(label(&raw["displayLabel"])),"rawName":raw["displayLabel"],"model":raw["display"]["model"],"harness":harness,"modelKey":model_key,"family":family_key(harness,&model_key),"vendor":vendor_key(harness,&model_key),
+        "name":clean_label(&format!("{harness} - {display_model}")),"rawName":clean_label(label(&raw["displayLabel"])),"model":display_model,"harness":harness,"modelKey":model_key,"family":family_key(harness,&model_key),"vendor":vendor_key(harness,&model_key),
         "swe":swe["reward"],"term":term["reward"],"qna":qna["reward"],"pass":pass,
         "waitSeconds":wait,"attemptUsd":attempt_usd,"readSeconds":qna_seconds,"readUsd":qna_usd,"pooledSeconds":pooled_seconds,"usdPerStep":number(&mean["costUsd"]) / number(&mean["steps"]),"taskMetrics":metrics
     });
     if let Some(item) = item {
         apply_model_quality(&mut row, item);
+        apply_orchestrator_resources(&mut row, item, hosts);
     }
     Some(row)
 }
@@ -596,13 +678,26 @@ pub fn agent_row(raw: &Value, item: Option<&Value>, hosts: &[&Value]) -> Option<
 pub fn model_row(item: &Value, hosts: &[&Value]) -> Value {
     let prices = model_prices(item, hosts);
     let speed = model_speed(item, hosts);
-    let rankable = !item["deprecated"].as_bool().unwrap_or(false)
+    let coding_rankable = !item["deprecated"].as_bool().unwrap_or(false)
         && fallback(&item["terminalbenchV21"], 0.0) > 0.0
         && !item["canonicalEvalTokenCounts"]["terminalbenchV21"].is_null()
         && item["gpqa"].is_number()
         && item["hle"].is_number()
         && prices.is_some()
         && speed.is_some_and(|speed| speed != 0.0 && !speed.is_nan());
+    let research_rankable = !item["deprecated"].as_bool().unwrap_or(false)
+        && [
+            &item["omniscienceBreakdown"]["accuracy"],
+            &item["omniscienceBreakdown"]["hallucinationRate"],
+            &item["lcr"],
+        ]
+        .iter()
+        .all(|value| {
+            value
+                .as_f64()
+                .is_some_and(|value| value.is_finite() && (0.0..=1.0).contains(&value))
+        });
+    let rankable = coding_rankable || research_rankable;
     let name = display_name(label(&item["name"]));
     let key = harness_key(label(&item["name"]));
     let mut metrics = Vec::new();
@@ -618,8 +713,19 @@ pub fn model_row(item: &Value, hosts: &[&Value]) -> Value {
             ("gpqa", "gpqa", "gpqa", GPQA_TASKS),
             ("hle", "hle", "hle", HLE_TASKS),
             ("lcr", "lcr", "lcr", LCR_TASKS),
+            (
+                "omniscience",
+                "omniscienceBreakdown.accuracy",
+                "omniscience",
+                OMNISCIENCE_TASKS,
+            ),
         ] {
-            let Some(pass) = item[score_key].as_f64() else {
+            let score = if score_key == "omniscienceBreakdown.accuracy" {
+                &item["omniscienceBreakdown"]["accuracy"]
+            } else {
+                &item[score_key]
+            };
+            let Some(pass) = score.as_f64() else {
                 continue;
             };
             if let Some((Some(seconds), Some(usd))) =
@@ -660,6 +766,7 @@ pub fn model_row(item: &Value, hosts: &[&Value]) -> Value {
     let mut row = json!({"name":name,"rawName":item["name"],"model":name,"modelKey":key,"harness":"model","family":family_key("model",&key),"vendor":vendor_key("model",&key),"term":item["terminalbenchV21"],"gpqa":item["gpqa"],"hle":item["hle"],"logic":if item["gpqa"].is_number() && item["hle"].is_number() { Some((number(&item["gpqa"])+number(&item["hle"]))/2.0) } else { None },"pass":item["terminalbenchV21"],"rankable":rankable,"speed":speed,"waitSeconds":terminal_seconds,"attemptUsd":terminal_usd,"readSeconds":terminal_seconds,"readUsd":terminal_usd,"taskMetrics":metrics});
     row["deprecated"] = json!(item["deprecated"].as_bool().unwrap_or(false));
     apply_model_quality(&mut row, item);
+    apply_orchestrator_resources(&mut row, item, hosts);
     row
 }
 
@@ -672,6 +779,9 @@ pub fn apply_model_quality(row: &mut Value, item: &Value) {
     row["gpqa"] = item["gpqa"].clone();
     row["hle"] = item["hle"].clone();
     row["lcr"] = item["lcr"].clone();
+    row["omniscienceAccuracy"] = item["omniscienceBreakdown"]["accuracy"].clone();
+    row["omniscienceAttemptRate"] = item["omniscienceBreakdown"]["attemptRate"].clone();
+    row["gdpPdf"] = item["gdpPdfAllPass"].clone();
     row["logic"] = json!(
         item["gpqa"]
             .as_f64()
@@ -722,7 +832,7 @@ pub fn rows_from_payloads(payloads: &Value) -> Result<Vec<Row>> {
                 .split_once('_')
                 .map(|(_, slug)| slug)
                 .unwrap_or("");
-            let model_key = harness_key(label(&raw["display"]["model"]));
+            let model_key = harness_key(&agent_model(raw)?);
             let exact = model_matches
                 .iter()
                 .filter(|model| model.key == model_key)

@@ -54,6 +54,8 @@ param(
     [string] $Version,
     [string] $RemoteHost = 'kanrinin',
     [string] $WebRoot = '/opt/homebrew/var/www/files/aitierlist',
+    [string] $SigningKeyFile = (Join-Path $env:LOCALAPPDATA 'blockitall-update\signing\aitierlist.key'),
+    [string] $UpdaterRoot = (Join-Path (Split-Path $PSScriptRoot -Parent) 'blockitall-update'),
     [switch] $Force,
     [switch] $WhatIf,
     [switch] $AllowUnbound
@@ -62,6 +64,8 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $root = $PSScriptRoot
+. (Join-Path $UpdaterRoot 'scripts\prepare-release.ps1')
+$PublisherBinary = Join-Path $UpdaterRoot 'target\release\blockitall-update.exe'
 $packedExe = Join-Path $root 'target\release\aitierlist.exe'
 $unpackedExe = Join-Path $root 'target\release\aitierlist-unpacked.exe'
 $upx = 'C:\Users\kaltsit\AppData\Local\Microsoft\WinGet\Links\upx.exe'
@@ -535,6 +539,10 @@ function Assert-LiveManifest {
     if ($null -eq $Json) { throw 'the live manifest is empty' }
     $raw = [string]$Json
     if ([string]::IsNullOrWhiteSpace($raw)) { throw 'the live manifest is empty' }
+    if ($Expected -is [string]) {
+        if ($raw -cne $Expected) { throw 'the live manifest bytes differ from the signed release' }
+        return $true
+    }
 
     $expectedArtifacts = @($Expected['artifacts'])
     if ($expectedArtifacts.Count -ne 1) {
@@ -2139,6 +2147,7 @@ Assert-Grammar -Value $remoteDir -Pattern (Get-WebRootGrammar) -What 'release di
 
 # The unpacked build is held against writes and deletion during inspection and
 # copying. The packed copy is held through its smoke test, hash, size and upload.
+$preparation = $null
 $unpacked = [System.IO.File]::Open(
     $packedExe,
     [System.IO.FileMode]::Open,
@@ -2206,12 +2215,25 @@ try {
     Write-Host "  sha256   : $sha"
     Write-Host "  target   : ${RemoteHost}:$remoteDir"
 
-    # The manifest, as bytes, before anything is uploaded. These exact bytes are
-    # what goes up, what is hashed here, and what every check from the stage to
-    # the published file compares against - there is no second serialization
-    # anywhere, and no temporary file for anything to reopen by name.
-    $expectedManifest = New-ReleaseManifest -Version $Version -FileName $fileName -Sha256 $sha -Size $size
-    $manifestDocument = New-ReleaseManifestBytes -Manifest $expectedManifest
+    $preparation = New-BlockItAllSignedRelease -AppId 'aitierlist' -Version $Version `
+        -ArtifactPath $packedExe -FileName $fileName -Kind 'portable' -Architecture 'x64' `
+        -SigningKeyFile $SigningKeyFile -PublisherBinary $PublisherBinary
+    $artifact.Dispose()
+    $artifact = [System.IO.File]::Open(
+        $preparation.ArtifactPath,
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read,
+        [System.IO.FileShare]::Read)
+    $size = $preparation.ArtifactSize
+    $sha = $preparation.ArtifactSha256
+    $manifestBytes = [System.IO.File]::ReadAllBytes($preparation.ManifestPath)
+    $manifestDocument = [pscustomobject]@{
+        Text = [System.Text.UTF8Encoding]::new($false, $true).GetString($manifestBytes)
+        Bytes = $manifestBytes
+        Size = $preparation.ManifestSize
+        Sha256 = $preparation.ManifestSha256
+    }
+    $expectedManifest = $manifestDocument.Text
     Write-Host "  manifest : $($manifestDocument.Size) bytes, sha256 $($manifestDocument.Sha256)"
 
     # A unique staging name per run, local and remote. A fixed `$env:TEMP\aitierlist-update.json`
@@ -2412,5 +2434,8 @@ try {
 finally {
     $artifact.Dispose()
     if ($unpacked -ne $artifact) { $unpacked.Dispose() }
+    if ($null -ne $preparation -and (Test-Path -LiteralPath $preparation.Directory)) {
+        Remove-BlockItAllSignedRelease -Directory $preparation.Directory
+    }
 }
 
