@@ -21,6 +21,7 @@ mod snapshot;
 mod solver;
 mod subscriptions;
 mod team_policy;
+mod theme;
 mod types;
 mod ui;
 mod update;
@@ -299,10 +300,10 @@ fn main() -> eframe::Result<()> {
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/aitierlist.png"))
         .expect("embedded application icon must be a valid PNG");
     let viewport = eframe::egui::ViewportBuilder::default()
-        .with_title("aitierlist")
+        .with_title("AI Tier List")
         .with_icon(icon)
-        .with_inner_size([1280.0, 800.0])
-        .with_min_inner_size([900.0, 600.0]);
+        .with_inner_size([1440.0, 940.0])
+        .with_min_inner_size([900.0, 650.0]);
 
     let options = eframe::NativeOptions {
         viewport,
@@ -314,7 +315,7 @@ fn main() -> eframe::Result<()> {
         "aitierlist",
         options,
         Box::new(|cc| {
-            cc.egui_ctx.set_visuals(eframe::egui::Visuals::dark());
+            theme::apply(&cc.egui_ctx);
             Ok(Box::new(ui::App::new(
                 cc,
                 updater,
