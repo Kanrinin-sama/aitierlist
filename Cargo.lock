@@ -661,6 +661,7 @@ dependencies = [
 [[package]]
 name = "blockitall-update"
 version = "0.1.0"
+source = "git+https://github.com/Kanrinin-sama/blockitall-update.git?rev=4259685e327a06d1fa599d658f06dcccd00ed77a#4259685e327a06d1fa599d658f06dcccd00ed77a"
 dependencies = [
  "anyhow",
  "base64",
