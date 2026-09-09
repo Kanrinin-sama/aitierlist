@@ -37,7 +37,7 @@ Workflow risk should be a vector with explicit triggers:
 | Correlation | same family/harness across creator and checker | require meaningfully distinct checker where valuable |
 | Deadline | slack relative to critical path and reset windows | reserve buffer, reduce scope, or defer |
 
-The four current work classes should become workflow templates selected from this vector rather than inferred mainly from changed-file counts. File count is useful load information, but a one-line authorization defect can be high risk and a twenty-file mechanical rename can be low risk. Templates can remain named Focused, Standard, Complex, and Extensive, yet their triggers should be question and consequence based. Focused covers a bounded question with known sources and reversible output. Standard covers a well-specified task needing one implementation and one check. Complex covers interacting decisions, uncertain diagnosis, or consequential interfaces. Extensive covers open-ended research, broad system design, high consequence, or unresolved scope. The selected template declares mandatory seats, separation requirements, evidence packet size, and escalation rules.
+The four work classes are workflow templates selected from this vector rather than from changed-file counts. File count is useful load information, but a one-line authorization defect can be high risk and a twenty-file mechanical rename can be low risk. Focused covers a bounded question with known sources and reversible output. Standard covers a well-specified task needing one implementation and independent checks. Complex covers interacting decisions, uncertain diagnosis, or consequential interfaces. Extensive covers open-ended research, broad system design, high consequence, or unresolved scope. The selected template declares its required stages and escalation rules.
 
 ## Native allocation specification
 
@@ -102,7 +102,7 @@ Online learning is necessary because route quality and consumption are uncertain
 
 ## Receding-horizon dispatcher
 
-A weekly static plan should become the initial horizon, not the runtime truth. Replan on each material event: job arrival, scope or risk change, stage completion, rejection, consumption settlement, native meter snapshot, reset, deadline change, route failure, host loss, or verified capability change. Freeze work already started and immutable outputs already produced. Re-optimize the remaining ready queue, holds, conditional stages, and future capacity.
+The weekly static plan is an initial horizon rather than runtime truth. Runtime replans on each material event: job arrival, scope or risk change, stage completion, rejection, consumption settlement, native meter snapshot, reset, deadline change, route failure, host loss, or verified capability change. Work already started and immutable outputs already produced remain fixed while the remaining ready queue, holds, conditional stages, and future capacity are reconsidered.
 
 The plan is a predetermined conditional policy: for a given job and observed state, it chooses one action. The readable table and generated Markdown are versioned views of that policy with the same stable IDs. They are not free-choice menus or round-robin suggestions. Future jobs, costs, meter states, and availability remain unknown, so the policy relies on receding-horizon replanning rather than an omniscient weekly timeline.
 
@@ -131,7 +131,7 @@ Agent-system scaling research finds that more agents help decomposable work but 
 
 ## Net Research as a seventh seat
 
-Net Research should be a first-class seat, not an incidental tool available to whichever worker happens to browse. Its route bundle includes exact model, effort, harness, tools, authorization, network policy, source scope, browser or fetch capability, citation requirements, and billing account. The seat produces a compact evidence packet consumed by comprehension, implementation, review, or the conductor. When it resolves facts already needed by comprehension or planning, its consumption replaces that unknown-resolution labor; it is not a blanket additive visit for every change. A one-line external documentation correction can require research, while a large internal refactor with authoritative local context may require none.
+Net Research is a first-class seat rather than an incidental tool available to whichever worker happens to browse. Its route bundle includes exact model, effort, harness, tools, authorization, network policy, source scope, browser or fetch capability, citation requirements, and billing account. The seat produces a compact evidence packet consumed by comprehension, implementation, review, or the conductor. When it resolves facts already needed by comprehension or planning, its consumption replaces that unknown-resolution labor; it is not a blanket additive visit for every change. A one-line external documentation correction can require research, while a large internal refactor with authoritative local context may require none.
 
 Research complexity should be based on the question, not file count:
 
