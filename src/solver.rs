@@ -1,3 +1,6 @@
+use std::cmp::{Ordering, Reverse};
+use std::collections::BinaryHeap;
+
 #[derive(Clone)]
 pub struct Choice {
     pub quality: f64,
@@ -23,13 +26,113 @@ pub struct Outcome<T> {
     pub solution: Option<Solution<T>>,
     pub bound: Option<f64>,
     pub proven: bool,
-    pub nodes: usize,
     pub limitation: Option<&'static str>,
+}
+
+pub struct SolverState<T> {
+    pending: BinaryHeap<QueuedNode>,
+    cuts: Vec<Vec<usize>>,
+    incumbent: Option<Solution<T>>,
+    nodes: usize,
+    numerical_limit: Option<f64>,
+    limitation: Option<&'static str>,
+    next_order: usize,
+    neighborhood_remaining: usize,
+}
+
+impl<T> SolverState<T> {
+    pub fn has_solution(&self) -> bool {
+        self.incumbent.is_some()
+    }
+
+    pub fn proven(&self) -> bool {
+        self.pending.is_empty() && self.numerical_limit.is_none()
+    }
+
+    pub fn nodes(&self) -> usize {
+        self.nodes
+    }
+
+    pub fn limitation(&self) -> Option<&'static str> {
+        self.limitation
+    }
+
+    pub fn can_advance(&self) -> bool {
+        !self.pending.is_empty()
+    }
 }
 
 struct Node {
     fixed: Vec<Option<usize>>,
     bound: f64,
+}
+
+struct QueuedNode {
+    node: Node,
+    depth: usize,
+    order: usize,
+}
+
+impl PartialEq for QueuedNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for QueuedNode {}
+
+impl PartialOrd for QueuedNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for QueuedNode {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.node
+            .bound
+            .total_cmp(&other.node.bound)
+            .then_with(|| self.depth.cmp(&other.depth))
+            .then_with(|| other.order.cmp(&self.order))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CoupledMove {
+    first_group: usize,
+    first_choice: usize,
+    second_group: usize,
+    second_choice: usize,
+    quality_delta: f64,
+    time_delta: f64,
+    cost_delta: f64,
+}
+
+impl PartialEq for CoupledMove {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for CoupledMove {}
+
+impl PartialOrd for CoupledMove {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CoupledMove {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.quality_delta
+            .total_cmp(&other.quality_delta)
+            .then_with(|| other.time_delta.total_cmp(&self.time_delta))
+            .then_with(|| other.cost_delta.total_cmp(&self.cost_delta))
+            .then_with(|| other.first_group.cmp(&self.first_group))
+            .then_with(|| other.first_choice.cmp(&self.first_choice))
+            .then_with(|| other.second_group.cmp(&self.second_group))
+            .then_with(|| other.second_choice.cmp(&self.second_choice))
+    }
 }
 
 struct Relaxation {
@@ -335,6 +438,121 @@ fn improve<T>(
     }
 }
 
+fn improve_coupled<T>(
+    problem: &Problem,
+    incumbent: &mut Option<Solution<T>>,
+    evaluation_limit: usize,
+    evaluate: &mut impl FnMut(&[usize]) -> Option<T>,
+) {
+    let mut remaining = evaluation_limit;
+    while remaining > 0 {
+        let Some(current) = incumbent.as_ref() else {
+            return;
+        };
+        let choices = current.choices.clone();
+        let mut baseline_resources = vec![0.0; problem.capacities.len()];
+        for (group, choice) in problem.groups.iter().zip(&choices) {
+            for (total, usage) in baseline_resources.iter_mut().zip(&group[*choice].resources) {
+                *total += usage;
+            }
+        }
+        let mut moves = BinaryHeap::new();
+        for first_group in 0..problem.groups.len() {
+            let first_existing = &problem.groups[first_group][choices[first_group]];
+            for second_group in first_group + 1..problem.groups.len() {
+                let second_existing = &problem.groups[second_group][choices[second_group]];
+                for (first_choice, first) in problem.groups[first_group].iter().enumerate() {
+                    if first_choice == choices[first_group] {
+                        continue;
+                    }
+                    for (second_choice, second) in problem.groups[second_group].iter().enumerate() {
+                        if second_choice == choices[second_group] {
+                            continue;
+                        }
+                        let quality_delta = first.quality + second.quality
+                            - first_existing.quality
+                            - second_existing.quality;
+                        let time_delta = first.nominal_time + second.nominal_time
+                            - first_existing.nominal_time
+                            - second_existing.nominal_time;
+                        let cost_delta = first.nominal_cost + second.nominal_cost
+                            - first_existing.nominal_cost
+                            - second_existing.nominal_cost;
+                        if quality_delta < -1e-8
+                            || (quality_delta.abs() <= 1e-8
+                                && (time_delta > 1e-8
+                                    || (time_delta.abs() <= 1e-8 && cost_delta >= -1e-8)))
+                        {
+                            continue;
+                        }
+                        if baseline_resources
+                            .iter()
+                            .zip(&first_existing.resources)
+                            .zip(&second_existing.resources)
+                            .zip(&first.resources)
+                            .zip(&second.resources)
+                            .zip(&problem.capacities)
+                            .any(
+                                |(
+                                    ((((total, first_old), second_old), first_new), second_new),
+                                    cap,
+                                )| {
+                                    total - first_old - second_old + first_new + second_new
+                                        > cap + 1e-8
+                                },
+                            )
+                        {
+                            continue;
+                        }
+                        let candidate = CoupledMove {
+                            first_group,
+                            first_choice,
+                            second_group,
+                            second_choice,
+                            quality_delta,
+                            time_delta,
+                            cost_delta,
+                        };
+                        if moves.len() < remaining {
+                            moves.push(Reverse(candidate));
+                        } else if moves.peek().is_some_and(|worst| candidate > worst.0) {
+                            moves.pop();
+                            moves.push(Reverse(candidate));
+                        }
+                    }
+                }
+            }
+        }
+        let mut ranked: Vec<_> = moves.into_iter().map(|entry| entry.0).collect();
+        ranked.sort_by(|left, right| right.cmp(left));
+        let mut improved = false;
+        for movement in ranked {
+            let mut next = choices.clone();
+            next[movement.first_group] = movement.first_choice;
+            next[movement.second_group] = movement.second_choice;
+            remaining -= 1;
+            let Some(solution) = candidate(problem, next, evaluate) else {
+                continue;
+            };
+            if incumbent.as_ref().is_some_and(|best| {
+                better(
+                    solution.quality,
+                    solution.nominal_time,
+                    solution.nominal_cost,
+                    best,
+                )
+            }) {
+                *incumbent = Some(solution);
+                improved = true;
+                break;
+            }
+        }
+        if !improved {
+            return;
+        }
+    }
+}
+
 fn resource_score(choice: &Choice, capacities: &[f64]) -> f64 {
     choice
         .resources
@@ -411,18 +629,21 @@ fn repair(problem: &Problem, mut choices: Vec<usize>, fixed: &[Option<usize>]) -
     choices
 }
 
-pub fn solve<T>(
+pub fn begin<T>(
     problem: &Problem,
-    node_limit: usize,
+    neighborhood_limit: usize,
     mut evaluate: impl FnMut(&[usize]) -> Option<T>,
-) -> Outcome<T> {
+) -> SolverState<T> {
     if problem.groups.iter().any(Vec::is_empty) {
-        return Outcome {
-            solution: None,
-            bound: None,
-            proven: true,
+        return SolverState {
+            pending: BinaryHeap::new(),
+            cuts: Vec::new(),
+            incumbent: None,
             nodes: 0,
+            numerical_limit: None,
             limitation: None,
+            next_order: 0,
+            neighborhood_remaining: neighborhood_limit,
         };
     }
     let initial_bound = problem
@@ -435,11 +656,15 @@ pub fn solve<T>(
                 .fold(0.0, f64::max)
         })
         .sum();
-    let mut pending = vec![Node {
-        fixed: vec![None; problem.groups.len()],
-        bound: initial_bound,
-    }];
-    let mut incumbent: Option<Solution<T>> = None;
+    let pending = BinaryHeap::from([QueuedNode {
+        node: Node {
+            fixed: vec![None; problem.groups.len()],
+            bound: initial_bound,
+        },
+        depth: 0,
+        order: 0,
+    }]);
+    let mut incumbent = None;
     for criterion in 0..3 {
         let choices = problem
             .groups
@@ -476,30 +701,66 @@ pub fn solve<T>(
             incumbent = Some(solution);
         }
     }
-    improve(problem, &mut incumbent, &mut evaluate);
-    let mut cuts = Vec::new();
-    let mut nodes = 0;
-    let mut numerical_limit = None;
-    let mut limitation = None;
-    while nodes < node_limit {
-        let Some(node) = pending.pop() else { break };
-        if incumbent
+    SolverState {
+        pending,
+        cuts: Vec::new(),
+        incumbent,
+        nodes: 0,
+        numerical_limit: None,
+        limitation: None,
+        next_order: 1,
+        neighborhood_remaining: neighborhood_limit,
+    }
+}
+
+pub fn advance<T>(
+    problem: &Problem,
+    state: &mut SolverState<T>,
+    additional_nodes: usize,
+    stop_on_feasible: bool,
+    mut evaluate: impl FnMut(&[usize]) -> Option<T>,
+) {
+    if !stop_on_feasible && state.neighborhood_remaining > 0 {
+        improve(problem, &mut state.incumbent, &mut evaluate);
+        improve_coupled(
+            problem,
+            &mut state.incumbent,
+            state.neighborhood_remaining,
+            &mut evaluate,
+        );
+        state.neighborhood_remaining = 0;
+    }
+    let target = state.nodes.saturating_add(additional_nodes);
+    while state.nodes < target {
+        if stop_on_feasible && state.incumbent.is_some() {
+            break;
+        }
+        let Some(queued) = state.pending.pop() else {
+            break;
+        };
+        let node = queued.node;
+        if state
+            .incumbent
             .as_ref()
             .is_some_and(|best| node.bound < best.quality - 1e-8)
         {
             continue;
         }
-        nodes += 1;
-        let relaxation = match relax(problem, &node.fixed, &cuts) {
+        state.nodes += 1;
+        let relaxation = match relax(problem, &node.fixed, &state.cuts) {
             Ok(Some(relaxation)) => relaxation,
             Ok(None) => continue,
             Err(reason) => {
-                numerical_limit = Some(node.bound);
-                limitation = Some(reason);
+                state.numerical_limit = Some(
+                    state
+                        .numerical_limit
+                        .map_or(node.bound, |bound| bound.max(node.bound)),
+                );
+                state.limitation = Some(reason);
                 break;
             }
         };
-        if incumbent.as_ref().is_some_and(|best| {
+        if state.incumbent.as_ref().is_some_and(|best| {
             !better(
                 relaxation.quality,
                 relaxation.nominal_time,
@@ -535,10 +796,10 @@ pub fn solve<T>(
                 values_left[choices[*left]].total_cmp(&values_right[choices[*right]])
             })
             .map(|(group, _)| group);
-        if fractional.is_some() && (nodes == 1 || nodes % 16 == 0) {
+        if fractional.is_some() && (state.nodes == 1 || state.nodes.is_multiple_of(16)) {
             let repaired = repair(problem, choices.clone(), &node.fixed);
             if let Some(solution) = candidate(problem, repaired, &mut evaluate)
-                && incumbent.as_ref().is_none_or(|best| {
+                && state.incumbent.as_ref().is_none_or(|best| {
                     better(
                         solution.quality,
                         solution.nominal_time,
@@ -547,11 +808,11 @@ pub fn solve<T>(
                     )
                 })
             {
-                incumbent = Some(solution);
+                state.incumbent = Some(solution);
             }
         }
         if let Some(solution) = candidate(problem, choices.clone(), &mut evaluate) {
-            if incumbent.as_ref().is_none_or(|best| {
+            if state.incumbent.as_ref().is_none_or(|best| {
                 better(
                     solution.quality,
                     solution.nominal_time,
@@ -559,17 +820,22 @@ pub fn solve<T>(
                     best,
                 )
             }) {
-                incumbent = Some(solution);
+                state.incumbent = Some(solution);
             }
             if fractional.is_none() {
                 continue;
             }
         } else if fractional.is_none() {
-            cuts.push(choices);
-            pending.push(Node {
-                fixed: node.fixed,
-                bound: relaxation.quality,
+            state.cuts.push(choices);
+            state.pending.push(QueuedNode {
+                node: Node {
+                    fixed: node.fixed,
+                    bound: relaxation.quality,
+                },
+                depth: queued.depth,
+                order: state.next_order,
             });
+            state.next_order += 1;
             continue;
         }
         let Some(group) = fractional else { continue };
@@ -584,28 +850,35 @@ pub fn solve<T>(
                 })
                 .then_with(|| left.cmp(right))
         });
-        for choice in candidates.into_iter().rev() {
+        for choice in candidates {
             let mut fixed = node.fixed.clone();
             fixed[group] = Some(choice);
-            pending.push(Node {
-                fixed,
-                bound: relaxation.quality,
+            state.pending.push(QueuedNode {
+                node: Node {
+                    fixed,
+                    bound: relaxation.quality,
+                },
+                depth: queued.depth + 1,
+                order: state.next_order,
             });
+            state.next_order += 1;
         }
     }
-    improve(problem, &mut incumbent, &mut evaluate);
-    let proven = pending.is_empty() && numerical_limit.is_none();
-    let bound = pending
+}
+
+pub fn finish<T>(state: SolverState<T>) -> Outcome<T> {
+    let proven = state.pending.is_empty() && state.numerical_limit.is_none();
+    let bound = state
+        .pending
         .iter()
-        .map(|node| node.bound)
-        .chain(numerical_limit)
-        .chain(incumbent.as_ref().map(|solution| solution.quality))
+        .map(|queued| queued.node.bound)
+        .chain(state.numerical_limit)
+        .chain(state.incumbent.as_ref().map(|solution| solution.quality))
         .reduce(f64::max);
     Outcome {
-        solution: incumbent,
+        solution: state.incumbent,
         bound,
         proven,
-        nodes,
-        limitation,
+        limitation: state.limitation,
     }
 }

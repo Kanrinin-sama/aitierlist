@@ -1,6 +1,6 @@
 use crate::engine::{self, DispatchCycle};
 use crate::settings::Settings;
-use crate::solver::{self, Choice, Outcome, Problem};
+use crate::solver::{self, Choice, Problem};
 use crate::subscriptions;
 use crate::types::{Row, Seat};
 use serde::{Deserialize, Serialize};
@@ -568,7 +568,8 @@ struct Schedule {
 
 struct Search {
     groups: Vec<Group>,
-    outcome: Outcome<Schedule>,
+    problem: Problem,
+    state: solver::SolverState<Schedule>,
     count: usize,
 }
 
@@ -1009,7 +1010,17 @@ fn search(
         groups: choices,
         capacities,
     };
-    let outcome = solver::solve(&problem, limit, |choices| {
+    let mut state = solver::begin(&problem, limit, |choices| {
+        schedule(
+            &groups,
+            choices,
+            &sequence[..count],
+            pools,
+            hours,
+            research_classes,
+        )
+    });
+    solver::advance(&problem, &mut state, limit, true, |choices| {
         schedule(
             &groups,
             choices,
@@ -1021,7 +1032,8 @@ fn search(
     });
     Search {
         groups,
-        outcome,
+        problem,
+        state,
         count,
     }
 }
@@ -1725,7 +1737,6 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
         .collect();
     seed_class_recommendations(&mut portfolio, &candidates, rows, settings.agent_hours);
     let mut nodes = 0;
-    let mut unresolved = false;
     let initial = search(
         forecast,
         &sequence,
@@ -1734,12 +1745,18 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
         settings,
         256,
     );
-    nodes += initial.outcome.nodes;
-    let mut numerical_failure = initial.outcome.limitation;
-    let mut best = if initial.outcome.solution.is_some() {
+    nodes += initial.state.nodes();
+    let mut numerical_failure = initial.state.limitation();
+    let mut smallest_proven_infeasible = None;
+    let mut unresolved_states = Vec::new();
+    let mut best = if initial.state.has_solution() {
         Some(initial)
     } else {
-        unresolved |= !initial.outcome.proven;
+        if initial.state.proven() {
+            smallest_proven_infeasible = Some(forecast);
+        } else {
+            unresolved_states.push(initial);
+        }
         None
     };
     if best.is_none() {
@@ -1755,24 +1772,104 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
                 settings,
                 (SEARCH_NODES - nodes).min(256),
             );
-            nodes += result.outcome.nodes;
-            if let Some(reason) = result.outcome.limitation {
+            nodes += result.state.nodes();
+            if let Some(reason) = result.state.limitation() {
                 numerical_failure.get_or_insert(reason);
             }
-            if result.outcome.solution.is_some() {
+            if result.state.has_solution() {
                 lower = count;
                 best = Some(result);
             } else {
-                unresolved |= !result.outcome.proven || result.outcome.limitation.is_some();
+                if result.state.proven() {
+                    smallest_proven_infeasible = Some(
+                        smallest_proven_infeasible.map_or(count, |known: usize| known.min(count)),
+                    );
+                } else {
+                    unresolved_states.push(result);
+                }
                 upper = count;
             }
         }
-        if lower + 1 < upper {
-            unresolved = true;
+    }
+    while nodes < SEARCH_NODES {
+        let admitted = best.as_ref().map_or(0, |state| state.count);
+        let upper = smallest_proven_infeasible.unwrap_or(forecast.saturating_add(1));
+        if admitted >= forecast || admitted.saturating_add(1) >= upper {
+            break;
+        }
+        unresolved_states.retain(|state| state.count > admitted && state.count < upper);
+        let existing = unresolved_states
+            .iter()
+            .enumerate()
+            .filter(|(_, state)| state.state.can_advance())
+            .min_by_key(|(_, state)| state.count)
+            .map(|(index, _)| index);
+        let (mut pending, counted) = if let Some(index) = existing {
+            (unresolved_states.remove(index), true)
+        } else {
+            let midpoint = (admitted + upper) / 2;
+            let Some(count) = (admitted + 1..upper)
+                .filter(|count| unresolved_states.iter().all(|state| state.count != *count))
+                .min_by_key(|count| (count.abs_diff(midpoint), *count))
+            else {
+                break;
+            };
+            (
+                search(
+                    count,
+                    &sequence,
+                    &candidates,
+                    &portfolio.pools,
+                    settings,
+                    (SEARCH_NODES - nodes).min(256),
+                ),
+                false,
+            )
+        };
+        let previous_nodes = pending.state.nodes();
+        if counted {
+            solver::advance(
+                &pending.problem,
+                &mut pending.state,
+                (SEARCH_NODES - nodes).min(256),
+                true,
+                |choices| {
+                    schedule(
+                        &pending.groups,
+                        choices,
+                        &sequence[..pending.count],
+                        &portfolio.pools,
+                        settings.agent_hours,
+                        &settings.research_classes,
+                    )
+                },
+            );
+        }
+        let progressed = if counted {
+            pending.state.nodes().saturating_sub(previous_nodes)
+        } else {
+            pending.state.nodes()
+        };
+        nodes += progressed;
+        if let Some(reason) = pending.state.limitation() {
+            numerical_failure.get_or_insert(reason);
+        }
+        if pending.state.has_solution() {
+            best = Some(pending);
+        } else if pending.state.proven() {
+            smallest_proven_infeasible = Some(
+                smallest_proven_infeasible.map_or(pending.count, |known| known.min(pending.count)),
+            );
+        } else {
+            unresolved_states.push(pending);
         }
     }
-    portfolio.dispatch.solver.nodes = nodes;
-    let Some(best) = best else {
+    let Some(mut best) = best else {
+        let unresolved = smallest_proven_infeasible != Some(1);
+        if !unresolved {
+            numerical_failure = None;
+        }
+        portfolio.dispatch.solver.nodes = nodes;
         portfolio.dispatch.solver.status = if numerical_failure.is_some() {
             "solver_failure"
         } else if unresolved {
@@ -1794,8 +1891,38 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
         adaptive_routes(&mut portfolio, &candidates, rows);
         return Some(portfolio);
     };
-    let solution = best.outcome.solution.expect("selected dispatch solution");
-    let proven = best.outcome.proven && !unresolved;
+    let remaining = SEARCH_NODES.saturating_sub(nodes);
+    {
+        let previous_nodes = best.state.nodes();
+        solver::advance(
+            &best.problem,
+            &mut best.state,
+            remaining,
+            false,
+            |choices| {
+                schedule(
+                    &best.groups,
+                    choices,
+                    &sequence[..best.count],
+                    &portfolio.pools,
+                    settings.agent_hours,
+                    &settings.research_classes,
+                )
+            },
+        );
+        nodes += best.state.nodes().saturating_sub(previous_nodes);
+    }
+    let admission_proven =
+        best.count == forecast || smallest_proven_infeasible == Some(best.count.saturating_add(1));
+    let outcome = solver::finish(best.state);
+    numerical_failure = if admission_proven {
+        outcome.limitation
+    } else {
+        outcome.limitation.or(numerical_failure)
+    };
+    portfolio.dispatch.solver.nodes = nodes;
+    let solution = outcome.solution.expect("selected dispatch solution");
+    let proven = outcome.proven && admission_proven;
     portfolio.dispatch.admitted_changes = best.count;
     portfolio.dispatch.deferred_changes = forecast - best.count;
     portfolio.dispatch.executable = true;
@@ -1815,8 +1942,8 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
     .to_owned();
     portfolio.dispatch.solver.proven_optimal = proven;
     portfolio.dispatch.solver.quality = solution.quality;
-    portfolio.dispatch.solver.bound = best.outcome.bound;
-    portfolio.dispatch.solver.relative_gap = best.outcome.bound.map(|bound| {
+    portfolio.dispatch.solver.bound = outcome.bound;
+    portfolio.dispatch.solver.relative_gap = outcome.bound.map(|bound| {
         ((bound - solution.quality).max(0.0) / solution.quality.max(f64::MIN_POSITIVE)).max(0.0)
     });
     portfolio.dispatch.solver.message = if proven {
