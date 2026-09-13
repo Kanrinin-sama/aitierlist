@@ -1007,7 +1007,7 @@ impl App {
                                 .unwrap_or_else(|| format!("Row #{}", scenario.row_index));
                             ui.label(format!(
                                 "{}: autonomous-capacity leader {} MAX {} at {:.1}; selected policy {:.1} agent completions/week ({:.1}% shortfall)",
-                                scenario.name,
+                                format_args!("{} · {}", scenario.name, scenario.capacity_basis),
                                 leader,
                                 scenario.attempt_limit,
                                 scenario.tasks_per_week,
@@ -2285,10 +2285,11 @@ impl App {
                         );
                     }
                     for window in &pool.rate_windows {
-                        let ceiling = window.ceiling_per_hour.map(|rate| format!("{rate:.4} {}/h", window.unit.label())).unwrap_or_else(|| "unknown / reference".to_owned());
-                        ui.label(format!("{} · {}{} · {ceiling} · {}", pool.plan_name, window.window_id, if window.binding { " (tightest in scope)" } else { "" }, window.status));
+                        let ceiling = window.ceiling_per_hour.map(|rate| format!("{:.2} committed / {:.2} {} cap", window.known_committed_amount, rate * window.commitment_hours, window.unit.label())).unwrap_or_else(|| "cap unknown / reference".to_owned());
+                        ui.label(format!("{} · {}{} · {ceiling} · {}", pool.plan_name, window.window_id, if window.binding { " (tightest known constraint)" } else { "" }, window.status));
                     }
                 }
+                ui.label(format!("T_path: {} iterations · {}", dispatch.path_iterations, dispatch.path_status));
                 for assumption in &portfolio.assumptions {
                     ui.label(assumption);
                 }

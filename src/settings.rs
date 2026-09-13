@@ -132,14 +132,19 @@ impl Settings {
 
     pub fn normalize(mut self) -> Self {
         self.subscriptions.retain(|provider_id, plan_id| {
-            crate::subscriptions::PROVIDERS.iter().any(|provider| {
-                provider.id == provider_id && provider.plans.iter().any(|plan| plan.id == plan_id)
-            })
+            crate::subscriptions::PROVIDERS
+                .iter()
+                .chain(crate::subscriptions::RANKING_PRIORS)
+                .any(|provider| {
+                    provider.id == provider_id
+                        && provider.plans.iter().any(|plan| plan.id == plan_id)
+                })
         });
         self.subscription_counts.retain(|provider_id, count| {
             *count > 0
                 && crate::subscriptions::PROVIDERS
                     .iter()
+                    .chain(crate::subscriptions::RANKING_PRIORS)
                     .any(|provider| provider.id == provider_id)
         });
         let defaults = Self::default();

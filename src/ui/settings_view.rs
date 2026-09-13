@@ -156,7 +156,10 @@ impl super::App {
         let mut changed = false;
         let mut monthly_spend = 0.0;
         let mut estimated_price = false;
-        for provider in crate::subscriptions::PROVIDERS {
+        for provider in crate::subscriptions::PROVIDERS
+            .iter()
+            .chain(crate::subscriptions::RANKING_PRIORS)
+        {
             let mut selected = self
                 .settings
                 .subscriptions
@@ -245,10 +248,10 @@ impl super::App {
                     plan.monthly_price * self.settings.subscription_count(provider.id) as f64;
                 estimated_price |= plan.price_is_estimate;
                 ui.label("Plan windows");
-                ui.colored_label(theme::MUTED, "Short and native-unit windows are stored and displayed, but not enforced. Blank overrides use the table; a plan-window override takes precedence over the vendor weekly override.");
+                ui.colored_label(theme::MUTED, "Every known non-reference window constrains measured demand in its own unit. Native counts remain unknown until measured. Blank overrides use the table; a plan-window override takes precedence over the vendor weekly override.");
                 let windows = plan.resolved_windows(provider.id, &self.settings);
                 for (definition, window) in plan.windows.iter().zip(&windows) {
-                    ui.label(window.summary(&windows));
+                    ui.label(window.summary(&windows, self.settings.agent_hours));
                     ui.horizontal(|ui| {
                         if !window.source_url.is_empty() {
                             ui.hyperlink_to("Source", &window.source_url);

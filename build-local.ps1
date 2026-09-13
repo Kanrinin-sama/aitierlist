@@ -157,19 +157,32 @@ Wait-ForExecutableUnlock $normalExecutable $ShutdownTimeoutSeconds
 
 $manifest = Join-Path $root 'Cargo.toml'
 $target = Join-Path $root 'target'
-Push-Location -LiteralPath $root
-try {
-    & $cargo fmt --all --manifest-path $manifest
-    if ($LASTEXITCODE -ne 0) { throw "cargo fmt failed with exit code $LASTEXITCODE" }
-    & $cargo clippy --manifest-path $manifest --all-targets --offline --target-dir $target -- -D warnings
-    if ($LASTEXITCODE -ne 0) { throw "cargo clippy failed with exit code $LASTEXITCODE" }
-    & $cargo build --manifest-path $manifest --release --offline --target-dir $target
-    if ($LASTEXITCODE -ne 0) { throw "cargo release build failed with exit code $LASTEXITCODE" }
+function Invoke-BuildStep([string[]] $Arguments) {
+    $info = [System.Diagnostics.ProcessStartInfo]::new()
+    $info.FileName = $cargo
+    $info.WorkingDirectory = $root
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.RedirectStandardInput = $true
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    foreach ($argument in $Arguments) {
+        [void] $info.ArgumentList.Add($argument)
+    }
+    $process = [System.Diagnostics.Process]::Start($info)
+    $output = $process.StandardOutput.ReadToEndAsync()
+    $errorOutput = $process.StandardError.ReadToEndAsync()
+    $process.WaitForExit()
+    $stdout = $output.GetAwaiter().GetResult()
+    $stderr = $errorOutput.GetAwaiter().GetResult()
+    if ($process.ExitCode -ne 0) {
+        throw "$cargo $Arguments failed with exit code $($process.ExitCode):$([Environment]::NewLine)$stdout$stderr"
+    }
+    $process.Dispose()
 }
-finally {
-    Pop-Location
-}
-
+Invoke-BuildStep @('fmt', '--all', '--manifest-path', $manifest)
+Invoke-BuildStep @('clippy', '--manifest-path', $manifest, '--all-targets', '--offline', '--target-dir', $target, '--', '-D', 'warnings')
+Invoke-BuildStep @('build', '--manifest-path', $manifest, '--release', '--offline', '--target-dir', $target)
 $application = Start-Process -FilePath $normalExecutable `
     -WorkingDirectory (Split-Path $normalExecutable -Parent) -WindowStyle Normal -PassThru
 $deadline = [DateTime]::UtcNow.AddSeconds($StartupTimeoutSeconds)

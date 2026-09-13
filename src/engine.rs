@@ -792,7 +792,12 @@ pub(crate) fn dispatch_cycles(
                 nominal_seconds: nominal[index].agent_seconds,
                 reserved_usage: (index + 1) as f64 * full_usage * stress,
                 reserved_seconds: (index + 1) as f64 * token_seconds.max(pooled_seconds) * stress,
-                native_demand: crate::types::CapacityDemand::default(),
+                native_demand: crate::types::CapacityDemand {
+                    api_equivalent_usd: None,
+                    requests: None,
+                    prompts: None,
+                    messages: None,
+                },
                 reference_completion: reference_completion[index],
             })
             .collect(),
@@ -817,7 +822,12 @@ pub(crate) fn orchestrator_dispatch_cycle(row: &Row, settings: &Settings) -> Opt
         nominal_seconds: cycle.wall,
         reserved_usage: cycle.model_spend * stress,
         reserved_seconds: cycle.wall * stress,
-        native_demand: crate::types::CapacityDemand::default(),
+        native_demand: crate::types::CapacityDemand {
+            api_equivalent_usd: None,
+            requests: None,
+            prompts: None,
+            messages: None,
+        },
         reference_completion: [None; 3],
     })
 }
@@ -891,7 +901,6 @@ struct Policy {
     row_index: usize,
     competence: Option<f64>,
     range: (f64, f64),
-    calls: bool,
     limit: usize,
     cycle: Cycle,
     nominal: f64,
@@ -1046,7 +1055,9 @@ fn analyze(
                     settings,
                     crate::types::CapacityDemand {
                         api_equivalent_usd: Some(cycle.model_spend),
-                        ..crate::types::CapacityDemand::default()
+                        requests: None,
+                        prompts: None,
+                        messages: None,
                     },
                     cycle.agent_seconds / 3600.0,
                     crate::subscriptions::is_fable(row),
@@ -1061,7 +1072,6 @@ fn analyze(
                     row_index,
                     competence: Some(competence),
                     range,
-                    calls: false,
                     limit: index + 1,
                     cycle,
                     nominal,
@@ -1104,14 +1114,7 @@ fn analyze(
                     let cycles = cached[policy.row_index]
                         .as_ref()
                         .expect("eligible policy has complete scenario resources");
-                    let range = if policy.calls {
-                        (
-                            policy.range.0 * assumptions.model_cost,
-                            policy.range.1 * assumptions.model_cost,
-                        )
-                    } else {
-                        policy.range
-                    };
+                    let range = policy.range;
                     tasks(
                         cycles[policy.limit - 1],
                         tier,
@@ -1367,9 +1370,10 @@ fn analyze(
                 })
                 .unwrap_or(selected);
             ScenarioPick {
-                name: format!(
-                    "{} · selected capacity: {} · comparator capacity: {}",
-                    definition.name,
+                name: definition.name.to_owned(),
+                id: definition.name.to_owned(),
+                capacity_basis: format!(
+                    "selected capacity: {} · comparator capacity: {}",
                     capacity_basis(&rows[policies[selected].row_index].vendor, budget, settings),
                     capacity_basis(&rows[policies[winner].row_index].vendor, budget, settings)
                 ),

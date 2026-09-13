@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::engine::{Allowance, ResourceAdjustment, plan_for, rank_seat};
+use crate::engine::{ResourceAdjustment, rank_seat};
 use crate::settings::Settings;
 use crate::types::{Pick, Row, Seat, Table, Tier};
 
@@ -70,7 +70,7 @@ fn same(left: f64, right: f64) -> bool {
 fn scenario_capacities(pick: &Pick) -> Vec<(&str, f64)> {
     pick.scenarios
         .iter()
-        .map(|scenario| (scenario.name.as_str(), scenario.selected_tasks_per_week))
+        .map(|scenario| (scenario.id.as_str(), scenario.selected_tasks_per_week))
         .collect()
 }
 
@@ -94,12 +94,12 @@ pub fn plan_comparisons(table: &Table) -> Vec<PlanComparison> {
                         right
                             .scenarios
                             .iter()
-                            .any(|right_scenario| right_scenario.name == left_scenario.name)
+                            .any(|right_scenario| right_scenario.id == left_scenario.id)
                     })
                     || !right.scenarios.iter().all(|right_scenario| {
                         left.scenarios
                             .iter()
-                            .any(|left_scenario| left_scenario.name == right_scenario.name)
+                            .any(|left_scenario| left_scenario.id == right_scenario.id)
                     })
                 {
                     continue;
@@ -111,7 +111,7 @@ pub fn plan_comparisons(table: &Table) -> Vec<PlanComparison> {
                         right
                             .scenarios
                             .iter()
-                            .find(|scenario| scenario.name == *name)
+                            .find(|scenario| scenario.id == *name)
                             .map(|scenario| scenario.selected_tasks_per_week - left_capacity)
                     })
                     .collect();
@@ -381,33 +381,11 @@ pub fn compare_candidate(
             ),
         };
     };
-    let cost_not_applicable = tier == Tier::Api
-        || (settings
-            .vendor_overrides
-            .get(&rows[row_index].vendor)
-            .copied()
-            .flatten()
-            .is_none()
-            && matches!(
-                plan_for(
-                    &rows[row_index].vendor,
-                    match tier {
-                        Tier::Api => -1.0,
-                        Tier::T200 => settings.plan_prices.t200,
-                        Tier::T100 => settings.plan_prices.t100,
-                        Tier::T20 => settings.plan_prices.t20,
-                    }
-                ),
-                Some(Allowance::Calls(_))
-            ));
+    let cost_not_applicable = tier == Tier::Api;
     let cost_not_applicable_threshold = || {
         threshold(
             ImprovementStatus::NotApplicable,
-            if tier == Tier::Api {
-                "API selection is not constrained by subscription allowance"
-            } else {
-                "Native call quotas scale with the modeled call price"
-            },
+            "API selection is not constrained by subscription allowance",
         )
     };
     if baseline_pick.row_index == row_index {

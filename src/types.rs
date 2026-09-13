@@ -152,7 +152,6 @@ pub struct Row {
     pub hle: Option<f64>,
     pub task_metrics: Vec<TaskMetric>,
     pub retry: crate::retry::RowRetry,
-    pub usd_per_step: Option<f64>,
     pub speed: Option<f64>,
     pub orchestrator_usd: Option<f64>,
     pub orchestrator_seconds: Option<f64>,
@@ -242,6 +241,10 @@ pub struct CandidatePick {
 #[serde(rename_all = "camelCase")]
 pub struct ScenarioPick {
     pub name: String,
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub capacity_basis: String,
     pub row_index: usize,
     pub tasks_per_week: f64,
     pub selected_tasks_per_week: f64,
@@ -463,6 +466,8 @@ pub struct CapacityWindow<S = String> {
     pub unit: CapacityUnit,
     pub cap: WindowCap,
     pub reset: WindowReset,
+    #[serde(default)]
+    pub reset_at: Option<S>,
     pub basis: CapacityBasis,
     pub reset_basis: CapacityBasis,
     pub source_url: S,
@@ -490,19 +495,23 @@ impl CapacityDemand {
 }
 
 impl WindowReset {
-    pub fn duration_hours(self) -> Option<f64> {
+    pub fn is_budget(self) -> bool {
+        matches!(self, Self::Weekly | Self::Monthly)
+    }
+
+    pub fn commitment_hours(self, weekly_working_hours: f64) -> f64 {
         match self {
-            Self::Rolling { hours } => Some(f64::from(hours)),
-            Self::Daily => Some(24.0),
-            Self::Weekly => Some(7.0 * 24.0),
-            Self::Monthly => None,
+            Self::Rolling { hours } => f64::from(hours),
+            Self::Daily => 24.0,
+            Self::Weekly => weekly_working_hours,
+            Self::Monthly => weekly_working_hours * 52.0 / 12.0,
         }
     }
 }
 
 impl<S> CapacityWindow<S> {
     pub fn enforceable_cap(&self) -> Option<WindowCap> {
-        (!self.reference_only).then_some(self.cap)
+        (!self.reference_only && self.cap != WindowCap::Unpublished).then_some(self.cap)
     }
 }
 
@@ -533,22 +542,14 @@ impl CapacityWindow {
         }
     }
 
-    pub fn rate_ceiling(&self, windows: &[Self]) -> Result<f64, &'static str> {
-        self.enforceable_cap()
-            .ok_or("reference only; never enforced")?;
-        let (amount, _) = self
-            .amount_bounds(windows)
-            .ok_or("cap unknown; supply an amount and same-unit parent chain")?;
-        let duration = self
-            .reset
-            .duration_hours()
-            .ok_or("reset duration unknown; supply the actual monthly reset interval")?;
-        if duration == 0.0 {
-            return Err("reset duration is zero");
+    pub fn capacity_limit(&self, windows: &[Self]) -> Result<f64, &'static str> {
+        if self.reference_only {
+            return Err("reference only; never enforced");
         }
-        Ok(amount / duration)
+        self.amount_bounds(windows)
+            .map(|(amount, _)| amount)
+            .ok_or("cap unknown; not enforced")
     }
-
     pub fn applies_to(&self, windows: &[Self], fable: bool) -> bool {
         let mut current = self;
         let mut visited = Vec::new();
@@ -569,7 +570,7 @@ impl CapacityWindow {
             current = next;
         }
     }
-    pub fn summary(&self, windows: &[Self]) -> String {
+    pub fn summary(&self, windows: &[Self], weekly_working_hours: f64) -> String {
         let parent = self
             .parent
             .as_ref()
@@ -580,7 +581,13 @@ impl CapacityWindow {
             WindowCap::ParentFraction(fraction) => {
                 let parent_amount = self
                     .amount_bounds(windows)
-                    .map(|(low, _)| format!("{low:.2}"))
+                    .map(|(low, high)| {
+                        if low == high {
+                            format!("{low:.2}")
+                        } else {
+                            format!("{low:.2}–{high:.2} (range)")
+                        }
+                    })
                     .unwrap_or_else(|| "unknown".to_owned());
                 let parent_basis = parent
                     .map(|window| window.basis.label())
@@ -594,13 +601,17 @@ impl CapacityWindow {
             }
             WindowCap::Unpublished => "amount unpublished".to_owned(),
         };
-        let status = match self.rate_ceiling(windows) {
-            Ok(rate) => format!(
-                "rate ceiling {rate:.4} {}/h; requires demand in the same unit",
-                self.unit.label()
+        let mut status = match self.capacity_limit(windows) {
+            Ok(amount) => format!(
+                "cap {amount:.4} {}; committed fleet rate × {:.4} working hours must fit",
+                self.unit.label(),
+                self.reset.commitment_hours(weekly_working_hours)
             ),
             Err(reason) => reason.to_owned(),
         };
+        if self.reset == WindowReset::Monthly && self.reset_at.is_none() {
+            status.push_str("; monthly reset instant unknown; live period boundary not enforced");
+        }
         format!(
             "{}: {amount} {} / {} · {} · reset: {} · {status}. {}",
             self.id,

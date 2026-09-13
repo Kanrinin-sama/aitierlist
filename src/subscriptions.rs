@@ -37,6 +37,7 @@ const fn weekly(
         unit: CapacityUnit::ApiEquivalentUsd,
         cap: WindowCap::Amount(price * ratio * 12.0 / 52.0),
         reset: WindowReset::Weekly,
+        reset_at: None,
         basis: CapacityBasis::Anecdotal,
         reset_basis: CapacityBasis::Anecdotal,
         source_url,
@@ -49,12 +50,13 @@ const CLAUDE_SHORT: CapacityWindow<&str> = CapacityWindow {
     id: "rolling-5h-usd",
     parent: Some("weekly-usd"),
     unit: CapacityUnit::ApiEquivalentUsd,
-    cap: WindowCap::ParentFraction(5.0 / 40.0),
+    cap: WindowCap::Unpublished,
     reset: WindowReset::Rolling { hours: 5 },
+    reset_at: None,
     basis: CapacityBasis::Anecdotal,
     reset_basis: CapacityBasis::Published,
     source_url: CLAUDE,
-    detail: "Unpublished amount: weekly USD spread over a nominal 40-hour work week.",
+    detail: "Five-hour USD amount unpublished; not enforced.",
     reference_only: false,
 };
 
@@ -64,6 +66,7 @@ const FABLE_WEEKLY: CapacityWindow<&str> = CapacityWindow {
     unit: CapacityUnit::ApiEquivalentUsd,
     cap: WindowCap::ParentFraction(0.5),
     reset: WindowReset::Weekly,
+    reset_at: None,
     basis: CapacityBasis::Published,
     reset_basis: CapacityBasis::Published,
     source_url: FABLE,
@@ -85,11 +88,13 @@ const fn native(
         unit,
         cap,
         reset,
+        reset_at: None,
         basis: CapacityBasis::Published,
         reset_basis: CapacityBasis::Published,
         source_url,
         detail,
-        reference_only: false,
+        reference_only: matches!(unit, CapacityUnit::Prompts)
+            && matches!(cap, WindowCap::Range { .. }),
     }
 }
 
@@ -566,7 +571,7 @@ const fn prior(low: f64, high: f64) -> CapacityWindow<&'static str> {
     }
 }
 
-const RANKING_PRIORS: &[Provider] = &[
+pub(crate) const RANKING_PRIORS: &[Provider] = &[
     Provider {
         id: "cursor",
         name: "cursor",
@@ -679,6 +684,7 @@ const RANKING_PRIORS: &[Provider] = &[
                 unit: CapacityUnit::Requests,
                 cap: WindowCap::Amount(90000.0),
                 reset: WindowReset::Monthly,
+                reset_at: None,
                 detail: "Transferred anecdotal native request prior; stored only, never converted to USD.",
                 ..prior(0.0, 0.0)
             }],
@@ -809,12 +815,17 @@ impl Plan {
             if !window.applies_to(&windows, fable) {
                 return None;
             }
-            let ceiling = window.rate_ceiling(&windows).ok()?;
+            let ceiling = window.capacity_limit(&windows).ok()?;
             let amount = demand.amount(window.unit)?;
-            let committed = settings.orchestrators as f64 * amount / duration_hours;
+            let committed = if window.reset.is_budget() {
+                settings.orchestrators as f64 * amount
+            } else {
+                settings.orchestrators as f64 * amount / duration_hours
+                    * window.reset.commitment_hours(settings.agent_hours)
+            };
             (committed > ceiling).then(|| {
                 format!(
-                    "rate-infeasible: {} commits {committed:.4} {}/h > {ceiling:.4} {}/h",
+                    "capacity-infeasible: {} commits {committed:.4} {} > {ceiling:.4} {}",
                     window.id,
                     window.unit.label(),
                     window.unit.label()
@@ -872,20 +883,17 @@ impl Plan {
     }
 
     pub fn fable_capacity(&self, provider_id: &str, settings: &Settings) -> f64 {
-        self.windows
+        let windows = self.resolved_windows(provider_id, settings);
+        windows
             .iter()
             .find(|window| window.id == FABLE_WEEKLY.id)
-            .map(|window| {
-                window
-                    .cap
-                    .bounds(self.weekly_bounds(provider_id, settings).0)
-                    .0
-            })
+            .and_then(|window| window.amount_bounds(&windows))
+            .map(|(low, _)| low)
             .unwrap_or(0.0)
     }
-
     pub fn resolved_windows(&self, provider_id: &str, settings: &Settings) -> Vec<CapacityWindow> {
-        self.windows
+        let windows: Vec<_> = self
+            .windows
             .iter()
             .map(|window| {
                 let override_amount = self.override_amount(provider_id, window, settings);
@@ -895,6 +903,7 @@ impl Plan {
                     unit: window.unit,
                     cap: override_amount.map(WindowCap::Amount).unwrap_or(window.cap),
                     reset: window.reset,
+                    reset_at: window.reset_at.map(str::to_owned),
                     basis: if override_amount.is_some() {
                         CapacityBasis::UserOverride
                     } else {
@@ -915,6 +924,21 @@ impl Plan {
                     reference_only: window.reference_only,
                 }
             })
+            .collect();
+        windows
+            .iter()
+            .map(|window| {
+                let mut resolved = window.clone();
+                if matches!(window.cap, WindowCap::ParentFraction(_)) {
+                    resolved.cap = match window.amount_bounds(&windows) {
+                        Some((low, high)) if low == high => WindowCap::Amount(low),
+                        Some((low, high)) => WindowCap::Range { low, high },
+                        None => WindowCap::Unpublished,
+                    };
+                    resolved.detail = window.summary(&windows, settings.agent_hours);
+                }
+                resolved
+            })
             .collect()
     }
 
@@ -922,7 +946,13 @@ impl Plan {
         let windows = self.resolved_windows(provider_id, settings);
         windows
             .iter()
-            .map(|window| format!("{} Source: {}", window.summary(&windows), window.source_url))
+            .map(|window| {
+                format!(
+                    "{} Source: {}",
+                    window.summary(&windows, settings.agent_hours),
+                    window.source_url
+                )
+            })
             .collect::<Vec<_>>()
             .join("; ")
     }

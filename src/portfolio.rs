@@ -269,6 +269,10 @@ pub struct DispatchPlan {
     pub deferred_changes: usize,
     pub cadence_hours: Option<f64>,
     pub jobs_per_week: Option<f64>,
+    #[serde(default)]
+    pub path_iterations: usize,
+    #[serde(default)]
+    pub path_status: String,
     pub repair_incidence: f64,
     pub classes: Vec<WorkClassDemand>,
     pub solver: SolverReport,
@@ -603,6 +607,9 @@ pub struct WindowRateUsage {
     pub ceiling_per_hour: Option<f64>,
     pub committed_per_hour: Option<f64>,
     pub known_committed_per_hour: f64,
+    pub commitment_hours: f64,
+    pub known_committed_amount: f64,
+    pub native_demand_per_hour: CapacityDemand,
     pub binding: bool,
     pub status: String,
 }
@@ -619,13 +626,19 @@ impl PoolUsage {
             if !window.applies_to(&self.windows, fable) {
                 return true;
             }
-            let Ok(ceiling) = window.rate_ceiling(&self.windows) else {
+            let Ok(ceiling) = window.capacity_limit(&self.windows) else {
                 return true;
             };
             let Some(amount) = demand.amount(window.unit) else {
                 return true;
             };
-            parallel as f64 * amount / duration_hours <= ceiling
+            if window.reset.is_budget() {
+                parallel as f64 * amount <= ceiling
+            } else {
+                parallel as f64 * amount / duration_hours
+                    * window.reset.commitment_hours(self.available_hours)
+                    <= ceiling
+            }
         })
     }
 }
@@ -639,7 +652,9 @@ fn policy_rate(
     if conductor {
         let demand = CapacityDemand {
             api_equivalent_usd: settings.orchestrator_headroom_usd,
-            ..CapacityDemand::default()
+            requests: None,
+            prompts: None,
+            messages: None,
         };
         demand
             .amount(unit)
@@ -653,7 +668,9 @@ fn refresh_rate_usage(portfolio: &mut Portfolio, rows: &[Row], settings: &Settin
     for pool in &mut portfolio.pools {
         let mut usages = Vec::new();
         for window in &pool.windows {
-            let ceiling = window.rate_ceiling(&pool.windows);
+            let ceiling = window
+                .capacity_limit(&pool.windows)
+                .map(|cap| cap / window.reset.commitment_hours(settings.agent_hours));
             let mut unknown = false;
             let mut committed = Vec::new();
             for class in WorkClass::ALL {
@@ -670,7 +687,13 @@ fn refresh_rate_usage(portfolio: &mut Portfolio, rows: &[Row], settings: &Settin
                             if window.unit == CapacityUnit::ApiEquivalentUsd
                                 && rule.per_call_reserved_hours > 0.0
                             {
-                                rate += rule.per_call_reserved_usage / rule.per_call_reserved_hours;
+                                rate += if window.reset.is_budget() {
+                                    rule.reserved_usage
+                                        / settings.agent_hours
+                                        / settings.orchestrators as f64
+                                } else {
+                                    rule.per_call_reserved_usage / rule.per_call_reserved_hours
+                                };
                             } else {
                                 unknown = true;
                             }
@@ -686,6 +709,7 @@ fn refresh_rate_usage(portfolio: &mut Portfolio, rows: &[Row], settings: &Settin
                         subscriptions::is_fable(&rows[conductor.row_index]),
                     )
                 {
+                    unknown = true;
                     if let Some(amount) = settings
                         .orchestrator_headroom_usd
                         .filter(|_| window.unit == CapacityUnit::ApiEquivalentUsd)
@@ -697,17 +721,37 @@ fn refresh_rate_usage(portfolio: &mut Portfolio, rows: &[Row], settings: &Settin
                 }
                 committed.push(settings.orchestrators as f64 * rate);
             }
-            let rate = committed.into_iter().fold(0.0, f64::max);
-            let binding = ceiling.as_ref().is_ok_and(|ceiling| {
-                !pool.windows.iter().any(|other| {
-                    other.unit == window.unit
-                        && other.applies_to(&pool.windows, false)
-                            == window.applies_to(&pool.windows, false)
-                        && other
-                            .rate_ceiling(&pool.windows)
-                            .is_ok_and(|rate| rate < *ceiling)
-                })
-            });
+            let rate = if window.reset.is_budget() {
+                let worker_rate: f64 = portfolio
+                    .roles
+                    .iter()
+                    .flat_map(|role| &role.rules)
+                    .filter(|rule| {
+                        !rule.recommendation_only
+                            && rule.planned_jobs > 0
+                            && rule.provider_id.as_deref() == Some(&pool.provider_id)
+                            && window.applies_to(&pool.windows, rule.fable)
+                    })
+                    .filter(|_| window.unit == CapacityUnit::ApiEquivalentUsd)
+                    .map(|rule| rule.reserved_usage / settings.agent_hours)
+                    .sum();
+                let headroom = portfolio
+                    .conductor
+                    .as_ref()
+                    .filter(|conductor| {
+                        conductor.provider_id == pool.provider_id
+                            && window.applies_to(
+                                &pool.windows,
+                                subscriptions::is_fable(&rows[conductor.row_index]),
+                            )
+                    })
+                    .and(settings.orchestrator_headroom_usd)
+                    .filter(|_| window.unit == CapacityUnit::ApiEquivalentUsd)
+                    .map(|amount| settings.orchestrators as f64 * amount / settings.agent_hours);
+                worker_rate + headroom.into_iter().sum::<f64>()
+            } else {
+                committed.into_iter().fold(0.0, f64::max)
+            };
             let status = match ceiling {
                 Err(reason) => reason.to_owned(),
                 Ok(ceiling) if rate > ceiling => "rate-infeasible".to_owned(),
@@ -716,9 +760,9 @@ fn refresh_rate_usage(portfolio: &mut Portfolio, rows: &[Row], settings: &Settin
                     window.unit.label(),
                 ),
                 Ok(_) if unknown => {
-                    "known committed rate fits; ongoing Orchestrator demand unknown".to_owned()
+                    "known committed spend fits; ongoing Orchestrator consumption unknown and not counted against capacity".to_owned()
                 }
-                Ok(_) => "committed rate fits".to_owned(),
+                Ok(_) => "committed spend fits".to_owned(),
             };
             usages.push(WindowRateUsage {
                 window_id: window.id.clone(),
@@ -726,9 +770,38 @@ fn refresh_rate_usage(portfolio: &mut Portfolio, rows: &[Row], settings: &Settin
                 ceiling_per_hour: ceiling.ok(),
                 committed_per_hour: (!unknown).then_some(rate),
                 known_committed_per_hour: rate,
-                binding,
+                commitment_hours: window.reset.commitment_hours(settings.agent_hours),
+                known_committed_amount: rate * window.reset.commitment_hours(settings.agent_hours),
+                native_demand_per_hour: CapacityDemand {
+                    api_equivalent_usd: (window.unit == CapacityUnit::ApiEquivalentUsd)
+                        .then_some(rate),
+                    requests: None,
+                    prompts: None,
+                    messages: None,
+                },
+                binding: false,
                 status,
             });
+        }
+        let tightest = usages
+            .iter()
+            .filter(|usage| {
+                usage.unit == CapacityUnit::ApiEquivalentUsd && usage.known_committed_per_hour > 0.0
+            })
+            .filter_map(|usage| {
+                usage
+                    .ceiling_per_hour
+                    .map(|cap| usage.known_committed_per_hour / cap)
+            })
+            .reduce(f64::max);
+        for usage in &mut usages {
+            usage.binding = usage
+                .ceiling_per_hour
+                .zip(tightest)
+                .is_some_and(|(cap, tightest)| {
+                    usage.known_committed_per_hour > 0.0
+                        && usage.known_committed_per_hour / cap == tightest
+                });
         }
         pool.rate_windows = usages;
     }
@@ -816,6 +889,10 @@ pub struct ConductorAllocation {
     pub capability_sensitivity: Option<CapabilityRange>,
     #[serde(default)]
     pub usage_forecast: Option<ConductorUsageForecast>,
+    #[serde(default)]
+    pub ongoing_demand_per_hour: CapacityDemand,
+    #[serde(default)]
+    pub working_hours_per_week: f64,
     #[serde(default)]
     pub headroom: ConductorHeadroom,
     pub per_call_expected_usage: f64,
@@ -1086,9 +1163,52 @@ fn schedule(
 ) -> Option<Schedule> {
     for (pool_index, pool) in pools.iter().enumerate() {
         for window in &pool.windows {
-            let Ok(ceiling) = window.rate_ceiling(&pool.windows) else {
+            let Ok(ceiling) = window.capacity_limit(&pool.windows) else {
                 continue;
             };
+            if window.reset.is_budget() {
+                let committed: f64 = groups
+                    .iter()
+                    .zip(choices)
+                    .filter_map(|(group, choice)| {
+                        let policy = &group.policies[*choice];
+                        if policy.pool != pool_index
+                            || !window.applies_to(&pool.windows, policy.fable)
+                        {
+                            return None;
+                        }
+                        if let Some(class) = group.class {
+                            let research = settings
+                                .research_classes
+                                .get(class.name())
+                                .copied()
+                                .unwrap_or(false);
+                            let visits = sequence
+                                .iter()
+                                .filter(|selected| **selected == class)
+                                .count()
+                                * reserved_visits(class, Seat::ALL[group.role], research);
+                            policy.cycle.demand().amount(window.unit).map(|amount| {
+                                amount
+                                    * visits as f64
+                                    * class.resource_factor()
+                                    * window.reset.commitment_hours(settings.agent_hours)
+                                    / settings.agent_hours
+                            })
+                        } else {
+                            policy_rate(policy, window.unit, true, settings).map(|rate| {
+                                settings.orchestrators as f64
+                                    * rate
+                                    * window.reset.commitment_hours(settings.agent_hours)
+                            })
+                        }
+                    })
+                    .sum();
+                if committed > ceiling {
+                    return None;
+                }
+                continue;
+            }
             for class in WorkClass::ALL {
                 let rate: f64 = groups
                     .iter()
@@ -1104,7 +1224,11 @@ fn schedule(
                         policy_rate(policy, window.unit, group.class.is_none(), settings)
                     })
                     .sum();
-                if settings.orchestrators as f64 * rate > ceiling {
+                if settings.orchestrators as f64
+                    * rate
+                    * window.reset.commitment_hours(settings.agent_hours)
+                    > ceiling
+                {
                     return None;
                 }
             }
@@ -1291,9 +1415,15 @@ fn search(
     }
     let mut capacities: Vec<_> = pools.iter().map(|pool| pool.available_hours).collect();
     let mut rate_resources = Vec::new();
+    let mut budget_resources = Vec::new();
     for (pool_index, pool) in pools.iter().enumerate() {
         for (window_index, window) in pool.windows.iter().enumerate() {
-            if let Ok(ceiling) = window.rate_ceiling(&pool.windows) {
+            if let Ok(ceiling) = window.capacity_limit(&pool.windows) {
+                if window.reset.is_budget() {
+                    budget_resources.push((pool_index, window_index, capacities.len()));
+                    capacities.push(ceiling);
+                    continue;
+                }
                 for class in WorkClass::ALL {
                     if counts[class.index()] > 0 {
                         rate_resources.push((pool_index, window_index, class, capacities.len()));
@@ -1420,6 +1550,31 @@ fn search(
                     } else {
                         reserved_factor * policy.cycle.reserved_seconds / 3600.0
                     };
+                    for (pool_index, window_index, resource) in &budget_resources {
+                        let pool = &pools[*pool_index];
+                        let window = &pool.windows[*window_index];
+                        if *pool_index != policy.pool
+                            || !window.applies_to(&pool.windows, policy.fable)
+                        {
+                            continue;
+                        }
+                        let amount = if group.class.is_none() {
+                            policy_rate(policy, window.unit, true, settings).map(|rate| {
+                                settings.orchestrators as f64 * rate * settings.agent_hours
+                            })
+                        } else {
+                            policy
+                                .cycle
+                                .demand()
+                                .amount(window.unit)
+                                .map(|amount| reserved_factor * amount)
+                        };
+                        if let Some(amount) = amount {
+                            resources[*resource] = amount
+                                * window.reset.commitment_hours(settings.agent_hours)
+                                / settings.agent_hours;
+                        }
+                    }
                     for (pool_index, window_index, class, resource) in &rate_resources {
                         if *pool_index != policy.pool
                             || group.class.is_some_and(|selected| selected != *class)
@@ -1432,7 +1587,9 @@ fn search(
                             && let Some(rate) =
                                 policy_rate(policy, window.unit, group.class.is_none(), settings)
                         {
-                            resources[*resource] = settings.orchestrators as f64 * rate;
+                            resources[*resource] = settings.orchestrators as f64
+                                * rate
+                                * window.reset.commitment_hours(settings.agent_hours);
                         }
                     }
                     for (link_index, (lower, upper)) in competence_links.iter().enumerate() {
@@ -1578,12 +1735,14 @@ fn stress_identity(role: usize, policy: &Policy) -> String {
 }
 
 fn conductor_headroom_fits(pool: &PoolUsage, fable: bool, settings: &Settings) -> bool {
-    let usage = settings.orchestrator_headroom_usd.unwrap_or(0.0);
+    let usage = settings.orchestrator_headroom_usd;
     let hours = settings.orchestrator_headroom_hours.unwrap_or(0.0);
     pool.rate_fits(
         CapacityDemand {
-            api_equivalent_usd: Some(usage),
-            ..CapacityDemand::default()
+            api_equivalent_usd: usage,
+            requests: None,
+            prompts: None,
+            messages: None,
         },
         settings.agent_hours,
         fable,
@@ -2118,10 +2277,95 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
     allocate_core(rows, settings, true)
 }
 
+fn assigned_path(portfolio: &Portfolio, settings: &Settings) -> Option<(String, f64)> {
+    let mut identity = String::new();
+    let mut hours = 0.0;
+    for (class, weight) in WorkClass::ALL.into_iter().zip(CLASS_MIX) {
+        let research = settings
+            .research_classes
+            .get(class.name())
+            .copied()
+            .unwrap_or(false);
+        let stages = workflow_stages(class, research);
+        let mut finishes = vec![0.0; stages.len()];
+        for stage in &stages {
+            let role = portfolio
+                .roles
+                .iter()
+                .find(|role| role.seat == stage.seat)?;
+            let rule = role.rules.iter().find(|rule| rule.class == class)?;
+            let row = rule.row_index?;
+            identity.push_str(&format!(
+                "{:?}/{:?}/{row}/{}/{:?}/{:?};",
+                class, stage.seat, rule.attempt_limit, rule.provider_id, rule.plan_id
+            ));
+            let start = stage
+                .dependencies
+                .iter()
+                .map(|dependency| finishes[*dependency])
+                .fold(0.0, f64::max);
+            finishes[stage.id] = start + rule.per_call_reserved_hours;
+        }
+        hours += weight * finishes.into_iter().reduce(f64::max)?;
+    }
+    if let Some(conductor) = &portfolio.conductor {
+        identity.push_str(&conductor.binding_id);
+    }
+    Some((identity, hours))
+}
+
 fn allocate_core(
     rows: &[Row],
     settings: &Settings,
     include_sensitivity: bool,
+) -> Option<Portfolio> {
+    let mut history: Vec<(String, Portfolio)> = Vec::new();
+    let mut path_hours = None;
+    loop {
+        let mut portfolio = allocate_once(rows, settings, include_sensitivity, path_hours)?;
+        portfolio.dispatch.path_iterations = history.len() + 1;
+        let Some((identity, assigned_hours)) = assigned_path(&portfolio, settings) else {
+            portfolio.dispatch.cadence_hours = None;
+            portfolio.dispatch.jobs_per_week = None;
+            portfolio.dispatch.path_status =
+                "Path time unknown: a required class stage has no assigned measured route."
+                    .to_owned();
+            return Some(portfolio);
+        };
+        if let Some(index) = history
+            .iter()
+            .position(|(previous, _)| previous == &identity)
+        {
+            if index + 1 == history.len() {
+                portfolio.dispatch.path_status = "Assignment fixed point".to_owned();
+                return Some(portfolio);
+            }
+            let iterations = portfolio.dispatch.path_iterations;
+            history.push((identity, portfolio));
+            let mut selected = history
+                .into_iter()
+                .skip(index)
+                .map(|(_, portfolio)| portfolio)
+                .min_by(|left, right| {
+                    left.dispatch
+                        .jobs_per_week
+                        .partial_cmp(&right.dispatch.jobs_per_week)
+                        .expect("derived finite demand")
+                })?;
+            selected.dispatch.path_iterations = iterations;
+            selected.dispatch.path_status =
+                "Assignment cycle detected; retained the lower-demand assignment".to_owned();
+            return Some(selected);
+        }
+        history.push((identity, portfolio));
+        path_hours = Some(assigned_hours);
+    }
+}
+fn allocate_once(
+    rows: &[Row],
+    settings: &Settings,
+    include_sensitivity: bool,
+    path_hours: Option<f64>,
 ) -> Option<Portfolio> {
     let selected: Vec<_> = subscriptions::PROVIDERS
         .iter()
@@ -2159,13 +2403,13 @@ fn allocate_core(
             provider_id: provider.id.to_owned(), name: format!("Fable: published 50% of weekly-usd; {} USD amount", plan.weekly_basis(provider.id, settings)), weekly_capacity: plan.fable_capacity(provider.id, settings), nominal_usage: 0.0, stress_usage: 0.0, reserved_usage: 0.0, remaining_capacity: plan.fable_capacity(provider.id, settings),
         }).collect(),
         assumptions: vec![
-            "Capacity table: anecdotal USD amounts and published quota rules are labeled in Settings. Every non-reference window at every nesting level enforces parallel orchestrators times aggregate committed seat rate <= cap / reset hours. Native counts and USD are separate demand dimensions; unknown native counts need measurement.".to_owned(),
-            "Demand is weekly hours times parallel orchestrators divided by the class-mix-weighted critical path of the fastest eligible measured workflow stages, including the full conditional repair path. Only complete bundles enter integer admission; fractional demand remains in jobs_per_week. Parallelism multiplies demand and committed seat rates, never quota. The existing class mix and resource factors are unchanged.".to_owned(),
+            "Capacity table: anecdotal USD amounts and published quota rules are labeled in Settings. Every non-reference window at every nesting level enforces parallel orchestrators times aggregate committed seat rate times working hours per budget period (H weekly; H × 52/12 monthly), or rolling interval hours, <= cap. Budget rates are reserved fleet visit spend divided by d × H; rolling rates are simultaneous active burn. Native counts and USD are separate demand dimensions; unknown native counts need measurement.".to_owned(),
+            "Demand is weekly hours times parallel orchestrators divided by the class-mix-weighted critical path of assigned measured workflow stages, iterated from fastest eligible until assignment stability or a detected cycle, including the full conditional repair path. Only complete bundles enter integer admission; fractional demand remains in jobs_per_week. Parallelism multiplies demand and committed seat rates, never quota. The existing class mix and resource factors are unchanged.".to_owned(),
             "The profile binds one account per provider, so the forecast uses one modeled allowance and one account calendar per provider regardless of owned subscription count. Additional subscriptions remain in purchase costs but contribute no forecast capacity. Forecast account ordinals are scheduling slots, not native account identities, authentication, meters, or authorization.".to_owned(),
             "Select workflow templates from consequence, uncertainty, coupling, reversibility, evidence need, tool risk, correlation, and deadline risk. File count is load information only and never determines the workflow.".to_owned(),
             "The full forecast uses largest-remainder class counts with canonical ties. A fixed deficit-ordered sequence supplies nested admission prefixes; reduced demand never re-apportions.".to_owned(),
             "The API-equivalent worker proxy uses one stage for Focused, six for Standard, and seven for Complex and Extensive work. Expected repair activation uses the selected Implementer's bounded-attempt benchmark residual as an uncalibrated proxy; the full conditional repair path remains reserved. Each class can explicitly include one AA research-reference visit; the default coding forecast excludes it. Native tasks expand from their risk vectors and actual task evidence.".to_owned(),
-            "The Orchestrator uses one persistent model and effort across the whole plan. Its ongoing demand is not inferred from worker jobs. Optional USD and hour headroom is reserved once on its selected account; every actual native call is charged through the runtime ledger. Each worker visit uses one model and effort with 1–3 same-model attempts.".to_owned(),
+            "The Orchestrator uses one persistent model and effort across the whole plan. Its ongoing consumption per hour is unknown and is not counted against capacity; it operates for H working hours per week. Optional USD and hour headroom is reserved once on its selected account; every actual native call is charged through the runtime ledger. Each worker visit uses one model and effort with 1–3 same-model attempts.".to_owned(),
             "Multi-criteria role utility uses each skill component once: capped completion for reference-workload evidence, static values for other skills. It is not real-job success probability. Class factors scale demand and resources, not calibrated difficulty.".to_owned(),
             "The proxy calendar places its declared stage sequence in earliest account gaps to estimate API-equivalent capacity. Native scheduling instead uses authorized ready task IDs, risk-selected DAGs, immutable artifact dependencies, current reset windows, and deadlines.".to_owned(),
             "The solver optimizes only assignments feasible under this declared scheduler. Modeled allowances and full-cap buffers do not guarantee real vendor quota or runtime; unknown actual usage requires pause and reconciliation.".to_owned(),
@@ -2181,7 +2425,7 @@ fn allocate_core(
         capability_scenario: None,
         dispatch: DispatchPlan {
             policy_version: crate::team_policy::VERSION.to_owned(),
-            forecast_changes: 0, admitted_changes: 0, deferred_changes: 0, cadence_hours: None, jobs_per_week: None, repair_incidence: 0.0,
+            forecast_changes: 0, admitted_changes: 0, deferred_changes: 0, cadence_hours: None, jobs_per_week: None, path_iterations: 0, path_status: String::new(), repair_incidence: 0.0,
             classes: WorkClass::ALL.into_iter().map(|class| WorkClassDemand { class, condition: class.condition().to_owned(), resource_factor: class.resource_factor(), forecast_changes: 0, admitted_changes: 0, research_included: settings.research_classes.get(class.name()).copied().unwrap_or(false) }).collect(),
             solver: SolverReport { status: "infeasible".to_owned(), proven_optimal: false, quality: 0.0, bound: None, relative_gap: None, nodes: 0, message: String::new() },
             executable: false, admitted_sequence: Vec::new(), reserved_makespan_hours: 0.0, schedule: Vec::new(), repair_sensitivity: Vec::new(), service: TeamServiceReport::default(),
@@ -2485,7 +2729,12 @@ fn allocate_core(
                         nominal_seconds: hours * 3600.0,
                         reserved_usage: usage * stress,
                         reserved_seconds: hours * 3600.0 * stress,
-                        native_demand: CapacityDemand::default(),
+                        native_demand: CapacityDemand {
+                            api_equivalent_usd: None,
+                            requests: None,
+                            prompts: None,
+                            messages: None,
+                        },
                         reference_completion: [None; 3],
                     },
                     fable: subscriptions::is_fable(&rows[candidate.row_index])
@@ -2498,7 +2747,8 @@ fn allocate_core(
             }
         }
     }
-    let Some(path_hours) = reference_path_hours(&candidates, settings) else {
+    let Some(path_hours) = path_hours.or_else(|| reference_path_hours(&candidates, settings))
+    else {
         portfolio.message = "Workflow demand unknown: every required DAG stage needs an eligible policy with a measured duration.".to_owned();
         refresh_rate_usage(&mut portfolio, rows, settings);
         return Some(portfolio);
@@ -2711,6 +2961,13 @@ fn allocate_core(
                     upper: policy.upper_utility,
                 }),
                 usage_forecast: None,
+                ongoing_demand_per_hour: CapacityDemand {
+                    api_equivalent_usd: None,
+                    requests: None,
+                    prompts: None,
+                    messages: None,
+                },
+                working_hours_per_week: settings.agent_hours,
                 headroom: ConductorHeadroom {
                     usd: settings.orchestrator_headroom_usd,
                     hours: settings.orchestrator_headroom_hours,
@@ -3046,6 +3303,13 @@ fn allocate_core(
                     upper: policy.upper_utility,
                 }),
                 usage_forecast: None,
+                ongoing_demand_per_hour: CapacityDemand {
+                    api_equivalent_usd: None,
+                    requests: None,
+                    prompts: None,
+                    messages: None,
+                },
+                working_hours_per_week: settings.agent_hours,
                 headroom: ConductorHeadroom {
                     usd: settings.orchestrator_headroom_usd,
                     hours: settings.orchestrator_headroom_hours,
