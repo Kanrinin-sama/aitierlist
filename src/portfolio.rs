@@ -551,6 +551,10 @@ pub struct PoolUsage {
     pub provider_id: String,
     pub subscription_count: usize,
     pub per_account_weekly_capacity: f64,
+    #[serde(default)]
+    pub per_account_fable_capacity: f64,
+    #[serde(default)]
+    pub windows: Vec<crate::types::CapacityWindow>,
     pub provider_name: String,
     pub plan_id: String,
     pub plan_name: String,
@@ -981,7 +985,7 @@ fn schedule(
                 account_usage + usage <= pools[policy.pool].per_account_weekly_capacity + 1e-8
                     && (!policy.fable
                         || account_fable_usage + usage
-                            <= pools[policy.pool].per_account_weekly_capacity * 0.5 + 1e-8)
+                            <= pools[policy.pool].per_account_fable_capacity + 1e-8)
             })
             .filter_map(|account| {
                 let mut start = dependency_start;
@@ -1117,7 +1121,7 @@ fn search(
         .position(|pool| pool.provider_id == "anthropic" && pool.plan_id != "claude-pro");
     let fable_resource = fable_pool.map(|pool| {
         let index = capacities.len();
-        capacities.push(pools[pool].weekly_capacity * 0.5);
+        capacities.push(pools[pool].per_account_fable_capacity);
         index
     });
     let path_resource = capacities.len();
@@ -1394,7 +1398,7 @@ fn conductor_headroom_fits(pool: &PoolUsage, fable: bool, settings: &Settings) -
     let hours = settings.orchestrator_headroom_hours.unwrap_or(0.0);
     usage <= pool.per_account_weekly_capacity
         && hours <= settings.agent_hours
-        && (!fable || usage <= pool.per_account_weekly_capacity * 0.5)
+        && (!fable || usage <= pool.per_account_fable_capacity)
 }
 
 fn scenario_better_or_equal<T>(
@@ -1591,7 +1595,7 @@ fn seed_class_recommendations(
                     let reserve = policy.cycle.reserved_usage * factor;
                     reserve <= pool.per_account_weekly_capacity
                         && policy.cycle.reserved_seconds * factor / 3600.0 <= hours
-                        && (!policy.fable || reserve <= pool.per_account_weekly_capacity * 0.5)
+                        && (!policy.fable || reserve <= pool.per_account_fable_capacity)
                 })
                 .max_by(|left, right| {
                     left.utility
@@ -1863,12 +1867,7 @@ pub fn compare_conductors(rows: &[Row], settings: &Settings) -> Vec<ConductorTra
                                     && crate::aa::family_key("", &native.model_key)
                                         == crate::aa::family_key("", &row.model_key)
                             }));
-                    let capacity = settings
-                        .vendor_overrides
-                        .get(provider.id)
-                        .copied()
-                        .flatten()
-                        .unwrap_or(plan.monthly_allowance_low * 12.0 / 52.0);
+                    let capacity = plan.weekly_bounds(provider.id, settings).0;
                     maps_to_provider && capacity > 0.0 && settings.agent_hours > 0.0
                 })
                 .then(|| engine::competence(row, Seat::Orchestrator))
@@ -1942,12 +1941,7 @@ fn allocate_core(
         return None;
     }
     let capacity = |provider: &subscriptions::Provider, plan: &subscriptions::Plan| {
-        settings
-            .vendor_overrides
-            .get(provider.id)
-            .copied()
-            .flatten()
-            .unwrap_or(plan.monthly_allowance_low * 12.0 / 52.0)
+        plan.weekly_bounds(provider.id, settings).0
     };
     let forecast = (settings.agent_hours / 4.0).ceil() as usize;
     let sequence = sequence(forecast);
@@ -1969,15 +1963,16 @@ fn allocate_core(
             }).collect(),
         }).collect(),
         pools: selected.iter().map(|(provider, plan)| PoolUsage {
-            provider_id: provider.id.to_owned(), subscription_count: settings.subscription_count(provider.id), per_account_weekly_capacity: capacity(provider, plan), provider_name: provider.name.to_owned(), plan_id: plan.id.to_owned(), plan_name: plan.name.to_owned(), monthly_price: plan.monthly_price * settings.subscription_count(provider.id) as f64, price_is_estimate: plan.price_is_estimate,
+            provider_id: provider.id.to_owned(), subscription_count: settings.subscription_count(provider.id), per_account_weekly_capacity: capacity(provider, plan), per_account_fable_capacity: plan.fable_capacity(provider.id, settings), windows: plan.resolved_windows(provider.id, settings), provider_name: provider.name.to_owned(), plan_id: plan.id.to_owned(), plan_name: plan.name.to_owned(), monthly_price: plan.monthly_price * settings.subscription_count(provider.id) as f64, price_is_estimate: plan.price_is_estimate,
             weekly_capacity: capacity(provider, plan), nominal_usage: 0.0, stress_usage: 0.0, remaining_capacity: capacity(provider, plan), utilization_pct: 0.0,
             available_hours: settings.agent_hours, scheduled_hours: 0.0, unused_hours: settings.agent_hours, reserved_usage: 0.0, reserved_hours: 0.0, remaining_reserved_capacity: capacity(provider, plan), remaining_reserved_hours: settings.agent_hours,
-            unit: "estimated API-equivalent USD".to_owned(), source_url: plan.source_url.to_owned(), allowance_basis: if settings.vendor_overrides.get(provider.id).copied().flatten().is_some() { format!("User-defined weekly API-equivalent allowance for one bound account; {} owned subscriptions", settings.subscription_count(provider.id)) } else { format!("{} Owned subscriptions: {}; forecast uses one bound account.", plan.allowance_basis, settings.subscription_count(provider.id)) },
+            unit: format!("{} API-equivalent USD", plan.weekly_basis(provider.id, settings)), source_url: plan.source_url.to_owned(), allowance_basis: format!("{} Owned subscriptions: {}; forecast uses one bound account. Short and native-unit windows are stored and displayed but not enforced.", plan.capacity_summary(provider.id, settings), settings.subscription_count(provider.id)),
         }).collect(),
         limits: selected.iter().filter(|(provider, plan)| provider.id == "anthropic" && plan.id != "claude-pro").map(|(provider, plan)| PoolLimit {
-            provider_id: provider.id.to_owned(), name: "Fable: 50% of the aggregate Claude account pools".to_owned(), weekly_capacity: capacity(provider, plan) * 0.5, nominal_usage: 0.0, stress_usage: 0.0, reserved_usage: 0.0, remaining_capacity: capacity(provider, plan) * 0.5,
+            provider_id: provider.id.to_owned(), name: format!("Fable: published 50% of weekly-usd; {} USD amount", plan.weekly_basis(provider.id, settings)), weekly_capacity: plan.fable_capacity(provider.id, settings), nominal_usage: 0.0, stress_usage: 0.0, reserved_usage: 0.0, remaining_capacity: plan.fable_capacity(provider.id, settings),
         }).collect(),
         assumptions: vec![
+            "Capacity table: anecdotal USD amounts and published quota rules are labeled in Settings. Short and native-unit windows are stored and displayed but not enforced; weekly USD and the existing Fable child limit govern this forecast.".to_owned(),
             "The proxy demand volume is ceil(weekly hours / 4). Concurrent orchestrators share that volume and every subscription allowance; the count does not multiply quota, calendar hours, or worker concurrency. Nested prefixes of the 50/30/15/5 sequence never re-apportion. Extensive is absent below 11 jobs. The 0.25/1/2/4 factors are declared conventions.".to_owned(),
             "The profile binds one account per provider, so the forecast uses one modeled allowance and one account calendar per provider regardless of owned subscription count. Additional subscriptions remain in purchase costs but contribute no forecast capacity. Forecast account ordinals are scheduling slots, not native account identities, authentication, meters, or authorization.".to_owned(),
             "Select workflow templates from consequence, uncertainty, coupling, reversibility, evidence need, tool risk, correlation, and deadline risk. File count is load information only and never determines the workflow.".to_owned(),

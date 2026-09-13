@@ -52,6 +52,7 @@ pub struct Settings {
     pub competence_floors: BTreeMap<String, Option<f64>>,
     pub plan_prices: PlanPrices,
     pub vendor_overrides: BTreeMap<String, Option<f64>>,
+    pub window_overrides: BTreeMap<String, Option<f64>>,
     pub cache_hours: u32,
     pub show_hallucination: bool,
     pub research_classes: BTreeMap<String, bool>,
@@ -105,6 +106,7 @@ impl Default for Settings {
             competence_floors,
             plan_prices: PlanPrices::default(),
             vendor_overrides,
+            window_overrides: BTreeMap::new(),
             cache_hours: 1,
             show_hallucination: false,
             research_classes: crate::portfolio::WorkClass::ALL
@@ -189,7 +191,11 @@ impl Settings {
                 .into_iter()
                 .any(|known| known.name() == class)
         });
-        for allowance in self.vendor_overrides.values_mut() {
+        for allowance in self
+            .vendor_overrides
+            .values_mut()
+            .chain(self.window_overrides.values_mut())
+        {
             if allowance.is_some_and(|value| !value.is_finite() || value < 0.0) {
                 *allowance = None;
             }
@@ -338,6 +344,11 @@ pub fn load_settings() -> Settings {
                 && let Ok(val) = serde_json::from_value(v)
             {
                 settings.vendor_overrides = val;
+            }
+            if let Some(v) = value.get("window_overrides").cloned()
+                && let Ok(val) = serde_json::from_value(v)
+            {
+                settings.window_overrides = val;
             }
             if let Some(v) = value.get("cache_hours").cloned()
                 && let Ok(val) = serde_json::from_value(v)

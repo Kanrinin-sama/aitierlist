@@ -244,6 +244,43 @@ impl super::App {
                 monthly_spend +=
                     plan.monthly_price * self.settings.subscription_count(provider.id) as f64;
                 estimated_price |= plan.price_is_estimate;
+                ui.label("Plan windows");
+                ui.colored_label(theme::MUTED, "Short and native-unit windows are stored and displayed, but not enforced. Blank overrides use the table; a plan-window override takes precedence over the vendor weekly override.");
+                let windows = plan.resolved_windows(provider.id, &self.settings);
+                for (definition, window) in plan.windows.iter().zip(&windows) {
+                    ui.label(window.summary(&windows));
+                    ui.horizontal(|ui| {
+                        if !window.source_url.is_empty() {
+                            ui.hyperlink_to("Source", &window.source_url);
+                        }
+                        if definition.basis == crate::types::CapacityBasis::Published
+                            && matches!(definition.cap, crate::types::WindowCap::ParentFraction(_))
+                        {
+                            ui.colored_label(
+                                theme::MUTED,
+                                "Published fraction retained; edit the weekly parent amount.",
+                            );
+                        } else {
+                            ui.label(format!("Override ({})", window.unit.label()));
+                            let key = crate::subscriptions::window_override_key(
+                                provider.id,
+                                plan.id,
+                                definition.id,
+                            );
+                            let editor_id = ui.id().with(("window_override", &key));
+                            let mut value =
+                                self.settings.window_overrides.get(&key).copied().flatten();
+                            if capacity_override_editor(ui, editor_id, &mut value) {
+                                if value.is_some() {
+                                    self.settings.window_overrides.insert(key, value);
+                                } else {
+                                    self.settings.window_overrides.remove(&key);
+                                }
+                                changed = true;
+                            }
+                        }
+                    });
+                }
             }
             self.native_connection_controls(ui, provider.id);
             ui.add_space(8.0);
@@ -675,7 +712,7 @@ impl super::App {
             .show(ui, |ui| {
                 ui.colored_label(
                     theme::MUTED,
-                    "Weekly USD. Leave blank to use the plan default.",
+                    "Parent weekly API-equivalent USD per account (user-override). Leave blank for the plan default. A plan-window override takes precedence; published child fractions remain.",
                 );
                 egui::Grid::new("vendor_overrides")
                     .num_columns(4)
@@ -689,46 +726,7 @@ impl super::App {
                                 ui.label("");
                             }
                             let editor_id = ui.id().with(("vendor_override", vendor.as_str()));
-                            let focused = ui.memory(|memory| memory.has_focus(editor_id));
-                            let saved_text =
-                                value.map(|amount| amount.to_string()).unwrap_or_default();
-                            let mut text = if focused {
-                                ui.ctx()
-                                    .data_mut(|data| data.get_temp::<String>(editor_id))
-                                    .unwrap_or(saved_text)
-                            } else {
-                                saved_text
-                            };
-                            let response = ui.add(
-                                egui::TextEdit::singleline(&mut text)
-                                    .id(editor_id)
-                                    .hint_text("default")
-                                    .desired_width(96.0),
-                            );
-                            ui.ctx().data_mut(|data| {
-                                data.insert_temp(editor_id, text.clone());
-                            });
-                            let trimmed = text.trim();
-                            let parsed = trimmed
-                                .parse::<f64>()
-                                .ok()
-                                .filter(|amount| amount.is_finite() && *amount >= 0.0);
-                            let invalid = !trimmed.is_empty() && parsed.is_none();
-                            let commit = response.lost_focus()
-                                || response.has_focus()
-                                    && ui.input(|input| input.key_pressed(egui::Key::Enter));
-                            if commit && !invalid {
-                                let next = if trimmed.is_empty() { None } else { parsed };
-                                if *value != next {
-                                    *value = next;
-                                    changed = true;
-                                }
-                            }
-                            if invalid {
-                                ui.colored_label(theme::ERROR, "Use zero or more");
-                            } else {
-                                ui.label("");
-                            }
+                            changed |= capacity_override_editor(ui, editor_id, value);
                             ui.end_row();
                         }
                     });
@@ -748,4 +746,50 @@ fn plan_label(plan: &crate::subscriptions::Plan) -> String {
         _ => plan.name,
     };
     format!("{name} · {price}/month")
+}
+
+fn capacity_override_editor(
+    ui: &mut egui::Ui,
+    editor_id: egui::Id,
+    value: &mut Option<f64>,
+) -> bool {
+    let focused = ui.memory(|memory| memory.has_focus(editor_id));
+    let saved_text = value.map(|amount| amount.to_string()).unwrap_or_default();
+    let mut text = if focused {
+        ui.ctx()
+            .data_mut(|data| data.get_temp::<String>(editor_id))
+            .unwrap_or(saved_text)
+    } else {
+        saved_text
+    };
+    let response = ui.add(
+        egui::TextEdit::singleline(&mut text)
+            .id(editor_id)
+            .hint_text("default")
+            .desired_width(96.0),
+    );
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(editor_id, text.clone()));
+    let trimmed = text.trim();
+    let parsed = trimmed
+        .parse::<f64>()
+        .ok()
+        .filter(|amount| amount.is_finite() && *amount >= 0.0);
+    let invalid = !trimmed.is_empty() && parsed.is_none();
+    let commit = response.lost_focus()
+        || response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+    let mut changed = false;
+    if commit && !invalid {
+        let next = if trimmed.is_empty() { None } else { parsed };
+        if *value != next {
+            *value = next;
+            changed = true;
+        }
+    }
+    if invalid {
+        ui.colored_label(theme::ERROR, "Use zero or more");
+    } else {
+        ui.label("");
+    }
+    changed
 }

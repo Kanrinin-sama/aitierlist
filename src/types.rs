@@ -211,6 +211,10 @@ impl Row {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CandidatePick {
+    #[serde(default)]
+    pub allowance_basis: String,
+    #[serde(default)]
+    pub capacity_windows: Vec<CapacityWindow>,
     pub row_index: usize,
     pub competence: Option<f64>,
     pub competence_floor: Option<f64>,
@@ -248,6 +252,10 @@ pub struct ScenarioPick {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Pick {
+    #[serde(default)]
+    pub allowance_basis: String,
+    #[serde(default)]
+    pub capacity_windows: Vec<CapacityWindow>,
     pub row_index: usize,
     pub competence: Option<f64>,
     pub competence_floor: Option<f64>,
@@ -365,5 +373,141 @@ fn benchmark_key(benchmark: Benchmark) -> &'static str {
         Benchmark::Hle => "hle",
         Benchmark::Lcr => "lcr",
         Benchmark::Omniscience => "omniscience",
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CapacityUnit {
+    ApiEquivalentUsd,
+    Requests,
+    Prompts,
+    Messages,
+}
+
+impl CapacityUnit {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ApiEquivalentUsd => "API-equivalent USD",
+            Self::Requests => "requests",
+            Self::Prompts => "prompts",
+            Self::Messages => "messages",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WindowCap {
+    Amount(f64),
+    Range { low: f64, high: f64 },
+    ParentFraction(f64),
+    Unpublished,
+}
+
+impl WindowCap {
+    pub fn bounds(self, parent: f64) -> (f64, f64) {
+        match self {
+            Self::Amount(amount) => (amount, amount),
+            Self::Range { low, high } => (low, high),
+            Self::ParentFraction(fraction) => (parent * fraction, parent * fraction),
+            Self::Unpublished => (0.0, 0.0),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WindowReset {
+    Rolling { hours: u32 },
+    Daily,
+    Weekly,
+    Monthly,
+}
+
+impl WindowReset {
+    pub fn label(self) -> String {
+        match self {
+            Self::Rolling { hours } => format!("rolling {hours} h"),
+            Self::Daily => "daily".to_owned(),
+            Self::Weekly => "weekly".to_owned(),
+            Self::Monthly => "monthly".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CapacityBasis {
+    Published,
+    Anecdotal,
+    TransferredPrior,
+    UserOverride,
+}
+
+impl CapacityBasis {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Published => "published",
+            Self::Anecdotal => "anecdotal",
+            Self::TransferredPrior => "transferred-prior (anecdotal)",
+            Self::UserOverride => "user-override",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CapacityWindow<S = String> {
+    pub id: S,
+    pub parent: Option<S>,
+    pub unit: CapacityUnit,
+    pub cap: WindowCap,
+    pub reset: WindowReset,
+    pub basis: CapacityBasis,
+    pub reset_basis: CapacityBasis,
+    pub source_url: S,
+    pub detail: S,
+    pub reference_only: bool,
+}
+
+impl CapacityWindow {
+    pub fn summary(&self, windows: &[Self]) -> String {
+        let parent = self
+            .parent
+            .as_ref()
+            .and_then(|id| windows.iter().find(|window| &window.id == id));
+        let amount = match self.cap {
+            WindowCap::Amount(amount) => format!("{amount:.2}"),
+            WindowCap::Range { low, high } => format!("{low:.2}–{high:.2} (range)"),
+            WindowCap::ParentFraction(fraction) => {
+                let parent_amount = parent.map(|window| window.cap.bounds(0.0).0).unwrap_or(0.0);
+                let parent_basis = parent
+                    .map(|window| window.basis.label())
+                    .unwrap_or("unknown");
+                format!(
+                    "{}% of {} = {:.2} ({parent_basis} amount)",
+                    fraction * 100.0,
+                    self.parent.as_deref().unwrap_or("parent"),
+                    parent_amount * fraction
+                )
+            }
+            WindowCap::Unpublished => "amount unpublished".to_owned(),
+        };
+        let status = if self.reference_only {
+            "reference only; not a fixed cap"
+        } else if self.unit != CapacityUnit::ApiEquivalentUsd || self.reset != WindowReset::Weekly {
+            "stored; not enforced"
+        } else {
+            "weekly allocation cap"
+        };
+        format!(
+            "{}: {amount} {} / {} · {} · reset: {} · {status}. {}",
+            self.id,
+            self.unit.label(),
+            self.reset.label(),
+            self.basis.label(),
+            self.reset_basis.label(),
+            self.detail
+        )
     }
 }

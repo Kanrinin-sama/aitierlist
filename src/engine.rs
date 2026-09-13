@@ -384,68 +384,39 @@ pub enum Allowance {
 }
 
 fn priced_plan_for(vendor: &str, budget: f64) -> Option<(f64, Allowance)> {
-    use Allowance::{Calls, Usd};
-    let plans: &[(f64, Allowance)] = match vendor {
-        "openai" => &[
-            (200.0, Usd(1538.0, 2272.0)),
-            (100.0, Usd(384.0, 568.0)),
-            (20.0, Usd(77.0, 114.0)),
-        ],
-        "anthropic" => &[
-            (200.0, Usd(1100.0, 1300.0)),
-            (100.0, Usd(500.0, 650.0)),
-            (20.0, Usd(100.0, 130.0)),
-        ],
-        "google" => &[
-            (199.99, Usd(19.99 * 20.0, 19.99 * 20.0)),
-            (99.99, Usd(19.99 * 5.0, 19.99 * 5.0)),
-            (19.99, Usd(19.99, 19.99)),
-        ],
-        "muse" => &[
-            (50.0, Usd(50.0, 50.0)),
-            (15.0, Usd(15.0, 15.0)),
-            (5.0, Usd(5.0, 5.0)),
-        ],
-        "xai" => &[
-            (300.0, Usd(300.0, 300.0)),
-            (100.0, Usd(100.0, 100.0)),
-            (30.0, Usd(19.0, 115.0)),
-        ],
-        "cursor" => &[
-            (200.0, Usd(228.0, 228.0)),
-            (60.0, Usd(34.0, 92.0)),
-            (20.0, Usd(11.0, 11.0)),
-        ],
-        "cursor-api" => &[
-            (200.0, Usd(92.31, 92.31)),
-            (60.0, Usd(16.15, 16.15)),
-            (20.0, Usd(4.62, 4.62)),
-        ],
-        "moonshot" => &[
-            (199.0, Usd(200.0, 200.0)),
-            (99.0, Usd(100.0, 100.0)),
-            (39.0, Usd(33.0, 33.0)),
-            (19.0, Usd(6.7, 6.7)),
-        ],
-        "alibaba" => &[(50.0, Calls(90000.0))],
-        "zai" => &[
-            (168.0, Usd(428.0, 568.0)),
-            (80.0, Usd(184.0, 243.0)),
-            (18.0, Usd(31.0, 41.0)),
-        ],
-        "minimax" => &[
-            (132.0, Usd(132.0, 132.0)),
-            (55.0, Usd(55.0, 55.0)),
-            (22.0, Usd(22.0, 22.0)),
-        ],
-        "opencode" => &[(10.0, Usd(60.0, 60.0))],
-        "cognition" => &[(200.0, Usd(200.0, 200.0)), (20.0, Usd(20.0, 20.0))],
-        _ => &[],
+    let plan = crate::subscriptions::plan_for(vendor, budget)?;
+    let allowance = if let Some(window) = plan.weekly_window() {
+        let (low, high) = window.cap.bounds(0.0);
+        Allowance::Usd(low, high)
+    } else {
+        let window = plan
+            .windows
+            .iter()
+            .find(|window| window.unit == crate::types::CapacityUnit::Requests)?;
+        Allowance::Calls(window.cap.bounds(0.0).0)
     };
-    plans
-        .iter()
-        .find(|(price, _)| *price <= budget)
-        .map(|(price, plan)| (*price, *plan))
+    Some((plan.monthly_price, allowance))
+}
+
+fn weekly_override(vendor: &str, budget: f64, settings: &Settings) -> Option<f64> {
+    crate::subscriptions::plan_for(vendor, budget)
+        .and_then(|plan| {
+            plan.weekly_window()
+                .and_then(|window| plan.override_amount(vendor, window, settings))
+        })
+        .or_else(|| settings.vendor_overrides.get(vendor).copied().flatten())
+}
+
+fn capacity_basis(vendor: &str, budget: f64, settings: &Settings) -> &'static str {
+    if budget < 0.0 {
+        "API; no subscription cap"
+    } else if weekly_override(vendor, budget, settings).is_some() {
+        "user-override"
+    } else if let Some(plan) = crate::subscriptions::plan_for(vendor, budget) {
+        plan.weekly_basis(vendor, settings)
+    } else {
+        "no weekly USD window"
+    }
 }
 
 pub fn plan_for(vendor: &str, budget: f64) -> Option<Allowance> {
@@ -472,13 +443,16 @@ pub fn subscription_price(row: &Row, tier: Tier, settings: &Settings) -> Option<
     priced_plan_for(&row.vendor, budget).map(|(price, _)| price)
 }
 
-fn plan_eligible(row: &Row, plan: Option<Allowance>) -> bool {
-    let Some(plan) = plan else { return false };
-    if matches!(plan, Allowance::Calls(_))
-        && !row
-            .usd_per_step
-            .is_some_and(|value| value.is_finite() && value > 0.0)
+fn plan_eligible(row: &Row, plan: Option<Allowance>, budget: f64) -> bool {
+    if row.vendor == "anthropic"
+        && crate::subscriptions::is_fable(row)
+        && crate::subscriptions::plan_for(&row.vendor, budget)
+            .is_some_and(|plan| plan.id == "claude-pro")
     {
+        return false;
+    }
+    let Some(plan) = plan else { return false };
+    if matches!(plan, Allowance::Calls(amount) if amount <= 0.0) {
         return false;
     }
     !row.harness.eq_ignore_ascii_case("Claude Code")
@@ -829,25 +803,13 @@ pub(crate) fn orchestrator_dispatch_cycle(row: &Row, settings: &Settings) -> Opt
     })
 }
 
-fn allowance(row: &Row, plan: Option<Allowance>, override_amount: Option<f64>) -> (f64, f64) {
+fn allowance(plan: Option<Allowance>, override_amount: Option<f64>) -> (f64, f64) {
     if let Some(amount) = override_amount {
         return (amount, amount);
     }
-    let conversion = if matches!(plan, Some(Allowance::Calls(_))) {
-        row.usd_per_step.unwrap_or(0.0)
-    } else {
-        1.0
-    };
     match plan {
-        Some(Allowance::Usd(low, high)) => (
-            low * 12.0 / 52.0 * conversion,
-            high * 12.0 / 52.0 * conversion,
-        ),
-        Some(Allowance::Calls(amount)) => {
-            let amount = amount * 12.0 / 52.0 * conversion;
-            (amount, amount)
-        }
-        None => (0.0, 0.0),
+        Some(Allowance::Usd(low, high)) => (low, high),
+        Some(Allowance::Calls(_)) | None => (0.0, 0.0),
     }
 }
 
@@ -862,13 +824,10 @@ pub fn has_positive_allowance(row: &Row, tier: Tier, settings: &Settings) -> boo
         Tier::T20 => settings.plan_prices.t20,
     };
     let plan = plan_for(&row.vendor, budget);
-    let override_amount = settings
-        .vendor_overrides
-        .get(&row.vendor)
-        .copied()
-        .flatten();
-    let range = allowance(row, plan, override_amount);
+    let override_amount = weekly_override(&row.vendor, budget, settings);
+    let range = allowance(plan, override_amount);
     range.1 > 0.0
+        && (plan_eligible(row, plan, budget) || plan.is_none() && override_amount.is_some())
 }
 
 fn fixed_tasks(time: f64, cost: f64, amount: f64) -> f64 {
@@ -1004,13 +963,9 @@ fn analyze(
         }
         let vendor = VENDORS.iter().position(|vendor| *vendor == row.vendor);
         let plan = vendor.and_then(|index| plans[index]);
-        let override_amount = settings
-            .vendor_overrides
-            .get(&row.vendor)
-            .copied()
-            .flatten();
+        let override_amount = weekly_override(&row.vendor, budget, settings);
         if tier != Tier::Api
-            && !plan_eligible(row, plan)
+            && !plan_eligible(row, plan, budget)
             && !(plan.is_none() && override_amount.is_some())
         {
             excluded.push(ExcludedCandidate {
@@ -1029,10 +984,8 @@ fn analyze(
         let allowance_multiplier = row_adjustment
             .map(|value| value.allowance_multiplier)
             .unwrap_or(1.0);
-        let mut range = allowance(row, plan, override_amount);
-        let calls = override_amount.is_none() && matches!(plan, Some(Allowance::Calls(_)));
-        let range_multiplier =
-            allowance_multiplier * if calls { model_cost_multiplier } else { 1.0 };
+        let mut range = allowance(plan, override_amount);
+        let range_multiplier = allowance_multiplier;
         range.0 *= range_multiplier;
         range.1 *= range_multiplier;
         let Some(cycles) = role_cycles(
@@ -1073,7 +1026,7 @@ fn analyze(
                     row_index,
                     competence: Some(competence),
                     range,
-                    calls,
+                    calls: false,
                     limit: index + 1,
                     cycle,
                     nominal,
@@ -1285,6 +1238,14 @@ fn analyze(
         let a_star_hours = quota.map(|value| value * cycle.wall / 3600.0);
         let cycles_per_week = cycle_capacity(cycle, tier, settings, policy.range);
         CandidatePick {
+            allowance_basis: capacity_basis(&rows[policy.row_index].vendor, budget, settings)
+                .to_owned(),
+            capacity_windows: crate::subscriptions::plan_for(
+                &rows[policy.row_index].vendor,
+                budget,
+            )
+            .map(|plan| plan.resolved_windows(&rows[policy.row_index].vendor, settings))
+            .unwrap_or_default(),
             row_index: policy.row_index,
             competence: policy.competence,
             competence_floor: configured_floor,
@@ -1371,7 +1332,12 @@ fn analyze(
                 })
                 .unwrap_or(selected);
             ScenarioPick {
-                name: definition.name.clone(),
+                name: format!(
+                    "{} · selected capacity: {} · comparator capacity: {}",
+                    definition.name,
+                    capacity_basis(&rows[policies[selected].row_index].vendor, budget, settings),
+                    capacity_basis(&rows[policies[winner].row_index].vendor, budget, settings)
+                ),
                 row_index: policies[winner].row_index,
                 attempt_limit: policies[winner].limit,
                 capacity_shortfall: if best_capacity[scenario_index] == 0.0 {
@@ -1386,6 +1352,8 @@ fn analyze(
         .collect();
     (
         Some(Pick {
+            allowance_basis: first.allowance_basis,
+            capacity_windows: first.capacity_windows,
             row_index: first.row_index,
             competence: first.competence,
             competence_floor: first.competence_floor,
