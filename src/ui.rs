@@ -1745,9 +1745,12 @@ impl App {
                 "/month · Declared subscriptions".to_owned(),
             ),
             (
-                "HOURS / ACCOUNT".to_owned(),
+                "HOURS / TRACK".to_owned(),
                 format!("{:.1} weekly", portfolio.available_hours_per_provider),
-                "Shared by worker roles".to_owned(),
+                format!(
+                    "{} parallel tracks share account quotas",
+                    portfolio.orchestrators
+                ),
             ),
             (
                 "FUNDED / DEMANDED JOBS".to_owned(),
@@ -2286,7 +2289,7 @@ impl App {
                                     "Expected",
                                     "Reserved",
                                     "Remaining",
-                                    "Time used / available",
+                                    "Track hours used / available",
                                 ] {
                                     ui.strong(label);
                                 }
@@ -2296,10 +2299,10 @@ impl App {
                                         "{} · {}",
                                         pool.provider_name, pool.plan_name
                                     ));
-                                    ui.label(format!("{:.2} {}", pool.weekly_capacity, pool.unit));
+                                    ui.label(pool.weekly_capacity.map_or_else(|| format!("Unknown {}", pool.unit), |capacity| format!("{capacity:.2} {}", pool.unit)));
                                     ui.label(format!("{:.2}", pool.nominal_usage));
                                     ui.label(format!("{:.2}", pool.reserved_usage));
-                                    ui.label(format!("{:.2}", pool.remaining_reserved_capacity));
+                                    ui.label(pool.remaining_reserved_capacity.map_or_else(|| "Unknown".to_owned(), |capacity| format!("{capacity:.2}")));
                                     ui.label(format!(
                                         "{:.1} / {:.1} h",
                                         pool.scheduled_hours, pool.available_hours
@@ -2395,6 +2398,9 @@ impl App {
         }
         ui.add_space(12.0);
         let table = self.selected_table();
+        if let Some(notice) = crate::comparison::scenario_identity_notice(table) {
+            ui.label(notice);
+        }
         if self.ranking_seat == Seat::NetResearch {
             let Some(research) = table
                 .research_tiers

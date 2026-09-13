@@ -67,9 +67,17 @@ fn same(left: f64, right: f64) -> bool {
     left.total_cmp(&right).is_eq()
 }
 
+pub fn scenario_identity_notice(table: &Table) -> Option<&'static str> {
+    table.picks.iter().filter_map(|entry| entry.pick.as_ref())
+        .flat_map(|pick| &pick.scenarios)
+        .any(|scenario| scenario.id.is_empty())
+        .then_some("Snapshot predates scenario identity; comparisons involving unidentified scenarios are unavailable. Recompute from source data.")
+}
+
 fn scenario_capacities(pick: &Pick) -> Vec<(&str, f64)> {
     pick.scenarios
         .iter()
+        .filter(|scenario| !scenario.id.is_empty())
         .map(|scenario| (scenario.id.as_str(), scenario.selected_tasks_per_week))
         .collect()
 }
@@ -88,7 +96,12 @@ pub fn plan_comparisons(table: &Table) -> Vec<PlanComparison> {
                 ) else {
                     continue;
                 };
-                if left.scenarios.is_empty()
+                if left
+                    .scenarios
+                    .iter()
+                    .chain(&right.scenarios)
+                    .any(|scenario| scenario.id.is_empty())
+                    || left.scenarios.is_empty()
                     || left.scenarios.len() != right.scenarios.len()
                     || !left.scenarios.iter().all(|left_scenario| {
                         right

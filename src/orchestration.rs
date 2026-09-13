@@ -21,7 +21,7 @@ pub fn isolated_protocol(table: &Table, paths: &crate::agent_setup::SetupPaths) 
     );
     output.push_str(&format!("Read the compact approved profile at `{}` and live ledger at `{}` only as needed. If missing, incomplete, changed, or moved to another machine, consult the profile schema `{}` and ledger schema `{}` from disk; do not paste schemas into routine prompts. Verify isolated CLI/model/effort, accounts, subscription connectors, native quota/reset windows, work periods, and lifecycle controls. Batch missing facts for approval; reuse unchanged facts and scoped overrides. Installation proves neither auth nor approval. Inspect captured hosts, use fleet login <host-id> before finalization when authentication is needed, confirm authentication/profile facts, save approved profile/ledger, then finalize routes. Missing tools require manual or tool-enabled setup.\n\n", paths.profile.display(), paths.ledger.display(), paths.profile_schema.display(), paths.ledger_schema.display()));
     if let Some(portfolio) = &table.portfolio {
-        output.push_str(&format!("Planning snapshot: {} concurrent project orchestrators, one conductor per project; {:.1} weekly wall-clock hours per account. Forecasts and weekly route reservations are aggregate across projects. All projects share the same account budgets and per-account work window; this count grants no extra worker concurrency. Confirm workflow.orchestrators separately from worker concurrency before spending.\n\n", portfolio.orchestrators, portfolio.available_hours_per_provider));
+        output.push_str(&format!("Planning snapshot: {} concurrent project orchestrators, one conductor per project; {:.1} weekly wall-clock hours per account. Forecasts and weekly route reservations are aggregate across projects. The proxy calendar has one track per concurrent project, each bounded by the weekly work window; all tracks share the same account budgets. Native worker concurrency requires profile authorization. Confirm workflow.orchestrators separately from worker concurrency before spending.\n\n", portfolio.orchestrators, portfolio.available_hours_per_provider));
     }
     if let Some(rule) = recommended_route(table) {
         output.push_str(&format!("Recommend {} / {} as the fixed conductor allocation. A different host must preserve the exact model, effort, provider, plan, and account binding; otherwise replan before spending.\n", rule.provider_id, rule.plan_id));
@@ -720,14 +720,15 @@ pub fn render_with_discovery(
             usage.reserved_hours
         )?;
     }
-    output.push_str("\n## Shared account planning inputs\n\nAPI-equivalent USD below is a model input, never a native quota meter. The profile binds one account per provider; only that account contributes forecast allowance and calendar hours, even when more subscriptions are owned. Onboarding must resolve real account aliases, entitlement, meter units, resets, and remaining working window before using them operationally.\n\n");
+    output.push_str("\n## Shared account planning inputs\n\nAPI-equivalent USD below is a model input, never a native quota meter. The profile binds one account per provider; its forecast allowance is shared by one H-hour calendar track per parallel orchestrator, even when more subscriptions are owned. Onboarding must resolve real account aliases, entitlement, meter units, resets, and remaining working window before using them operationally.\n\n");
     for pool in &portfolio.pools {
         writeln!(
             output,
-            "- {} / {}: one bound account contributes modeled {:.4} USD/week and {:.1} hours/week; {} owned subscriptions count toward monthly purchase cost only and add no forecast capacity; [plan source]({}). {}",
+            "- {} / {}: one bound account contributes modeled {} USD/week and {:.1} aggregate track hours/week; {} owned subscriptions count toward monthly purchase cost only and add no forecast capacity; [plan source]({}). {}",
             pool.provider_id,
             pool.plan_id,
-            pool.per_account_weekly_capacity,
+            pool.per_account_weekly_capacity
+                .map_or_else(|| "unknown".to_owned(), |capacity| format!("{capacity:.4}")),
             pool.available_hours,
             pool.subscription_count,
             pool.source_url,

@@ -818,7 +818,10 @@ impl Plan {
             let ceiling = window.capacity_limit(&windows).ok()?;
             let amount = demand.amount(window.unit)?;
             let committed = if window.reset.is_budget() {
-                settings.orchestrators as f64 * amount
+                settings.orchestrators as f64
+                    * amount
+                    * window.reset.commitment_hours(settings.agent_hours)
+                    / settings.agent_hours
             } else {
                 settings.orchestrators as f64 * amount / duration_hours
                     * window.reset.commitment_hours(settings.agent_hours)
@@ -839,7 +842,7 @@ impl Plan {
             window.parent.is_none()
                 && window.unit == CapacityUnit::ApiEquivalentUsd
                 && window.reset == WindowReset::Weekly
-                && window.enforceable_cap().is_some()
+                && !window.reference_only
         })
     }
 
@@ -873,23 +876,20 @@ impl Plan {
             .filter(|amount| amount.is_finite() && *amount >= 0.0)
     }
 
-    pub fn weekly_bounds(&self, provider_id: &str, settings: &Settings) -> (f64, f64) {
-        let Some(window) = self.weekly_window() else {
-            return (0.0, 0.0);
-        };
+    pub fn weekly_bounds(&self, provider_id: &str, settings: &Settings) -> Option<(f64, f64)> {
+        let window = self.weekly_window()?;
         self.override_amount(provider_id, window, settings)
             .map(|amount| (amount, amount))
-            .unwrap_or_else(|| window.cap.bounds(0.0))
+            .or_else(|| window.cap.bounds(None))
     }
 
-    pub fn fable_capacity(&self, provider_id: &str, settings: &Settings) -> f64 {
+    pub fn fable_capacity(&self, provider_id: &str, settings: &Settings) -> Option<f64> {
         let windows = self.resolved_windows(provider_id, settings);
         windows
             .iter()
             .find(|window| window.id == FABLE_WEEKLY.id)
             .and_then(|window| window.amount_bounds(&windows))
             .map(|(low, _)| low)
-            .unwrap_or(0.0)
     }
     pub fn resolved_windows(&self, provider_id: &str, settings: &Settings) -> Vec<CapacityWindow> {
         let windows: Vec<_> = self
@@ -1005,7 +1005,7 @@ pub fn eligible(provider: &Provider, plan: &Plan, row: &Row) -> bool {
             row.harness == "Grok Build"
                 && (row.vendor == "xai" || row.model.starts_with("Composer 2.5"))
         }
-        _ => false,
+        _ => provider.id == row.vendor && row.harness != "model",
     }
 }
 

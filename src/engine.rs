@@ -381,19 +381,22 @@ pub fn reference_workload_name(seat: Seat) -> &'static str {
 pub enum Allowance {
     Usd(f64, f64),
     Calls(f64),
+    Unknown,
 }
 
 fn priced_plan_for(vendor: &str, budget: f64) -> Option<(f64, Allowance)> {
     let plan = crate::subscriptions::plan_for(vendor, budget)?;
     let allowance = if let Some(window) = plan.weekly_window() {
-        let (low, high) = window.cap.bounds(0.0);
-        Allowance::Usd(low, high)
+        match window.cap.bounds(None) {
+            Some((low, high)) => Allowance::Usd(low, high),
+            None => Allowance::Unknown,
+        }
     } else {
-        let window = plan.windows.iter().find(|window| {
-            window.unit == crate::types::CapacityUnit::Requests
-                && window.enforceable_cap().is_some()
-        })?;
-        Allowance::Calls(window.enforceable_cap()?.bounds(0.0).0)
+        plan.windows
+            .iter()
+            .filter(|window| window.unit == crate::types::CapacityUnit::Requests)
+            .find_map(|window| window.enforceable_cap()?.bounds(None))
+            .map_or(Allowance::Unknown, |(amount, _)| Allowance::Calls(amount))
     };
     Some((plan.monthly_price, allowance))
 }
@@ -832,13 +835,13 @@ pub(crate) fn orchestrator_dispatch_cycle(row: &Row, settings: &Settings) -> Opt
     })
 }
 
-fn allowance(plan: Option<Allowance>, override_amount: Option<f64>) -> (f64, f64) {
+fn allowance(plan: Option<Allowance>, override_amount: Option<f64>) -> Option<(f64, f64)> {
     if let Some(amount) = override_amount {
-        return (amount, amount);
+        return Some((amount, amount));
     }
     match plan {
-        Some(Allowance::Usd(low, high)) => (low, high),
-        Some(Allowance::Calls(_)) | None => (0.0, 0.0),
+        Some(Allowance::Usd(low, high)) => Some((low, high)),
+        Some(Allowance::Calls(_) | Allowance::Unknown) | None => None,
     }
 }
 
@@ -855,7 +858,7 @@ pub fn has_positive_allowance(row: &Row, tier: Tier, settings: &Settings) -> boo
     let plan = plan_for(&row.vendor, budget);
     let override_amount = weekly_override(&row.vendor, budget, settings);
     let range = allowance(plan, override_amount);
-    range.1 > 0.0
+    range.is_some_and(|(_, high)| high > 0.0)
         && (plan_eligible(row, plan, budget) || plan.is_none() && override_amount.is_some())
 }
 
@@ -871,36 +874,36 @@ fn tasks(
     cycle: Cycle,
     tier: Tier,
     settings: &Settings,
-    range: (f64, f64),
+    range: Option<(f64, f64)>,
     point: Option<bool>,
 ) -> f64 {
     let time = settings.agent_hours * 3600.0 / cycle.wall;
-    let cycles = if tier == Tier::Api {
-        time
-    } else {
-        let amount = match point {
-            Some(false) => range.0,
-            Some(true) => range.1,
-            None => (range.0 + range.1) / 2.0,
-        };
-        fixed_tasks(time, cycle.model_spend, amount)
+    let cycles = match (tier, range) {
+        (Tier::Api, _) | (_, None) => time,
+        (_, Some((low, high))) => {
+            let amount = match point {
+                Some(false) => low,
+                Some(true) => high,
+                None => (low + high) / 2.0,
+            };
+            fixed_tasks(time, cycle.model_spend, amount)
+        }
     };
     cycles * (1.0 - cycle.unfinished)
 }
 
-fn cycle_capacity(cycle: Cycle, tier: Tier, settings: &Settings, range: (f64, f64)) -> f64 {
+fn cycle_capacity(cycle: Cycle, tier: Tier, settings: &Settings, range: Option<(f64, f64)>) -> f64 {
     let time = settings.agent_hours * 3600.0 / cycle.wall;
-    if tier == Tier::Api {
-        return time;
+    match (tier, range) {
+        (Tier::Api, _) | (_, None) => time,
+        (_, Some((low, high))) => fixed_tasks(time, cycle.model_spend, (low + high) / 2.0),
     }
-    let amount = (range.0 + range.1) / 2.0;
-    fixed_tasks(time, cycle.model_spend, amount)
 }
 
 struct Policy {
     row_index: usize,
     competence: Option<f64>,
-    range: (f64, f64),
+    range: Option<(f64, f64)>,
     limit: usize,
     cycle: Cycle,
     nominal: f64,
@@ -1012,10 +1015,8 @@ fn analyze(
         let allowance_multiplier = row_adjustment
             .map(|value| value.allowance_multiplier)
             .unwrap_or(1.0);
-        let mut range = allowance(plan, override_amount);
-        let range_multiplier = allowance_multiplier;
-        range.0 *= range_multiplier;
-        range.1 *= range_multiplier;
+        let range = allowance(plan, override_amount)
+            .map(|(low, high)| (low * allowance_multiplier, high * allowance_multiplier));
         let Some(cycles) = role_cycles(
             row,
             seat,
@@ -1270,9 +1271,10 @@ fn analyze(
             .map(|scenario| scenario[index])
             .fold(f64::NEG_INFINITY, f64::max);
         let time = settings.agent_hours * 3600.0 / cycle.wall;
-        let mean_amount = (policy.range.0 + policy.range.1) / 2.0;
-        let quota = (tier != Tier::Api && cycle.model_spend > 0.0)
-            .then_some(mean_amount / cycle.model_spend);
+        let quota = policy
+            .range
+            .filter(|_| tier != Tier::Api && cycle.model_spend > 0.0)
+            .map(|(low, high)| (low + high) / 2.0 / cycle.model_spend);
         let a_star_hours = quota.map(|value| value * cycle.wall / 3600.0);
         let cycles_per_week = cycle_capacity(cycle, tier, settings, policy.range);
         CandidatePick {
@@ -1499,7 +1501,10 @@ pub fn score(
         source_fetched_at,
         cache_state,
         plan_comparisons: Vec::new(),
+        plan_comparison_notice: None,
     };
     table.plan_comparisons = crate::comparison::plan_comparisons(&table);
+    table.plan_comparison_notice =
+        crate::comparison::scenario_identity_notice(&table).map(str::to_owned);
     table
 }

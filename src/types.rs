@@ -325,6 +325,7 @@ pub struct SeatTierFrontier {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(remote = "Self")]
 pub struct Table {
     #[serde(default)]
     pub portfolio: Option<crate::portfolio::Portfolio>,
@@ -333,6 +334,8 @@ pub struct Table {
     pub frontiers: Vec<SeatTierFrontier>,
     #[serde(default)]
     pub plan_comparisons: Vec<crate::comparison::PlanComparison>,
+    #[serde(default)]
+    pub plan_comparison_notice: Option<String>,
     pub rows: Vec<Row>,
     #[serde(default)]
     pub research_tiers: Vec<crate::portfolio::ResearchTierPick>,
@@ -341,6 +344,22 @@ pub struct Table {
     pub generated_at: String,
     pub source_fetched_at: String,
     pub cache_state: CacheState,
+}
+
+impl Serialize for Table {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Table {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut table = Self::deserialize(deserializer)?;
+        table.plan_comparisons = crate::comparison::plan_comparisons(&table);
+        table.plan_comparison_notice =
+            crate::comparison::scenario_identity_notice(&table).map(str::to_owned);
+        Ok(table)
+    }
 }
 
 impl Table {
@@ -357,6 +376,7 @@ impl Table {
             picks: Vec::new(),
             frontiers: Vec::new(),
             plan_comparisons: Vec::new(),
+            plan_comparison_notice: None,
             rows: Vec::new(),
             research_tiers: Vec::new(),
             evidence_catalog: crate::evidence::EvidenceCatalog::default(),
@@ -409,12 +429,14 @@ pub enum WindowCap {
 }
 
 impl WindowCap {
-    pub fn bounds(self, parent: f64) -> (f64, f64) {
+    pub fn bounds(self, parent: Option<(f64, f64)>) -> Option<(f64, f64)> {
         match self {
-            Self::Amount(amount) => (amount, amount),
-            Self::Range { low, high } => (low, high),
-            Self::ParentFraction(fraction) => (parent * fraction, parent * fraction),
-            Self::Unpublished => (0.0, 0.0),
+            Self::Amount(amount) => Some((amount, amount)),
+            Self::Range { low, high } => Some((low, high)),
+            Self::ParentFraction(fraction) => {
+                parent.map(|(low, high)| (low * fraction, high * fraction))
+            }
+            Self::Unpublished => None,
         }
     }
 }
@@ -496,13 +518,13 @@ impl CapacityDemand {
 
 impl WindowReset {
     pub fn is_budget(self) -> bool {
-        matches!(self, Self::Weekly | Self::Monthly)
+        matches!(self, Self::Daily | Self::Weekly | Self::Monthly)
     }
 
     pub fn commitment_hours(self, weekly_working_hours: f64) -> f64 {
         match self {
             Self::Rolling { hours } => f64::from(hours),
-            Self::Daily => 24.0,
+            Self::Daily => weekly_working_hours / 7.0,
             Self::Weekly => weekly_working_hours,
             Self::Monthly => weekly_working_hours * 52.0 / 12.0,
         }
@@ -603,9 +625,15 @@ impl CapacityWindow {
         };
         let mut status = match self.capacity_limit(windows) {
             Ok(amount) => format!(
-                "cap {amount:.4} {}; committed fleet rate × {:.4} working hours must fit",
+                "cap {amount:.4} {}; committed fleet rate × {:.4} {} must fit",
                 self.unit.label(),
-                self.reset.commitment_hours(weekly_working_hours)
+                self.reset.commitment_hours(weekly_working_hours),
+                match self.reset {
+                    WindowReset::Rolling { .. } => "elapsed hours per rolling window",
+                    WindowReset::Daily => "working hours per day (weekly hours / 7)",
+                    WindowReset::Weekly => "working hours per week",
+                    WindowReset::Monthly => "working hours per month (weekly hours × 52/12)",
+                }
             ),
             Err(reason) => reason.to_owned(),
         };

@@ -180,7 +180,7 @@ impl Portfolio {
                 demand - self.dispatch.admitted_changes as f64,
             ),
             None => format!(
-                "Weekly job demand is unknown: a required workflow stage lacks a measured duration. Subscriptions fund {} admitted jobs/week; the shortfall is unknown.",
+                "Weekly job demand is unknown: critical path duration unresolved. Subscriptions fund {} admitted jobs/week; the shortfall is unknown.",
                 self.dispatch.admitted_changes,
             ),
         }
@@ -603,9 +603,9 @@ pub struct AdaptiveRoute {
 pub struct PoolUsage {
     pub provider_id: String,
     pub subscription_count: usize,
-    pub per_account_weekly_capacity: f64,
+    pub per_account_weekly_capacity: Option<f64>,
     #[serde(default)]
-    pub per_account_fable_capacity: f64,
+    pub per_account_fable_capacity: Option<f64>,
     #[serde(default)]
     pub windows: Vec<crate::types::CapacityWindow>,
     #[serde(default)]
@@ -617,17 +617,17 @@ pub struct PoolUsage {
     pub plan_name: String,
     pub monthly_price: f64,
     pub price_is_estimate: bool,
-    pub weekly_capacity: f64,
+    pub weekly_capacity: Option<f64>,
     pub nominal_usage: f64,
     pub stress_usage: f64,
-    pub remaining_capacity: f64,
-    pub utilization_pct: f64,
+    pub remaining_capacity: Option<f64>,
+    pub utilization_pct: Option<f64>,
     pub available_hours: f64,
     pub scheduled_hours: f64,
     pub unused_hours: f64,
     pub reserved_usage: f64,
     pub reserved_hours: f64,
-    pub remaining_reserved_capacity: f64,
+    pub remaining_reserved_capacity: Option<f64>,
     pub remaining_reserved_hours: f64,
     pub unit: String,
     pub source_url: String,
@@ -639,11 +639,11 @@ pub struct PoolUsage {
 pub struct PoolLimit {
     pub provider_id: String,
     pub name: String,
-    pub weekly_capacity: f64,
+    pub weekly_capacity: Option<f64>,
     pub nominal_usage: f64,
     pub stress_usage: f64,
     pub reserved_usage: f64,
-    pub remaining_capacity: f64,
+    pub remaining_capacity: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -667,7 +667,7 @@ impl PoolUsage {
         demand: CapacityDemand,
         duration_hours: f64,
         fable: bool,
-        parallel: usize,
+        settings: &Settings,
     ) -> bool {
         self.windows.iter().all(|window| {
             if !window.applies_to(&self.windows, fable) {
@@ -680,10 +680,14 @@ impl PoolUsage {
                 return true;
             };
             if window.reset.is_budget() {
-                parallel as f64 * amount <= ceiling
+                settings.orchestrators as f64
+                    * amount
+                    * window.reset.commitment_hours(settings.agent_hours)
+                    / settings.agent_hours
+                    <= ceiling
             } else {
-                parallel as f64 * amount / duration_hours
-                    * window.reset.commitment_hours(self.available_hours)
+                settings.orchestrators as f64 * amount / duration_hours
+                    * window.reset.commitment_hours(settings.agent_hours)
                     <= ceiling
             }
         })
@@ -871,7 +875,7 @@ fn refresh_rate_usage(portfolio: &mut Portfolio, rows: &[Row], settings: &Settin
     );
 }
 fn reference_path_hours(candidates: &[Vec<Policy>], settings: &Settings) -> Option<f64> {
-    WorkClass::ALL
+    let hours: Option<f64> = WorkClass::ALL
         .into_iter()
         .zip(CLASS_MIX)
         .map(|(class, weight)| {
@@ -902,7 +906,8 @@ fn reference_path_hours(candidates: &[Vec<Policy>], settings: &Settings) -> Opti
             }
             Some(weight * finishes.into_iter().reduce(f64::max)?)
         })
-        .sum()
+        .sum();
+    hours.filter(|hours| hours.is_finite() && *hours > 0.0)
 }
 
 #[derive(Clone)]
@@ -1356,7 +1361,7 @@ fn schedule(
         if calendars[policy.pool].is_empty() {
             calendars[policy.pool].push(AccountCalendar::default());
         }
-        let (account_ordinal, start, finish) = (0..1)
+        let (account_ordinal, start, finish) = (0..settings.orchestrators)
             .filter_map(|account| {
                 let mut start = dependency_start;
                 if let Some(calendar) = calendars[policy.pool].get(account) {
@@ -1500,7 +1505,8 @@ fn search(
         }
     }
     let path_resource = capacities.len();
-    capacities.extend([hours, hours]);
+    let parallel_hours = hours * settings.orchestrators as f64;
+    capacities.extend([parallel_hours, parallel_hours]);
     let mut competence_links = Vec::new();
     if monotonic_class_competence {
         for role in 0..Seat::ALL.len() {
@@ -2035,7 +2041,7 @@ fn seed_class_recommendations(
                         policy.cycle.demand(),
                         policy.cycle.reserved_seconds / 3600.0,
                         policy.fable,
-                        settings.orchestrators,
+                        settings,
                     ) && policy.cycle.reserved_seconds * factor / 3600.0 <= hours
                 })
                 .max_by(|left, right| {
@@ -2275,6 +2281,7 @@ pub fn research_tier_picks(
 pub fn compare_conductors(rows: &[Row], settings: &Settings) -> Vec<ConductorTradeoff> {
     let selected: Vec<_> = subscriptions::PROVIDERS
         .iter()
+        .chain(subscriptions::RANKING_PRIORS)
         .filter_map(|provider| {
             let plan_id = settings.subscriptions.get(provider.id)?;
             Some((
@@ -2308,8 +2315,12 @@ pub fn compare_conductors(rows: &[Row], settings: &Settings) -> Vec<ConductorTra
                                     && crate::aa::family_key("", &native.model_key)
                                         == crate::aa::family_key("", &row.model_key)
                             }));
-                    let capacity = plan.weekly_bounds(provider.id, settings).0;
-                    maps_to_provider && capacity > 0.0 && settings.agent_hours > 0.0
+                    let capacity = plan
+                        .weekly_bounds(provider.id, settings)
+                        .map(|(low, _)| low);
+                    maps_to_provider
+                        && capacity.is_none_or(|capacity| capacity > 0.0)
+                        && settings.agent_hours > 0.0
                 })
                 .then(|| engine::competence(row, Seat::Orchestrator))
                 .flatten()
@@ -2400,7 +2411,7 @@ fn assigned_path(portfolio: &Portfolio, settings: &Settings) -> Option<(String, 
     if let Some(conductor) = &portfolio.conductor {
         identity.push_str(&conductor.binding_id);
     }
-    Some((identity, hours))
+    (hours.is_finite() && hours > 0.0).then_some((identity, hours))
 }
 
 fn allocate_core(
@@ -2417,7 +2428,7 @@ fn allocate_core(
             portfolio.dispatch.cadence_hours = None;
             portfolio.dispatch.jobs_per_week = None;
             portfolio.dispatch.path_status =
-                "Path time unknown: a required class stage has no assigned measured route."
+                "Critical path duration unresolved: a required stage lacks an assigned measured route or the derived path is not positive and finite."
                     .to_owned();
             return Some(portfolio);
         };
@@ -2458,6 +2469,7 @@ fn allocate_once(
 ) -> Option<Portfolio> {
     let selected: Vec<_> = subscriptions::PROVIDERS
         .iter()
+        .chain(subscriptions::RANKING_PRIORS)
         .filter_map(|provider| {
             let id = settings.subscriptions.get(provider.id)?;
             Some((provider, provider.plans.iter().find(|plan| plan.id == id)?))
@@ -2467,7 +2479,8 @@ fn allocate_once(
         return None;
     }
     let capacity = |provider: &subscriptions::Provider, plan: &subscriptions::Plan| {
-        plan.weekly_bounds(provider.id, settings).0
+        plan.weekly_bounds(provider.id, settings)
+            .map(|(low, _)| low)
     };
     let mut portfolio = Portfolio {
         orchestrators: settings.orchestrators, available_hours_per_provider: settings.agent_hours, total_scheduled_hours: 0.0, total_agent_hours: 0.0,
@@ -2484,23 +2497,23 @@ fn allocate_once(
         }).collect(),
         pools: selected.iter().map(|(provider, plan)| PoolUsage {
             provider_id: provider.id.to_owned(), subscription_count: settings.subscription_count(provider.id), per_account_weekly_capacity: capacity(provider, plan), per_account_fable_capacity: plan.fable_capacity(provider.id, settings), windows: plan.resolved_windows(provider.id, settings), rate_windows: Vec::new(), rate_infeasible: false, provider_name: provider.name.to_owned(), plan_id: plan.id.to_owned(), plan_name: plan.name.to_owned(), monthly_price: plan.monthly_price * settings.subscription_count(provider.id) as f64, price_is_estimate: plan.price_is_estimate,
-            weekly_capacity: capacity(provider, plan), nominal_usage: 0.0, stress_usage: 0.0, remaining_capacity: capacity(provider, plan), utilization_pct: 0.0,
-            available_hours: settings.agent_hours, scheduled_hours: 0.0, unused_hours: settings.agent_hours, reserved_usage: 0.0, reserved_hours: 0.0, remaining_reserved_capacity: capacity(provider, plan), remaining_reserved_hours: settings.agent_hours,
+            weekly_capacity: capacity(provider, plan), nominal_usage: 0.0, stress_usage: 0.0, remaining_capacity: capacity(provider, plan), utilization_pct: capacity(provider, plan).filter(|amount| *amount > 0.0).map(|_| 0.0),
+            available_hours: settings.agent_hours * settings.orchestrators as f64, scheduled_hours: 0.0, unused_hours: settings.agent_hours * settings.orchestrators as f64, reserved_usage: 0.0, reserved_hours: 0.0, remaining_reserved_capacity: capacity(provider, plan), remaining_reserved_hours: settings.agent_hours * settings.orchestrators as f64,
             unit: format!("{} API-equivalent USD", plan.weekly_basis(provider.id, settings)), source_url: plan.source_url.to_owned(), allowance_basis: format!("{} Owned subscriptions: {}; forecast uses one bound account. Every non-reference window constrains known demand in its own unit. Unknown native counts cannot constrain USD demand.", plan.capacity_summary(provider.id, settings), settings.subscription_count(provider.id)),
         }).collect(),
         limits: selected.iter().filter(|(provider, plan)| provider.id == "anthropic" && plan.id != "claude-pro").map(|(provider, plan)| PoolLimit {
             provider_id: provider.id.to_owned(), name: format!("Fable: published 50% of weekly-usd; {} USD amount", plan.weekly_basis(provider.id, settings)), weekly_capacity: plan.fable_capacity(provider.id, settings), nominal_usage: 0.0, stress_usage: 0.0, reserved_usage: 0.0, remaining_capacity: plan.fable_capacity(provider.id, settings),
         }).collect(),
         assumptions: vec![
-            "Capacity table: anecdotal USD amounts and published quota rules are labeled in Settings. Every non-reference window at every nesting level enforces parallel orchestrators times aggregate committed seat rate times working hours per budget period (H weekly; H × 52/12 monthly), or rolling interval hours, <= cap. Budget rates are reserved fleet visit spend divided by d × H; rolling rates are simultaneous active burn. Native counts and USD are separate demand dimensions; unknown native counts need measurement.".to_owned(),
+            "Capacity table: anecdotal USD amounts and published quota rules are labeled in Settings. Every non-reference window at every nesting level enforces parallel orchestrators times aggregate committed seat rate times working hours per budget period (H/7 daily; H weekly; H × 52/12 monthly), or rolling interval hours, <= cap. Budget rates are reserved fleet visit spend divided by d × H; rolling rates are simultaneous active burn. Native counts and USD are separate demand dimensions; unknown native counts need measurement.".to_owned(),
             "Demand is weekly hours times parallel orchestrators divided by the class-mix-weighted critical path of assigned measured workflow stages, iterated from fastest eligible until assignment stability or a detected cycle, including the full conditional repair path. Only complete bundles enter integer admission; fractional demand remains in jobs_per_week. Parallelism multiplies demand and committed seat rates, never quota. The existing class mix and resource factors are unchanged.".to_owned(),
-            "The profile binds one account per provider, so the forecast uses one modeled allowance and one account calendar per provider regardless of owned subscription count. Additional subscriptions remain in purchase costs but contribute no forecast capacity. Forecast account ordinals are scheduling slots, not native account identities, authentication, meters, or authorization.".to_owned(),
+            "The profile binds one account per provider, so the forecast uses one modeled allowance per provider shared across d calendar tracks of H hours, regardless of owned subscription count. Additional subscriptions remain in purchase costs but contribute no forecast capacity. Forecast account ordinals are scheduling slots, not native account identities, authentication, meters, or authorization.".to_owned(),
             "Select workflow templates from consequence, uncertainty, coupling, reversibility, evidence need, tool risk, correlation, and deadline risk. File count is load information only and never determines the workflow.".to_owned(),
             "The full forecast uses largest-remainder class counts with canonical ties. A fixed deficit-ordered sequence supplies nested admission prefixes; reduced demand never re-apportions.".to_owned(),
             "The API-equivalent worker proxy uses one stage for Focused, six for Standard, and seven for Complex and Extensive work. Expected repair activation uses the selected Implementer's bounded-attempt benchmark residual as an uncalibrated proxy; the full conditional repair path remains reserved. Each class can explicitly include one AA research-reference visit; the default coding forecast excludes it. Native tasks expand from their risk vectors and actual task evidence.".to_owned(),
             "The Orchestrator uses one persistent model and effort across the whole plan. Every admitted job charges one measured dispatch at its stress-adjusted per-job USD rate through all applicable budget and rate windows. Continuous/idle consumption is unknown and not measured or fully charged; optional USD headroom is an additional weekly fleet allowance reserved once on its selected account. Optional hour headroom is reserved once. Every actual native call is charged through the runtime ledger. Each worker visit uses one model and effort with 1–3 same-model attempts.".to_owned(),
             "Multi-criteria role utility uses each skill component once: capped completion for reference-workload evidence, static values for other skills. It is not real-job success probability. Class factors scale demand and resources, not calibrated difficulty.".to_owned(),
-            "The proxy calendar places its declared stage sequence in earliest account gaps to estimate API-equivalent capacity. Native scheduling instead uses authorized ready task IDs, risk-selected DAGs, immutable artifact dependencies, current reset windows, and deadlines.".to_owned(),
+            "The proxy calendar places its declared stage sequence in earliest parallel track gaps to estimate API-equivalent capacity. Native scheduling instead uses authorized ready task IDs, risk-selected DAGs, immutable artifact dependencies, current reset windows, and deadlines.".to_owned(),
             "The solver optimizes only assignments feasible under this declared scheduler. Modeled allowances and full-cap buffers do not guarantee real vendor quota or runtime; unknown actual usage requires pause and reconciliation.".to_owned(),
         ],
         message: String::new(),
@@ -2689,8 +2702,11 @@ fn allocate_once(
             } else {
                 native_pool
             };
-            let Some(pool) = pool.filter(|pool| portfolio.pools[*pool].weekly_capacity > 0.0)
-            else {
+            let Some(pool) = pool.filter(|pool| {
+                portfolio.pools[*pool]
+                    .weekly_capacity
+                    .is_none_or(|capacity| capacity > 0.0)
+            }) else {
                 continue;
             };
             let competence = if seat == Seat::Orchestrator {
@@ -2836,7 +2852,7 @@ fn allocate_once(
     }
     let Some(path_hours) = path_hours.or_else(|| reference_path_hours(&candidates, settings))
     else {
-        portfolio.message = "Workflow demand unknown: every required DAG stage needs an eligible policy with a measured duration.".to_owned();
+        portfolio.message = "Workflow demand unknown: critical path duration unresolved. Every required DAG stage needs an eligible measured route and the derived path must be positive and finite.".to_owned();
         refresh_rate_usage(&mut portfolio, rows, settings);
         return Some(portfolio);
     };
@@ -2869,7 +2885,7 @@ fn allocate_once(
                     policy.cycle.demand(),
                     policy.cycle.reserved_seconds / 3600.0,
                     policy.fable,
-                    settings.orchestrators,
+                    settings,
                 )
             });
     }
@@ -3023,8 +3039,9 @@ fn allocate_once(
                 {
                     limit.reserved_usage += settings.orchestrator_headroom_usd.unwrap_or(0.0);
                     limit.stress_usage = limit.reserved_usage;
-                    limit.remaining_capacity =
-                        (limit.weekly_capacity - limit.reserved_usage).max(0.0);
+                    limit.remaining_capacity = limit
+                        .weekly_capacity
+                        .map(|capacity| capacity - limit.reserved_usage);
                 }
             }
             portfolio.conductor = Some(ConductorAllocation {
@@ -3090,14 +3107,14 @@ fn allocate_once(
         }
         for pool in &mut portfolio.pools {
             pool.stress_usage = pool.reserved_usage;
-            pool.remaining_reserved_capacity =
-                (pool.weekly_capacity - pool.reserved_usage).max(0.0);
+            pool.remaining_reserved_capacity = pool
+                .weekly_capacity
+                .map(|capacity| capacity - pool.reserved_usage);
             pool.remaining_reserved_hours = (pool.available_hours - pool.reserved_hours).max(0.0);
-            pool.utilization_pct = if pool.weekly_capacity > 0.0 {
-                100.0 * pool.reserved_usage / pool.weekly_capacity
-            } else {
-                0.0
-            };
+            pool.utilization_pct = pool
+                .weekly_capacity
+                .filter(|capacity| *capacity > 0.0)
+                .map(|capacity| 100.0 * pool.reserved_usage / capacity);
         }
         adaptive_routes(&mut portfolio, &candidates, rows);
         fill_math_audit(&mut portfolio);
@@ -3357,8 +3374,9 @@ fn allocate_once(
                     limit.nominal_usage += rule.nominal_usage;
                     limit.reserved_usage += rule.reserved_usage;
                     limit.stress_usage = limit.reserved_usage;
-                    limit.remaining_capacity =
-                        (limit.weekly_capacity - limit.reserved_usage).max(0.0);
+                    limit.remaining_capacity = limit
+                        .weekly_capacity
+                        .map(|capacity| capacity - limit.reserved_usage);
                 }
             }
             portfolio.roles[group.role].allocated_hours += rule.nominal_hours;
@@ -3379,7 +3397,9 @@ fn allocate_once(
                 {
                     limit.reserved_usage += headroom_usage;
                     limit.stress_usage = limit.reserved_usage;
-                    limit.remaining_capacity = limit.weekly_capacity - limit.reserved_usage;
+                    limit.remaining_capacity = limit
+                        .weekly_capacity
+                        .map(|capacity| capacity - limit.reserved_usage);
                 }
             }
             portfolio.conductor = Some(ConductorAllocation {
@@ -3447,15 +3467,18 @@ fn allocate_once(
     adaptive_routes(&mut portfolio, &candidates, rows);
     for pool in &mut portfolio.pools {
         pool.stress_usage = pool.reserved_usage;
-        pool.remaining_capacity = (pool.weekly_capacity - pool.nominal_usage).max(0.0);
-        pool.remaining_reserved_capacity = (pool.weekly_capacity - pool.reserved_usage).max(0.0);
+        pool.remaining_capacity = pool
+            .weekly_capacity
+            .map(|capacity| capacity - pool.nominal_usage);
+        pool.remaining_reserved_capacity = pool
+            .weekly_capacity
+            .map(|capacity| capacity - pool.reserved_usage);
         pool.remaining_reserved_hours = (pool.available_hours - pool.reserved_hours).max(0.0);
         pool.unused_hours = (pool.available_hours - pool.scheduled_hours).max(0.0);
-        pool.utilization_pct = if pool.weekly_capacity > 0.0 {
-            100.0 * pool.reserved_usage / pool.weekly_capacity
-        } else {
-            0.0
-        };
+        pool.utilization_pct = pool
+            .weekly_capacity
+            .filter(|capacity| *capacity > 0.0)
+            .map(|capacity| 100.0 * pool.reserved_usage / capacity);
         portfolio.total_scheduled_hours += pool.scheduled_hours;
     }
     portfolio.total_agent_hours = portfolio.total_scheduled_hours;
