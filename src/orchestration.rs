@@ -429,7 +429,7 @@ pub fn render_with_discovery(
             cell(&conductor.binding_id)
         )?;
     }
-    output.push_str("\n## Persistent orchestrator\n\nThe same exact model and effort provides a persistent human-facing coordination service across concurrent projects and work classes. Worker jobs do not create forecast coordination visits. When no usage forecast is declared, native calls are on demand and governed by ledger holds. Optional USD and hour headroom is reserved once, independently of worker-job counts. Per-call resource values are qualification proxies, not a forecast or native quota claim. Benchmark provenance and native launch binding remain explicit.\n\n| Service | Model ID | Benchmark source | Account / plan | Cap | Capability | Utility | Evidence profile | II / LCR / HLE | Usage forecast | Fixed headroom USD / h | Per-call qualification proxy USD / h |\n|---|---|---|---|---:|---:|---:|---|---|---|---|---|\n");
+    output.push_str("\n## Persistent orchestrator\n\nThe same exact model and effort provides a persistent human-facing coordination service across concurrent projects and work classes. Each admitted worker job charges one measured dispatch at the stress-adjusted per-job USD rate through the applicable windows. Continuous/idle use between dispatches remains unmeasured and uncharged beyond any user allowance. Optional USD headroom is an additional weekly allowance for the whole fleet, reserved once on top of dispatch spend; hour headroom is reserved separately. Actual native calls are governed by ledger holds. Dispatch resource values are benchmark-derived forecasts, not native quota claims. Benchmark provenance and native launch binding remain explicit.\n\n| Service | Model ID | Benchmark source | Account / plan | Cap | Capability | Utility | Evidence profile | II / LCR / HLE | Usage forecast | Additional weekly fleet idle allowance USD / hours reserve | Per-dispatch reserved USD / h |\n|---|---|---|---|---:|---:|---:|---|---|---|---|---|\n");
     if let Some(conductor) = &portfolio.conductor {
         let benchmark = table
             .rows
@@ -484,8 +484,8 @@ pub fn render_with_discovery(
             cell(&evidence_components),
             cell(&forecast),
             cell(&headroom),
-            conductor.per_call_expected_usage,
-            conductor.per_call_expected_hours
+            conductor.per_call_reserved_usage,
+            conductor.per_call_reserved_hours
         )?;
     } else {
         output.push_str("| On demand | Unfunded | - | - | - | - | - | - | - | - | - | - |\n");

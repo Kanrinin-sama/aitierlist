@@ -1592,7 +1592,7 @@ impl App {
                     ui.horizontal_wrapped(|ui| {
                         let mut reserve_usd = self.settings.orchestrator_headroom_usd.is_some();
                         if ui
-                            .checkbox(&mut reserve_usd, "Reserve Orchestrator USD headroom")
+                            .checkbox(&mut reserve_usd, "Additional continuous/idle allowance (USD/week, whole fleet)")
                             .changed()
                         {
                             self.settings.orchestrator_headroom_usd = reserve_usd.then_some(0.0);
@@ -1620,7 +1620,7 @@ impl App {
                         }
                     });
                     ui.small(
-                        "Optional fixed Orchestrator headroom is reserved once for persistent coordination and does not scale with worker jobs.",
+                        "Every admitted job is charged the measured Orchestrator dispatch cost automatically. This optional weekly allowance is added once for the whole fleet on top of dispatch charges; it does not measure continuous/idle usage. Hours reserve remains separate.",
                     );
                     if changed {
                         self.apply_settings_change();
@@ -1665,6 +1665,34 @@ impl App {
             return;
         };
         let dispatch = &portfolio.dispatch;
+        egui::Frame::group(ui.style())
+            .fill(crate::theme::SURFACE)
+            .corner_radius(10)
+            .inner_margin(16)
+            .show(ui, |ui| {
+                ui.add(egui::Label::new(egui::RichText::new(portfolio.funding_summary()).strong().size(18.0)).wrap());
+                ui.add(egui::Label::new(portfolio.binding_summary()).wrap());
+                if !dispatch.service.proven_optimal {
+                    ui.small("This is the funded plan found by the bounded service search; maximum fundable job volume is not proved.");
+                }
+                if let Some(conductor) = &portfolio.conductor {
+                    ui.add(egui::Label::new(format!(
+                        "Orchestrator dispatch charged to {} / {}: {:.6} USD/job × {} admitted jobs = {:.2} USD/week.",
+                        conductor.provider_id,
+                        conductor.plan_id,
+                        conductor.per_call_reserved_usage,
+                        dispatch.admitted_changes,
+                        conductor.per_call_reserved_usage * dispatch.admitted_changes as f64,
+                    )).wrap());
+                    if let Some(allowance) = conductor.headroom.usd {
+                        ui.label(format!(
+                            "Additional continuous/idle allowance: {allowance:.2} USD/week, reserved once for the whole fleet."
+                        ));
+                    }
+                    ui.add(egui::Label::new("Known uncharged cost: continuous/idle Orchestrator use between dispatches is unmeasured. Its actual cost remains unknown, including any use beyond a supplied allowance.").wrap());
+                }
+            });
+        ui.add_space(12.0);
         let estimated = portfolio.pools.iter().any(|pool| pool.price_is_estimate);
         egui::Frame::group(ui.style())
             .fill(crate::theme::SURFACE)
@@ -1722,10 +1750,13 @@ impl App {
                 "Shared by worker roles".to_owned(),
             ),
             (
-                "MODELED FIT / FORECAST".to_owned(),
+                "FUNDED / DEMANDED JOBS".to_owned(),
                 format!(
                     "{} / {}",
-                    dispatch.admitted_changes, dispatch.forecast_changes
+                    dispatch.admitted_changes,
+                    dispatch
+                        .jobs_per_week
+                        .map_or_else(|| "Unknown".to_owned(), |demand| format!("{demand:.1}"))
                 ),
                 "Allowance and working time".to_owned(),
             ),
@@ -1974,16 +2005,16 @@ impl App {
                             ))
                                 .on_hover_text(role_evidence_hover(row, Seat::Orchestrator));
                             let usage = conductor.usage_forecast.as_ref().map_or_else(
-                                || "Usage forecast: Unknown / on demand".to_owned(),
+                                || "Dispatch usage unknown".to_owned(),
                                 |forecast| {
                                     format!(
-                                        "Usage forecast: {} calls · {:.3} USD · {:.3} h",
+                                        "Charged dispatches: {} jobs · {:.3} USD · {:.3} measured h",
                                         forecast.visits, forecast.usage, forecast.hours
                                     )
                                 },
                             );
                             let headroom = format!(
-                                "Fixed headroom: {} USD · {} h",
+                                "Additional weekly fleet idle allowance: {} USD · hours reserve: {} h",
                                 conductor
                                     .headroom
                                     .usd
@@ -1999,7 +2030,7 @@ impl App {
                                 "On demand"
                             })
                             .on_hover_text(format!(
-                                "Human-facing coordination service. Calls are independent of worker-job counts and actual native use is governed by ledger holds.\n{usage}\n{headroom}"
+                                "Human-facing coordination service. One measured dispatch is charged per admitted job. Continuous/idle use is unknown and remains uncharged beyond any additional allowance. Actual native use is governed by ledger holds.\n{usage}\n{headroom}"
                             ));
                             ui.end_row();
                         }
@@ -2227,7 +2258,7 @@ impl App {
             .show(ui, |ui| {
                 if let Some(conductor) = &portfolio.conductor {
                     ui.label(format!(
-                        "Orchestrator headroom reserved once: {} USD · {} h",
+                        "Additional weekly fleet idle allowance reserved once: {} USD · hours reserve: {} h",
                         conductor
                             .headroom
                             .usd
@@ -2238,7 +2269,7 @@ impl App {
                             .map_or_else(|| "unspecified".to_owned(), |value| format!("{value:.3}"))
                     ));
                     ui.small(
-                        "This optional fixed reserve is independent of worker-job counts. On-demand native calls use ledger holds; no call volume is forecast when usage is unknown.",
+                        "This allowance is added to measured dispatch spend once per week for the whole fleet. Dispatch count equals admitted jobs. Continuous/idle use remains unmeasured; actual native calls use ledger holds.",
                     );
                 }
                 ui.label(&portfolio.math_audit.objective);
