@@ -2277,6 +2277,18 @@ impl App {
                                 }
                             });
                     });
+                for pool in &portfolio.pools {
+                    if pool.rate_infeasible {
+                        ui.colored_label(
+                            egui::Color32::LIGHT_RED,
+                            format!("{}: rate-infeasible at {} parallel orchestrators; no measured worker route fits.", pool.plan_name, portfolio.orchestrators),
+                        );
+                    }
+                    for window in &pool.rate_windows {
+                        let ceiling = window.ceiling_per_hour.map(|rate| format!("{rate:.4} {}/h", window.unit.label())).unwrap_or_else(|| "unknown / reference".to_owned());
+                        ui.label(format!("{} · {}{} · {ceiling} · {}", pool.plan_name, window.window_id, if window.binding { " (tightest in scope)" } else { "" }, window.status));
+                    }
+                }
                 for assumption in &portfolio.assumptions {
                     ui.label(assumption);
                 }

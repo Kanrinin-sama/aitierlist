@@ -389,11 +389,11 @@ fn priced_plan_for(vendor: &str, budget: f64) -> Option<(f64, Allowance)> {
         let (low, high) = window.cap.bounds(0.0);
         Allowance::Usd(low, high)
     } else {
-        let window = plan
-            .windows
-            .iter()
-            .find(|window| window.unit == crate::types::CapacityUnit::Requests)?;
-        Allowance::Calls(window.cap.bounds(0.0).0)
+        let window = plan.windows.iter().find(|window| {
+            window.unit == crate::types::CapacityUnit::Requests
+                && window.enforceable_cap().is_some()
+        })?;
+        Allowance::Calls(window.enforceable_cap()?.bounds(0.0).0)
     };
     Some((plan.monthly_price, allowance))
 }
@@ -663,7 +663,24 @@ pub(crate) struct DispatchCycle {
     pub nominal_seconds: f64,
     pub reserved_usage: f64,
     pub reserved_seconds: f64,
+    pub native_demand: crate::types::CapacityDemand,
     pub(crate) reference_completion: [Option<f64>; 3],
+}
+
+impl DispatchCycle {
+    pub fn demand(self) -> crate::types::CapacityDemand {
+        crate::types::CapacityDemand {
+            api_equivalent_usd: Some(self.reserved_usage),
+            ..self.native_demand
+        }
+    }
+
+    pub fn rate(self, unit: crate::types::CapacityUnit) -> Option<f64> {
+        if self.reserved_seconds == 0.0 {
+            return None;
+        }
+        Some(self.demand().amount(unit)? / (self.reserved_seconds / 3600.0))
+    }
 }
 
 pub(crate) fn dispatch_utility(row: &Row, seat: Seat, cycle: &DispatchCycle) -> Option<f64> {
@@ -775,6 +792,7 @@ pub(crate) fn dispatch_cycles(
                 nominal_seconds: nominal[index].agent_seconds,
                 reserved_usage: (index + 1) as f64 * full_usage * stress,
                 reserved_seconds: (index + 1) as f64 * token_seconds.max(pooled_seconds) * stress,
+                native_demand: crate::types::CapacityDemand::default(),
                 reference_completion: reference_completion[index],
             })
             .collect(),
@@ -799,6 +817,7 @@ pub(crate) fn orchestrator_dispatch_cycle(row: &Row, settings: &Settings) -> Opt
         nominal_seconds: cycle.wall,
         reserved_usage: cycle.model_spend * stress,
         reserved_seconds: cycle.wall * stress,
+        native_demand: crate::types::CapacityDemand::default(),
         reference_completion: [None; 3],
     })
 }
@@ -1020,6 +1039,22 @@ fn analyze(
         }
         let policy_start = policies.len();
         for (index, cycle) in cycles.into_iter().enumerate() {
+            if tier != Tier::Api
+                && let Some(plan) = crate::subscriptions::plan_for(&row.vendor, budget)
+                && let Some(reason) = plan.rate_infeasibility(
+                    &row.vendor,
+                    settings,
+                    crate::types::CapacityDemand {
+                        api_equivalent_usd: Some(cycle.model_spend),
+                        ..crate::types::CapacityDemand::default()
+                    },
+                    cycle.agent_seconds / 3600.0,
+                    crate::subscriptions::is_fable(row),
+                )
+            {
+                excluded.push(ExcludedCandidate { row_index, reason });
+                continue;
+            }
             let nominal = cycle_capacity(cycle, tier, settings, range) * (1.0 - cycle.unfinished);
             if tier == Tier::Api || nominal > 0.0 || cycle.model_spend == 0.0 {
                 policies.push(Policy {

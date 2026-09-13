@@ -796,12 +796,39 @@ pub fn window_override_key(provider_id: &str, plan_id: &str, window_id: &str) ->
 }
 
 impl Plan {
+    pub fn rate_infeasibility(
+        &self,
+        provider_id: &str,
+        settings: &Settings,
+        demand: crate::types::CapacityDemand,
+        duration_hours: f64,
+        fable: bool,
+    ) -> Option<String> {
+        let windows = self.resolved_windows(provider_id, settings);
+        windows.iter().find_map(|window| {
+            if !window.applies_to(&windows, fable) {
+                return None;
+            }
+            let ceiling = window.rate_ceiling(&windows).ok()?;
+            let amount = demand.amount(window.unit)?;
+            let committed = settings.orchestrators as f64 * amount / duration_hours;
+            (committed > ceiling).then(|| {
+                format!(
+                    "rate-infeasible: {} commits {committed:.4} {}/h > {ceiling:.4} {}/h",
+                    window.id,
+                    window.unit.label(),
+                    window.unit.label()
+                )
+            })
+        })
+    }
+
     pub fn weekly_window(&self) -> Option<&CapacityWindow<&'static str>> {
         self.windows.iter().find(|window| {
             window.parent.is_none()
                 && window.unit == CapacityUnit::ApiEquivalentUsd
                 && window.reset == WindowReset::Weekly
-                && !window.reference_only
+                && window.enforceable_cap().is_some()
         })
     }
 

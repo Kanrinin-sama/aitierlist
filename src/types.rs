@@ -470,7 +470,105 @@ pub struct CapacityWindow<S = String> {
     pub reference_only: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct CapacityDemand {
+    pub api_equivalent_usd: Option<f64>,
+    pub requests: Option<f64>,
+    pub prompts: Option<f64>,
+    pub messages: Option<f64>,
+}
+
+impl CapacityDemand {
+    pub fn amount(self, unit: CapacityUnit) -> Option<f64> {
+        match unit {
+            CapacityUnit::ApiEquivalentUsd => self.api_equivalent_usd,
+            CapacityUnit::Requests => self.requests,
+            CapacityUnit::Prompts => self.prompts,
+            CapacityUnit::Messages => self.messages,
+        }
+    }
+}
+
+impl WindowReset {
+    pub fn duration_hours(self) -> Option<f64> {
+        match self {
+            Self::Rolling { hours } => Some(f64::from(hours)),
+            Self::Daily => Some(24.0),
+            Self::Weekly => Some(7.0 * 24.0),
+            Self::Monthly => None,
+        }
+    }
+}
+
+impl<S> CapacityWindow<S> {
+    pub fn enforceable_cap(&self) -> Option<WindowCap> {
+        (!self.reference_only).then_some(self.cap)
+    }
+}
+
 impl CapacityWindow {
+    pub fn amount_bounds(&self, windows: &[Self]) -> Option<(f64, f64)> {
+        self.resolve_bounds(windows, &mut Vec::new())
+    }
+
+    fn resolve_bounds(&self, windows: &[Self], ancestors: &mut Vec<String>) -> Option<(f64, f64)> {
+        if ancestors.contains(&self.id) {
+            return None;
+        }
+        ancestors.push(self.id.clone());
+        match self.cap {
+            WindowCap::Amount(amount) => Some((amount, amount)),
+            WindowCap::Range { low, high } => Some((low, high)),
+            WindowCap::ParentFraction(fraction) => {
+                let parent = windows
+                    .iter()
+                    .find(|window| Some(&window.id) == self.parent.as_ref())?;
+                if self.unit != parent.unit {
+                    return None;
+                }
+                let (low, high) = parent.resolve_bounds(windows, ancestors)?;
+                Some((low * fraction, high * fraction))
+            }
+            WindowCap::Unpublished => None,
+        }
+    }
+
+    pub fn rate_ceiling(&self, windows: &[Self]) -> Result<f64, &'static str> {
+        self.enforceable_cap()
+            .ok_or("reference only; never enforced")?;
+        let (amount, _) = self
+            .amount_bounds(windows)
+            .ok_or("cap unknown; supply an amount and same-unit parent chain")?;
+        let duration = self
+            .reset
+            .duration_hours()
+            .ok_or("reset duration unknown; supply the actual monthly reset interval")?;
+        if duration == 0.0 {
+            return Err("reset duration is zero");
+        }
+        Ok(amount / duration)
+    }
+
+    pub fn applies_to(&self, windows: &[Self], fable: bool) -> bool {
+        let mut current = self;
+        let mut visited = Vec::new();
+        loop {
+            if current.id == "fable-weekly-usd" && !fable {
+                return false;
+            }
+            if visited.contains(&current.id) {
+                return false;
+            }
+            visited.push(current.id.clone());
+            let Some(parent) = current.parent.as_ref() else {
+                return true;
+            };
+            let Some(next) = windows.iter().find(|window| &window.id == parent) else {
+                return true;
+            };
+            current = next;
+        }
+    }
     pub fn summary(&self, windows: &[Self]) -> String {
         let parent = self
             .parent
@@ -480,25 +578,28 @@ impl CapacityWindow {
             WindowCap::Amount(amount) => format!("{amount:.2}"),
             WindowCap::Range { low, high } => format!("{low:.2}–{high:.2} (range)"),
             WindowCap::ParentFraction(fraction) => {
-                let parent_amount = parent.map(|window| window.cap.bounds(0.0).0).unwrap_or(0.0);
+                let parent_amount = self
+                    .amount_bounds(windows)
+                    .map(|(low, _)| format!("{low:.2}"))
+                    .unwrap_or_else(|| "unknown".to_owned());
                 let parent_basis = parent
                     .map(|window| window.basis.label())
                     .unwrap_or("unknown");
                 format!(
-                    "{}% of {} = {:.2} ({parent_basis} amount)",
+                    "{}% of {} = {} ({parent_basis} amount)",
                     fraction * 100.0,
                     self.parent.as_deref().unwrap_or("parent"),
-                    parent_amount * fraction
+                    parent_amount
                 )
             }
             WindowCap::Unpublished => "amount unpublished".to_owned(),
         };
-        let status = if self.reference_only {
-            "reference only; not a fixed cap"
-        } else if self.unit != CapacityUnit::ApiEquivalentUsd || self.reset != WindowReset::Weekly {
-            "stored; not enforced"
-        } else {
-            "weekly allocation cap"
+        let status = match self.rate_ceiling(windows) {
+            Ok(rate) => format!(
+                "rate ceiling {rate:.4} {}/h; requires demand in the same unit",
+                self.unit.label()
+            ),
+            Err(reason) => reason.to_owned(),
         };
         format!(
             "{}: {amount} {} / {} · {} · reset: {} · {status}. {}",
