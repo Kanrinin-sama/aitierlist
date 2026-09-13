@@ -3,39 +3,124 @@ use crate::types::Seat;
 use eframe::egui;
 use std::sync::mpsc::channel;
 
-const SUBSCRIPTIONS_TAB: usize = 0;
 const WORKSPACE_TAB: usize = 1;
 const MODELING_TAB: usize = 2;
+const BACKGROUND_TAB: usize = 3;
 
 impl super::App {
     pub(super) fn settings_content(&mut self, ui: &mut egui::Ui) -> bool {
-        let tab_id = ui.id().with("settings_active_tab");
-        let mut active_tab = ui
-            .ctx()
-            .data_mut(|data| data.get_temp::<usize>(tab_id))
-            .unwrap_or(SUBSCRIPTIONS_TAB);
         ui.horizontal(|ui| {
-            for (index, label) in ["Subscriptions", "Workspace", "Modeling & data"]
-                .into_iter()
-                .enumerate()
+            for (index, label) in [
+                "Subscriptions",
+                "Workspace",
+                "Modeling & data",
+                "Background",
+            ]
+            .into_iter()
+            .enumerate()
             {
-                if ui.selectable_label(active_tab == index, label).clicked() {
-                    active_tab = index;
+                if ui
+                    .selectable_label(self.settings_tab == index, label)
+                    .clicked()
+                {
+                    self.settings_tab = index;
                 }
             }
         });
-        ui.ctx()
-            .data_mut(|data| data.insert_temp(tab_id, active_tab));
         ui.add_space(16.0);
 
-        match active_tab {
+        match self.settings_tab {
             WORKSPACE_TAB => self.workspace_controls(ui),
             MODELING_TAB => self.modeling_controls(ui),
+            BACKGROUND_TAB => {
+                self.background_controls(ui);
+                false
+            }
             _ => self.subscription_controls(ui),
         }
     }
 
+    fn background_controls(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            egui::RichText::new("Background behavior")
+                .size(20.0)
+                .color(theme::TEXT),
+        );
+        ui.colored_label(
+            theme::MUTED,
+            "Keep subscription connections available with minimal work while the window is hidden.",
+        );
+        ui.add_space(12.0);
+
+        let previous_start_at_login = self.settings.start_at_login;
+        let previous_start_minimized = self.settings.start_minimized;
+        let start_changed = ui
+            .checkbox(&mut self.settings.start_at_login, "Start when I sign in")
+            .changed();
+        let minimized_changed = ui
+            .checkbox(
+                &mut self.settings.start_minimized,
+                "Start hidden in the notification area",
+            )
+            .changed();
+        if start_changed || minimized_changed {
+            match crate::desktop::set_start_at_login(
+                self.settings.start_at_login,
+                self.settings.start_minimized,
+            ) {
+                Ok(()) => {
+                    if let Err(error) = self.save_desktop_settings() {
+                        self.settings.start_at_login = previous_start_at_login;
+                        self.settings.start_minimized = previous_start_minimized;
+                        let restore_error = crate::desktop::set_start_at_login(
+                            previous_start_at_login,
+                            previous_start_minimized,
+                        )
+                        .err()
+                        .map(|error| format!(" Restoring startup also failed: {error:#}"))
+                        .unwrap_or_default();
+                        self.background_status = format!("{error}{restore_error}");
+                    } else {
+                        self.background_status.clear();
+                    }
+                }
+                Err(error) => {
+                    self.settings.start_at_login = previous_start_at_login;
+                    self.settings.start_minimized = previous_start_minimized;
+                    self.background_status = format!("Could not update sign-in startup: {error:#}");
+                }
+            }
+        }
+
+        let previous_close_to_tray = self.settings.close_to_tray;
+        if ui
+            .checkbox(
+                &mut self.settings.close_to_tray,
+                "Keep running when I close the window",
+            )
+            .changed()
+        {
+            match self.save_desktop_settings() {
+                Ok(()) => self.background_status.clear(),
+                Err(error) => {
+                    self.settings.close_to_tray = previous_close_to_tray;
+                    self.background_status = error;
+                }
+            }
+        }
+        if self.desktop.is_none() {
+            ui.colored_label(
+                theme::MUTED,
+                "The notification area is unavailable, so closing exits the app.",
+            );
+        }
+        if !self.background_status.is_empty() {
+            ui.colored_label(theme::ERROR, &self.background_status);
+        }
+    }
+
     pub(super) fn subscription_controls(&mut self, ui: &mut egui::Ui) -> bool {
+        self.native_connections.ensure_discovery();
         ui.label(
             egui::RichText::new("Your subscriptions")
                 .size(20.0)
@@ -43,8 +128,29 @@ impl super::App {
         );
         ui.colored_label(
             theme::MUTED,
-            "Choose each plan and the number of accounts sharing work across your team.",
+            "Choose each plan and the number of owned accounts. Additional accounts add monthly cost only and do not add forecast capacity.",
         );
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    !self.native_connections.discovering(),
+                    egui::Button::new("Check CLIs again"),
+                )
+                .clicked()
+            {
+                self.native_connection_status = self
+                    .native_connections
+                    .rediscover()
+                    .err()
+                    .unwrap_or_default();
+            }
+            if self.native_connections.discovering() {
+                ui.spinner();
+            }
+        });
+        if let Some(error) = self.native_connections.discovery_error() {
+            ui.colored_label(theme::ERROR, error);
+        }
         ui.add_space(12.0);
 
         let mut changed = false;
@@ -92,7 +198,9 @@ impl super::App {
                                         .horizontal_align(egui::Align::Center),
                                 )
                                 .changed();
-                            ui.colored_label(theme::MUTED, "accounts");
+                            ui.colored_label(theme::MUTED, "accounts").on_hover_text(
+                                "Additional accounts add monthly cost only and do not add forecast capacity.",
+                            );
                             egui::ComboBox::from_id_salt(("subscription", provider.id))
                                 .width(210.0)
                                 .selected_text(label)
@@ -109,8 +217,6 @@ impl super::App {
                         });
                     });
                 });
-            ui.add_space(8.0);
-
             let parsed_count = count_text.parse::<usize>().ok().filter(|count| *count > 0);
             if count_changed && let Some(count) = parsed_count {
                 self.settings
@@ -139,6 +245,12 @@ impl super::App {
                     plan.monthly_price * self.settings.subscription_count(provider.id) as f64;
                 estimated_price |= plan.price_is_estimate;
             }
+            self.native_connection_controls(ui, provider.id);
+            ui.add_space(8.0);
+        }
+        if !self.native_connection_status.is_empty() {
+            ui.colored_label(theme::ERROR, &self.native_connection_status);
+            ui.add_space(8.0);
         }
 
         egui::Frame::new()
@@ -159,6 +271,100 @@ impl super::App {
                 });
             });
         changed
+    }
+
+    fn native_connection_controls(&mut self, ui: &mut egui::Ui, provider_id: &str) {
+        let entries = self
+            .native_connections
+            .entries()
+            .iter()
+            .filter(|entry| entry.provider_id == provider_id)
+            .map(|entry| {
+                (
+                    entry.id.clone(),
+                    entry.name.clone(),
+                    entry.installed,
+                    entry.status,
+                    entry.busy,
+                    entry.supports_status,
+                    entry.detail.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            if self.native_connections.loading() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.colored_label(theme::MUTED, "Checking native CLI…");
+                });
+            }
+            return;
+        }
+
+        for (id, name, installed, status, busy, supports_status, detail) in entries {
+            let mut connect = false;
+            let mut open = false;
+            let mut refresh = false;
+            ui.horizontal(|ui| {
+                if busy {
+                    ui.spinner();
+                }
+                let color = if status.connected()
+                    || status == crate::native_connections::ConnectionStatus::SignInCompleted
+                {
+                    theme::SUCCESS
+                } else if matches!(
+                    status,
+                    crate::native_connections::ConnectionStatus::Failed
+                        | crate::native_connections::ConnectionStatus::ReconnectRequired
+                ) {
+                    theme::ERROR
+                } else {
+                    theme::MUTED
+                };
+                ui.colored_label(color, format!("{name} · {}", status.label()));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    open = ui
+                        .add_enabled(installed && !busy, egui::Button::new("Open CLI"))
+                        .clicked();
+                    refresh = ui
+                        .add_enabled(
+                            installed && !busy && supports_status,
+                            egui::Button::new("Check"),
+                        )
+                        .clicked();
+                    let reconnect = status.connected()
+                        || matches!(
+                            status,
+                            crate::native_connections::ConnectionStatus::CredentialsReported
+                                | crate::native_connections::ConnectionStatus::SignInCompleted
+                                | crate::native_connections::ConnectionStatus::ReconnectRequired
+                                | crate::native_connections::ConnectionStatus::Failed
+                        );
+                    connect = ui
+                        .add_enabled(
+                            installed && !busy,
+                            egui::Button::new(if reconnect { "Reconnect" } else { "Connect" }),
+                        )
+                        .clicked();
+                });
+            });
+            if !detail.is_empty() {
+                ui.colored_label(theme::MUTED, detail);
+            }
+            let result = if connect {
+                Some(self.native_connections.connect(&id))
+            } else if open {
+                Some(self.native_connections.open_cli(&id))
+            } else if refresh {
+                Some(self.native_connections.refresh_status(&id))
+            } else {
+                None
+            };
+            if let Some(result) = result {
+                self.native_connection_status = result.err().unwrap_or_default();
+            }
+        }
     }
 
     fn workspace_controls(&mut self, ui: &mut egui::Ui) -> bool {
@@ -357,6 +563,15 @@ impl super::App {
                         "Show hallucination reliability",
                     )
                     .changed();
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.allow_cross_harness_benchmark_proxies,
+                        "Use labeled cross-harness benchmark proxies",
+                    )
+                    .on_hover_text(
+                        "Exact model, effort, and benchmark-series evidence is selected in this order: matching harness, model-level evidence for model-level benchmarks, then an enabled cross-harness proxy. Freshness breaks ties only inside that tier. The source harness remains visible.",
+                    )
+                    .changed();
             });
 
         egui::CollapsingHeader::new("Competence minimums")
@@ -376,7 +591,7 @@ impl super::App {
                         let mut enabled = floor.is_some();
                         let response = ui.checkbox(&mut enabled, seat.name());
                         if seat == Seat::Orchestrator {
-                            response.clone().on_hover_text("Per-plan Orchestrator competence uses the AA Intelligence Index. Absolute rankings blend GPQA and the Intelligence Index equally.");
+                            response.clone().on_hover_text("Orchestrator competence is the AA Intelligence Index (score / 100). LCR and HLE are diagnostics and do not enter the score.");
                         }
                         if response.changed() {
                             *floor = enabled.then_some(0.0);

@@ -5,10 +5,13 @@ mod aa;
 mod agent_setup;
 mod cache;
 mod comparison;
+mod desktop;
 mod engine;
+mod evidence;
 mod file_tx;
 mod host_install;
 mod isolation;
+mod native_connections;
 mod native_reconciliation;
 mod native_scheduler;
 mod orchestration;
@@ -25,6 +28,7 @@ mod theme;
 mod types;
 mod ui;
 mod update;
+mod upstream;
 mod workspace;
 
 #[used]
@@ -294,9 +298,44 @@ fn main() -> eframe::Result<()> {
             }
         }
     }
+    let instance_guard = match desktop::claim_single_instance() {
+        Ok(instance) => instance,
+        Err(error) => {
+            eprintln!("{error:#}");
+            std::process::exit(1);
+        }
+    };
+    let Some(_instance_guard) = instance_guard else {
+        return Ok(());
+    };
     std::hint::black_box(VERSION_TAG);
     std::hint::black_box(update::COMMIT_TAG);
     std::hint::black_box(update::TREE_TAG);
+
+    let start_minimized = application_arguments
+        .iter()
+        .any(|argument| argument == "--start-minimized")
+        || settings::load_settings().start_minimized;
+    let mut desktop = desktop::Desktop::new(None)
+        .map_err(|error| eprintln!("Desktop integration unavailable: {error:#}"))
+        .ok();
+    let mut health_guard = Some(health_guard);
+    let mut open_subscriptions = false;
+    if start_minimized && desktop.is_some() {
+        if let Some(guard) = health_guard.take()
+            && let Err(error) = guard.confirm_healthy()
+        {
+            eprintln!("Update health confirmation failed: {error:#}");
+            std::process::exit(1);
+        }
+        let event = desktop.as_ref().and_then(desktop::Desktop::wait_event);
+        match event {
+            Some(desktop::DesktopEvent::Open) => {}
+            Some(desktop::DesktopEvent::Subscriptions) => open_subscriptions = true,
+            Some(desktop::DesktopEvent::Quit) => return Ok(()),
+            None => desktop = None,
+        }
+    }
 
     let handoff_status = match blockitall_update::install::take_last_status(&install_config) {
         Ok(Some(status)) => format!(
@@ -327,17 +366,21 @@ fn main() -> eframe::Result<()> {
         persist_window: true,
         ..Default::default()
     };
-
     eframe::run_native(
         "aitierlist",
         options,
         Box::new(|cc| {
             theme::apply(&cc.egui_ctx);
+            if let Some(desktop) = desktop.as_ref() {
+                desktop.attach_context(cc.egui_ctx.clone());
+            }
             Ok(Box::new(ui::App::new(
                 cc,
                 updater,
                 health_guard,
                 handoff_status,
+                desktop,
+                open_subscriptions,
             )))
         }),
     )

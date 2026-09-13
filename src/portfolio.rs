@@ -4,8 +4,10 @@ use crate::solver::{self, Choice, Problem};
 use crate::subscriptions;
 use crate::types::{Row, Seat};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 const SEARCH_NODES: usize = 1024;
+const ORCHESTRATOR_WELFARE: f64 = 0.24;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkClass {
@@ -61,50 +63,37 @@ pub struct WorkflowStage {
 }
 
 fn workflow_stages(class: WorkClass, research: bool) -> Vec<WorkflowStage> {
-    let mut stages = vec![WorkflowStage {
-        id: 0,
-        seat: Seat::Orchestrator,
-        visit: 1,
-        dependencies: Vec::new(),
-        condition: "Admitted change",
-    }];
-    let mut dependency = 0;
+    let mut stages = Vec::new();
+    let mut dependency = None;
     if research {
         stages.push(WorkflowStage {
             id: stages.len(),
             seat: Seat::NetResearch,
             visit: 1,
-            dependencies: vec![dependency],
+            dependencies: Vec::new(),
             condition: "Class policy includes one declared research reference visit",
         });
-        dependency = stages.len() - 1;
+        dependency = Some(stages.len() - 1);
     }
     if matches!(class, WorkClass::Complex | WorkClass::Extensive) {
         stages.push(WorkflowStage {
             id: stages.len(),
             seat: Seat::Comprehension,
             visit: 1,
-            dependencies: vec![dependency],
+            dependencies: dependency.into_iter().collect(),
             condition: "Brief and evidence packet accepted",
         });
-        dependency = stages.len() - 1;
+        dependency = Some(stages.len() - 1);
     }
     stages.push(WorkflowStage {
         id: stages.len(),
         seat: Seat::Implementer,
         visit: 1,
-        dependencies: vec![dependency],
+        dependencies: dependency.into_iter().collect(),
         condition: "Required context and evidence accepted",
     });
     let implementation = stages.len() - 1;
     if class == WorkClass::Focused {
-        stages.push(WorkflowStage {
-            id: stages.len(),
-            seat: Seat::Orchestrator,
-            visit: 2,
-            dependencies: vec![implementation],
-            condition: "Accept bounded output or close with deferral",
-        });
         return stages;
     }
     for seat in [Seat::Reviewer, Seat::Sanity] {
@@ -122,7 +111,7 @@ fn workflow_stages(class: WorkClass, research: bool) -> Vec<WorkflowStage> {
         seat: Seat::Debugger,
         visit: 1,
         dependencies: initial_checks.to_vec(),
-        condition: "Implementation blocked or either initial check rejected; otherwise skip",
+        condition: "Initial implementation blocked or either initial check blocked or completed with rejection, and no other Debugger is running for this task; skip when both checks accepted",
     });
     let repair = stages.len() - 1;
     for seat in [Seat::Reviewer, Seat::Sanity] {
@@ -134,13 +123,6 @@ fn workflow_stages(class: WorkClass, research: bool) -> Vec<WorkflowStage> {
             condition: "Repair produced immutable output; otherwise skip",
         });
     }
-    stages.push(WorkflowStage {
-        id: stages.len(),
-        seat: Seat::Orchestrator,
-        visit: 2,
-        dependencies: vec![stages.len() - 2, stages.len() - 1],
-        condition: "Accept checked output or close with bounded deferral",
-    });
     stages
 }
 
@@ -151,10 +133,12 @@ fn reserved_visits(class: WorkClass, seat: Seat, research: bool) -> usize {
         .count()
 }
 
-fn expected_visits(class: WorkClass, seat: Seat, research: bool) -> f64 {
+fn expected_visits(class: WorkClass, seat: Seat, research: bool, repair: f64) -> f64 {
     match seat {
-        Seat::Debugger => (class != WorkClass::Focused) as u8 as f64 * 0.25,
-        Seat::Reviewer | Seat::Sanity => (class != WorkClass::Focused) as u8 as f64 * 1.25,
+        Seat::Debugger => (class != WorkClass::Focused) as u8 as f64 * repair,
+        Seat::Reviewer | Seat::Sanity => {
+            (class != WorkClass::Focused) as u8 as f64 * (1.0 + repair)
+        }
         _ => reserved_visits(class, seat, research) as f64,
     }
 }
@@ -176,6 +160,74 @@ pub struct Portfolio {
     pub dispatch: DispatchPlan,
     pub math_audit: MathAudit,
     pub conductor: Option<ConductorAllocation>,
+    #[serde(default)]
+    pub close_choices: Vec<CloseChoice>,
+    #[serde(default)]
+    pub capability_scenario: Option<CapabilityScenarioReport>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapabilityRange {
+    pub nominal: f64,
+    pub lower: f64,
+    pub upper: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassRepairSensitivity {
+    pub class: WorkClass,
+    pub nominal: f64,
+    pub lower: f64,
+    pub upper: f64,
+    pub basis: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloseChoice {
+    pub seat: Seat,
+    pub class: Option<WorkClass>,
+    pub nominal_row_index: usize,
+    pub challenger_row_index: usize,
+    pub nominal_utility: f64,
+    pub challenger_utility: f64,
+    pub challenger_attempt_limit: usize,
+    pub challenger_provider_id: String,
+    pub challenger_plan_id: String,
+    pub challenger_native_harness: String,
+    pub scenario_status: String,
+    pub scenario_bound: Option<f64>,
+    pub scenario_relative_gap: Option<f64>,
+    pub scenario_proven: bool,
+    pub condition: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScenarioAssignment {
+    pub seat: Seat,
+    pub class: Option<WorkClass>,
+    pub row_index: usize,
+    pub attempt_limit: usize,
+    pub provider_id: String,
+    pub plan_id: String,
+    pub native_harness: String,
+    pub utility: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapabilityScenarioReport {
+    pub status: String,
+    pub proven: bool,
+    pub quality: f64,
+    pub baseline_quality: Option<f64>,
+    pub bound: Option<f64>,
+    pub relative_gap: Option<f64>,
+    pub message: String,
+    pub assignments: Vec<ScenarioAssignment>,
 }
 
 fn single_orchestrator() -> usize {
@@ -212,8 +264,6 @@ pub struct DispatchPlan {
     #[serde(default = "policy_version")]
     pub policy_version: String,
     pub forecast_changes: usize,
-    #[serde(default)]
-    pub native_admission_changes: usize,
     pub admitted_changes: usize,
     pub deferred_changes: usize,
     pub cadence_hours: f64,
@@ -224,6 +274,24 @@ pub struct DispatchPlan {
     pub admitted_sequence: Vec<WorkClass>,
     pub reserved_makespan_hours: f64,
     pub schedule: Vec<ScheduledVisit>,
+    #[serde(default)]
+    pub repair_sensitivity: Vec<ClassRepairSensitivity>,
+    #[serde(default)]
+    pub service: TeamServiceReport,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamServiceReport {
+    pub workload: f64,
+    pub team_capability: f64,
+    pub quality_adjusted_service: f64,
+    pub maximum_volume_admitted: usize,
+    pub maximum_volume_service: Option<f64>,
+    pub proven_optimal: bool,
+    pub bound: Option<f64>,
+    pub relative_gap: Option<f64>,
+    pub message: String,
 }
 
 fn policy_version() -> String {
@@ -321,6 +389,12 @@ pub struct DispatchRule {
     pub fable: bool,
     pub failure_action: String,
     pub message: String,
+    #[serde(default)]
+    pub evidence_level: String,
+    #[serde(default)]
+    pub capability_sensitivity: Option<CapabilityRange>,
+    #[serde(default)]
+    pub repair_activation_proxy: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -383,15 +457,9 @@ fn assess_research(row: &Row, weights: [f64; 4]) -> Option<ResearchAssessment> {
         bounded(row.hle)
     };
     let direct_metric = |benchmark| {
-        row.task_metrics.iter().find(|metric| {
-            metric.benchmark == benchmark
-                && metric
-                    .time_basis
-                    .starts_with("Canonical output decode estimate")
-                && metric
-                    .cost_basis
-                    .starts_with("Canonical token-price estimate")
-        })
+        row.task_metrics
+            .iter()
+            .find(|metric| metric.benchmark == benchmark && metric.canonical_resources)
     };
     let omni_weight = weights[0] + weights[1];
     let resources = direct_metric(crate::types::Benchmark::Omniscience)
@@ -404,10 +472,12 @@ fn assess_research(row: &Row, weights: [f64; 4]) -> Option<ResearchAssessment> {
             }
         });
     Some(ResearchAssessment {
-        score: weights[0] * accuracy
-            + weights[1] * non_wrong
-            + weights[2] * lcr
-            + weights[3] * hle.unwrap_or(0.0),
+        score: engine::weighted_geometric(&[
+            (accuracy, weights[0]),
+            (non_wrong, weights[1]),
+            (lcr, weights[2]),
+            (hle.unwrap_or(0.0), weights[3]),
+        ])?,
         accuracy,
         non_wrong,
         conditional_hallucination,
@@ -425,6 +495,35 @@ fn assess_research(row: &Row, weights: [f64; 4]) -> Option<ResearchAssessment> {
                 / 3600.0
         }),
     })
+}
+
+fn research_sensitivity(candidate: &ResearchCandidate, span: f64) -> CapabilityRange {
+    let weighted = |multiplier: f64| {
+        engine::weighted_geometric(&[
+            (
+                (candidate.accuracy * multiplier).clamp(0.0, 1.0),
+                candidate.accuracy_weight,
+            ),
+            (
+                (candidate.non_wrong * multiplier).clamp(0.0, 1.0),
+                candidate.non_wrong_weight,
+            ),
+            (
+                (candidate.lcr * multiplier).clamp(0.0, 1.0),
+                candidate.lcr_weight,
+            ),
+            (
+                (candidate.hle.unwrap_or(0.0) * multiplier).clamp(0.0, 1.0),
+                candidate.hle_weight,
+            ),
+        ])
+        .unwrap_or(candidate.score)
+    };
+    CapabilityRange {
+        nominal: candidate.score,
+        lower: weighted(1.0 - span),
+        upper: weighted(1.0 + span),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -497,6 +596,9 @@ struct Policy {
     cycle: DispatchCycle,
     fable: bool,
     research_class: Option<WorkClass>,
+    lower_utility: f64,
+    upper_utility: f64,
+    evidence_level: String,
 }
 
 struct Group {
@@ -523,12 +625,18 @@ pub struct ConductorAllocation {
     pub attempt_limit: usize,
     pub competence: f64,
     pub utility: f64,
-    pub expected_visits: usize,
-    pub reserved_visits: usize,
-    pub expected_usage: f64,
-    pub expected_hours: f64,
-    pub reserved_usage: f64,
-    pub reserved_hours: f64,
+    #[serde(default = "persistent_conductor")]
+    pub persistent: bool,
+    #[serde(default)]
+    pub evidence_profile: String,
+    #[serde(default)]
+    pub evidence_level: String,
+    #[serde(default)]
+    pub capability_sensitivity: Option<CapabilityRange>,
+    #[serde(default)]
+    pub usage_forecast: Option<ConductorUsageForecast>,
+    #[serde(default)]
+    pub headroom: ConductorHeadroom,
     pub per_call_expected_usage: f64,
     pub per_call_expected_hours: f64,
     pub per_call_reserved_usage: f64,
@@ -536,6 +644,25 @@ pub struct ConductorAllocation {
     pub cost_basis: String,
     pub time_basis: String,
     pub classes: Vec<ConductorClassDemand>,
+}
+
+fn persistent_conductor() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConductorUsageForecast {
+    pub visits: usize,
+    pub usage: f64,
+    pub hours: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConductorHeadroom {
+    pub usd: Option<f64>,
+    pub hours: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -561,9 +688,24 @@ pub struct ConductorClassDemand {
     pub visits: usize,
 }
 
+#[derive(Clone)]
 struct Schedule {
     visits: Vec<ScheduledVisit>,
     makespan: f64,
+}
+
+fn search_service(search: &Search) -> Option<f64> {
+    let solution = search.state.incumbent()?;
+    Some(search.workload * ((solution.quality + search.log_shift) / search.workload).exp())
+}
+
+fn search_service_bound(search: &Search) -> f64 {
+    if search.state.proven() && !search.state.has_solution() {
+        return 0.0;
+    }
+    search.state.bound().map_or(search.workload, |bound| {
+        search.workload * ((bound + search.log_shift) / search.workload).exp()
+    })
 }
 
 struct Search {
@@ -571,6 +713,8 @@ struct Search {
     problem: Problem,
     state: solver::SolverState<Schedule>,
     count: usize,
+    workload: f64,
+    log_shift: f64,
 }
 
 fn failure_action(seat: Seat) -> &'static str {
@@ -600,6 +744,59 @@ fn seat_id(seat: Seat) -> &'static str {
         Seat::Comprehension => "comprehension",
         Seat::NetResearch => "net-research",
     }
+}
+
+fn evidence_level_name(level: engine::RoleEvidenceLevel) -> String {
+    match level {
+        engine::RoleEvidenceLevel::ExactHarness => "exact_harness",
+        engine::RoleEvidenceLevel::ModelLevel => "model_level",
+        engine::RoleEvidenceLevel::CrossHarnessProxy => "cross_harness_proxy",
+        engine::RoleEvidenceLevel::Unknown => "unknown",
+    }
+    .to_owned()
+}
+
+fn role_evidence_level(row: &Row, seat: Seat) -> String {
+    engine::role_evidence(row, seat)
+        .map(|components| evidence_level_name(engine::weakest_evidence_level(&components)))
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn research_evidence_level(row: &Row, class: WorkClass) -> String {
+    let families: &[&str] = if matches!(class, WorkClass::Complex | WorkClass::Extensive) {
+        &["omniscience", "lcr", "hle"]
+    } else {
+        &["omniscience", "lcr"]
+    };
+    let level = families
+        .iter()
+        .map(|family| {
+            row.benchmark_evidence
+                .iter()
+                .find(|projection| projection.family == *family)
+                .map_or(
+                    engine::RoleEvidenceLevel::Unknown,
+                    |projection| match projection.transfer {
+                        crate::evidence::TransferKind::ExactHarness => {
+                            engine::RoleEvidenceLevel::ExactHarness
+                        }
+                        crate::evidence::TransferKind::ModelLevel => {
+                            engine::RoleEvidenceLevel::ModelLevel
+                        }
+                        crate::evidence::TransferKind::CrossHarnessProxy => {
+                            engine::RoleEvidenceLevel::CrossHarnessProxy
+                        }
+                    },
+                )
+        })
+        .min_by_key(|level| match level {
+            engine::RoleEvidenceLevel::Unknown => 0,
+            engine::RoleEvidenceLevel::CrossHarnessProxy => 1,
+            engine::RoleEvidenceLevel::ModelLevel => 2,
+            engine::RoleEvidenceLevel::ExactHarness => 3,
+        })
+        .unwrap_or(engine::RoleEvidenceLevel::Unknown);
+    evidence_level_name(level)
 }
 
 fn sequence(total: usize) -> Vec<WorkClass> {
@@ -704,9 +901,12 @@ fn schedule(
     choices: &[usize],
     sequence: &[WorkClass],
     pools: &[PoolUsage],
-    hours: f64,
-    research_classes: &std::collections::BTreeMap<String, bool>,
+    settings: &Settings,
 ) -> Option<Schedule> {
+    let hours = settings.agent_hours;
+    let research_classes = &settings.research_classes;
+    let orchestrator_headroom_usd = settings.orchestrator_headroom_usd;
+    let orchestrator_headroom_hours = settings.orchestrator_headroom_hours;
     let mut lookup = [[None; 7]; 4];
     let mut orchestrator = None;
     for (index, group) in groups.iter().enumerate() {
@@ -739,6 +939,22 @@ fn schedule(
     }
     let mut finishes = vec![0.0_f64; planned.len()];
     let mut calendars: Vec<Vec<AccountCalendar>> = (0..pools.len()).map(|_| Vec::new()).collect();
+    if let Some(group) = orchestrator {
+        let policy = &groups[group].policies[choices[group]];
+        let held_hours = orchestrator_headroom_hours.unwrap_or(0.0);
+        calendars[policy.pool].push(AccountCalendar {
+            intervals: (held_hours > 0.0)
+                .then_some((hours - held_hours, hours))
+                .into_iter()
+                .collect(),
+            usage: orchestrator_headroom_usd.unwrap_or(0.0),
+            fable_usage: if policy.fable {
+                orchestrator_headroom_usd.unwrap_or(0.0)
+            } else {
+                0.0
+            },
+        });
+    }
     let mut visits = Vec::with_capacity(planned.len());
     let mut makespan = 0.0_f64;
     for (index, (change_index, class, base, stage, policy)) in planned.iter().enumerate() {
@@ -752,15 +968,7 @@ fn schedule(
         if calendars[policy.pool].is_empty() {
             calendars[policy.pool].push(AccountCalendar::default());
         }
-        let existing = calendars[policy.pool].len();
-        let candidates = if stage.seat == Seat::Orchestrator {
-            1
-        } else if existing < pools[policy.pool].subscription_count {
-            existing + 1
-        } else {
-            existing
-        };
-        let (account_ordinal, start, finish) = (0..candidates)
+        let (account_ordinal, start, finish) = (0..1)
             .filter(|account| {
                 let account_usage = calendars[policy.pool]
                     .get(*account)
@@ -833,6 +1041,7 @@ fn search(
     pools: &[PoolUsage],
     settings: &Settings,
     limit: usize,
+    stressed_incumbents: Option<&std::collections::BTreeSet<String>>,
 ) -> Search {
     let hours = settings.agent_hours;
     let research_classes = &settings.research_classes;
@@ -849,7 +1058,19 @@ fn search(
     groups.push(Group {
         role: orchestrator_role,
         class: None,
-        policies: candidates[orchestrator_role].clone(),
+        policies: candidates[orchestrator_role]
+            .iter()
+            .filter(|policy| {
+                stressed_incumbents.map_or(policy.utility, |incumbents| {
+                    if incumbents.contains(&stress_identity(orchestrator_role, policy)) {
+                        policy.lower_utility
+                    } else {
+                        policy.upper_utility
+                    }
+                }) > 0.0
+            })
+            .cloned()
+            .collect(),
     });
     for class in WorkClass::ALL {
         if counts[class.index()] > 0 {
@@ -871,8 +1092,15 @@ fn search(
                     policies: policies
                         .iter()
                         .filter(|policy| {
-                            Seat::ALL[role] != Seat::NetResearch
-                                || policy.research_class == Some(class)
+                            (Seat::ALL[role] != Seat::NetResearch
+                                || policy.research_class == Some(class))
+                                && stressed_incumbents.map_or(policy.utility, |incumbents| {
+                                    if incumbents.contains(&stress_identity(role, policy)) {
+                                        policy.lower_utility
+                                    } else {
+                                        policy.upper_utility
+                                    }
+                                }) > 0.0
                         })
                         .cloned()
                         .collect(),
@@ -893,7 +1121,7 @@ fn search(
         index
     });
     let path_resource = capacities.len();
-    capacities.extend([hours; 8]);
+    capacities.extend([hours, hours]);
     let mut competence_links = Vec::new();
     if monotonic_class_competence {
         for role in 0..Seat::ALL.len() {
@@ -912,6 +1140,28 @@ fn search(
         }
         capacities.extend(std::iter::repeat_n(1.0, competence_links.len()));
     }
+    let diversity_resource = capacities.len();
+    let mut diversity_keys: Vec<(WorkClass, usize)> = Vec::new();
+    for class in WorkClass::ALL {
+        if class == WorkClass::Focused || counts[class.index()] == 0 {
+            continue;
+        }
+        let rows: BTreeSet<usize> = groups
+            .iter()
+            .filter(|group| {
+                group.class == Some(class)
+                    && matches!(
+                        Seat::ALL[group.role],
+                        Seat::Implementer | Seat::Reviewer | Seat::Sanity
+                    )
+            })
+            .flat_map(|group| group.policies.iter().map(|policy| policy.row_index))
+            .collect();
+        for row_index in rows {
+            diversity_keys.push((class, row_index));
+            capacities.push(1.0);
+        }
+    }
     let choices = groups
         .iter()
         .enumerate()
@@ -923,23 +1173,21 @@ fn search(
                     .map(|class| (counts[class.index()] as f64, class.resource_factor()))
                     .collect(),
             };
-            let expected_factor: f64 = demands
-                .iter()
-                .map(|(changes, factor)| {
-                    let class = group.class.unwrap_or(WorkClass::Focused);
-                    changes
-                        * factor
-                        * if group.class.is_none() {
-                            2.0
-                        } else {
-                            expected_visits(
-                                class,
-                                Seat::ALL[group.role],
-                                research_classes.get(class.name()).copied().unwrap_or(false),
-                            )
-                        }
-                })
-                .sum();
+            let quality_factor: f64 = if let Some(class) = group.class {
+                let workers = groups
+                    .iter()
+                    .filter(|candidate| candidate.class == Some(class))
+                    .count() as f64;
+                counts[class.index()] as f64
+                    * class.resource_factor()
+                    * (1.0 - ORCHESTRATOR_WELFARE)
+                    / workers
+            } else {
+                demands
+                    .iter()
+                    .map(|(changes, factor)| changes * factor * ORCHESTRATOR_WELFARE)
+                    .sum()
+            };
             let reserved_factor: f64 = demands
                 .iter()
                 .map(|(changes, factor)| {
@@ -947,7 +1195,7 @@ fn search(
                     changes
                         * factor
                         * if group.class.is_none() {
-                            2.0
+                            0.0
                         } else {
                             reserved_visits(
                                 class,
@@ -957,21 +1205,50 @@ fn search(
                         }
                 })
                 .sum();
+            let minimum_log_utility = group
+                .policies
+                .iter()
+                .map(|policy| {
+                    stressed_incumbents.map_or(policy.utility, |incumbents| {
+                        if incumbents.contains(&stress_identity(group.role, policy)) {
+                            policy.lower_utility
+                        } else {
+                            policy.upper_utility
+                        }
+                    })
+                })
+                .map(f64::ln)
+                .reduce(f64::min)
+                .unwrap_or(0.0);
             group
                 .policies
                 .iter()
                 .map(|policy| {
+                    let utility = stressed_incumbents.map_or(policy.utility, |incumbents| {
+                        if incumbents.contains(&stress_identity(group.role, policy)) {
+                            policy.lower_utility
+                        } else {
+                            policy.upper_utility
+                        }
+                    });
                     let mut resources = vec![0.0; capacities.len()];
-                    resources[policy.pool * 2] = reserved_factor * policy.cycle.reserved_usage;
-                    resources[policy.pool * 2 + 1] =
-                        reserved_factor * policy.cycle.reserved_seconds / 3600.0;
+                    if group.class.is_none() {
+                        resources[policy.pool * 2] =
+                            settings.orchestrator_headroom_usd.unwrap_or(0.0);
+                        resources[policy.pool * 2 + 1] =
+                            settings.orchestrator_headroom_hours.unwrap_or(0.0);
+                    } else {
+                        resources[policy.pool * 2] = reserved_factor * policy.cycle.reserved_usage;
+                        resources[policy.pool * 2 + 1] =
+                            reserved_factor * policy.cycle.reserved_seconds / 3600.0;
+                    }
                     if policy.fable
                         && let Some(index) = fable_resource
                     {
                         resources[index] = resources[policy.pool * 2];
                     }
                     for (link_index, (lower, upper)) in competence_links.iter().enumerate() {
-                        let resource = path_resource + 8 + link_index;
+                        let resource = path_resource + 2 + link_index;
                         if group_index == *lower {
                             resources[resource] = policy.competence;
                         } else if group_index == *upper {
@@ -982,24 +1259,46 @@ fn search(
                         if group.class.is_some_and(|selected| selected != class) || changes == 0 {
                             continue;
                         }
-                        let path = path_resource + class.index() * 2;
+                        let path = path_resource;
                         let factor = class.resource_factor();
                         let seat = Seat::ALL[group.role];
                         let research = research_classes.get(class.name()).copied().unwrap_or(false);
                         let visits = reserved_visits(class, seat, research) as f64;
-                        resources[path] += if seat == Seat::Sanity { 0.0 } else { visits }
+                        let jobs = changes as f64;
+                        resources[path] += jobs
+                            * if seat == Seat::Sanity { 0.0 } else { visits }
                             * factor
                             * policy.cycle.reserved_seconds
                             / 3600.0;
-                        resources[path + 1] += if seat == Seat::Reviewer { 0.0 } else { visits }
+                        resources[path + 1] += jobs
+                            * if seat == Seat::Reviewer { 0.0 } else { visits }
                             * factor
                             * policy.cycle.reserved_seconds
                             / 3600.0;
                     }
+                    for (offset, (class, row_index)) in diversity_keys.iter().enumerate() {
+                        if group.class == Some(*class)
+                            && matches!(
+                                Seat::ALL[group.role],
+                                Seat::Implementer | Seat::Reviewer | Seat::Sanity
+                            )
+                            && policy.row_index == *row_index
+                        {
+                            resources[diversity_resource + offset] = 1.0;
+                        }
+                    }
                     Choice {
-                        quality: expected_factor * policy.utility,
-                        nominal_time: expected_factor * policy.cycle.nominal_seconds / 3600.0,
-                        nominal_cost: expected_factor * policy.cycle.nominal_usage,
+                        quality: quality_factor * (utility.ln() - minimum_log_utility),
+                        nominal_time: if group.class.is_none() {
+                            0.0
+                        } else {
+                            quality_factor * policy.cycle.nominal_seconds / 3600.0
+                        },
+                        nominal_cost: if group.class.is_none() {
+                            0.0
+                        } else {
+                            quality_factor * policy.cycle.nominal_usage
+                        },
                         resources,
                     }
                 })
@@ -1011,31 +1310,266 @@ fn search(
         capacities,
     };
     let mut state = solver::begin(&problem, limit, |choices| {
-        schedule(
-            &groups,
-            choices,
-            &sequence[..count],
-            pools,
-            hours,
-            research_classes,
-        )
+        schedule(&groups, choices, &sequence[..count], pools, settings)
     });
     solver::advance(&problem, &mut state, limit, true, |choices| {
-        schedule(
-            &groups,
-            choices,
-            &sequence[..count],
-            pools,
-            hours,
-            research_classes,
-        )
+        schedule(&groups, choices, &sequence[..count], pools, settings)
     });
+    let workload = counts
+        .into_iter()
+        .zip(WorkClass::ALL)
+        .map(|(changes, class)| changes as f64 * class.resource_factor())
+        .sum();
+    let log_shift = groups
+        .iter()
+        .map(|group| {
+            let coefficient = if let Some(class) = group.class {
+                let workers = groups
+                    .iter()
+                    .filter(|candidate| candidate.class == Some(class))
+                    .count()
+                    .max(1) as f64;
+                counts[class.index()] as f64
+                    * class.resource_factor()
+                    * (1.0 - ORCHESTRATOR_WELFARE)
+                    / workers
+            } else {
+                WorkClass::ALL
+                    .into_iter()
+                    .map(|class| {
+                        counts[class.index()] as f64
+                            * class.resource_factor()
+                            * ORCHESTRATOR_WELFARE
+                    })
+                    .sum()
+            };
+            let minimum = group
+                .policies
+                .iter()
+                .map(|policy| {
+                    stressed_incumbents.map_or(policy.utility, |incumbents| {
+                        if incumbents.contains(&stress_identity(group.role, policy)) {
+                            policy.lower_utility
+                        } else {
+                            policy.upper_utility
+                        }
+                    })
+                })
+                .map(f64::ln)
+                .reduce(f64::min)
+                .unwrap_or(0.0);
+            coefficient * minimum
+        })
+        .sum();
     Search {
         groups,
         problem,
         state,
         count,
+        workload,
+        log_shift,
     }
+}
+
+fn policy_identity(role: usize, policy: &Policy) -> String {
+    format!(
+        "{role}:{}:{}:{}:{}:{:?}",
+        policy.row_index,
+        policy.attempt_limit,
+        policy.native_harness,
+        policy.pool,
+        policy.research_class
+    )
+}
+
+fn stress_identity(role: usize, policy: &Policy) -> String {
+    format!(
+        "{role}:{}:{}:{}:{:?}",
+        policy.row_index, policy.native_harness, policy.pool, policy.research_class
+    )
+}
+
+fn conductor_headroom_fits(pool: &PoolUsage, fable: bool, settings: &Settings) -> bool {
+    let usage = settings.orchestrator_headroom_usd.unwrap_or(0.0);
+    let hours = settings.orchestrator_headroom_hours.unwrap_or(0.0);
+    usage <= pool.per_account_weekly_capacity
+        && hours <= settings.agent_hours
+        && (!fable || usage <= pool.per_account_weekly_capacity * 0.5)
+}
+
+fn scenario_better_or_equal<T>(
+    candidate: &solver::Solution<T>,
+    baseline_quality: f64,
+    baseline_time: f64,
+    baseline_cost: f64,
+) -> bool {
+    candidate.quality > baseline_quality + 1e-8
+        || ((candidate.quality - baseline_quality).abs() <= 1e-8
+            && (candidate.nominal_time < baseline_time - 1e-8
+                || ((candidate.nominal_time - baseline_time).abs() <= 1e-8
+                    && candidate.nominal_cost <= baseline_cost + 1e-8)))
+}
+
+fn capability_scenario(
+    count: usize,
+    sequence: &[WorkClass],
+    all_candidates: &[Vec<Policy>],
+    pools: &[PoolUsage],
+    settings: &Settings,
+    nominal_groups: &[Group],
+    nominal_choices: &[usize],
+) -> (CapabilityScenarioReport, Vec<CloseChoice>) {
+    let incumbents: std::collections::BTreeSet<_> = nominal_groups
+        .iter()
+        .zip(nominal_choices)
+        .map(|(group, choice)| stress_identity(group.role, &group.policies[*choice]))
+        .collect();
+    let mut result = search(
+        count,
+        sequence,
+        all_candidates,
+        pools,
+        settings,
+        256,
+        Some(&incumbents),
+    );
+    let used = result.state.nodes();
+    solver::advance(
+        &result.problem,
+        &mut result.state,
+        256_usize.saturating_sub(used),
+        false,
+        |choices| schedule(&result.groups, choices, &sequence[..count], pools, settings),
+    );
+    let baseline_choices: Option<Vec<_>> = result
+        .groups
+        .iter()
+        .map(|group| {
+            let nominal_group = nominal_groups
+                .iter()
+                .position(|nominal| nominal.role == group.role && nominal.class == group.class)?;
+            let nominal = &nominal_groups[nominal_group].policies[nominal_choices[nominal_group]];
+            group.policies.iter().position(|policy| {
+                policy_identity(group.role, policy) == policy_identity(group.role, nominal)
+            })
+        })
+        .collect();
+    let workload = result.workload;
+    let log_shift = result.log_shift;
+    let Some((baseline_quality, baseline_time, baseline_cost)) =
+        baseline_choices.as_ref().map(|choices| {
+            result.problem.groups.iter().zip(choices).fold(
+                (0.0, 0.0, 0.0),
+                |totals, (group, choice)| {
+                    let selected = &group[*choice];
+                    (
+                        totals.0 + selected.quality,
+                        totals.1 + selected.nominal_time,
+                        totals.2 + selected.nominal_cost,
+                    )
+                },
+            )
+        })
+    else {
+        return (
+                CapabilityScenarioReport {
+                    status: "unresolved".to_owned(),
+                    proven: false,
+                    quality: 0.0,
+                    baseline_quality: None,
+                    bound: None,
+                    relative_gap: None,
+                    message: "The bounded sensitivity scenario could not map the complete nominal team into its eligible candidate set; stability is unresolved.".to_owned(),
+                    assignments: Vec::new(),
+                },
+                Vec::new(),
+            );
+    };
+    let baseline_service = workload * ((baseline_quality + log_shift) / workload).exp();
+    let outcome = solver::finish(result.state);
+    let bound = outcome
+        .bound
+        .map(|value| workload * ((value + log_shift) / workload).exp());
+    let proven = outcome.proven;
+    let Some(solution) = outcome.solution.filter(|solution| {
+        scenario_better_or_equal(solution, baseline_quality, baseline_time, baseline_cost)
+    }) else {
+        return (
+            CapabilityScenarioReport {
+                status: "unresolved".to_owned(),
+                proven: false,
+                quality: 0.0,
+                baseline_quality: Some(baseline_service),
+                bound,
+                relative_gap: None,
+                message: "The bounded role-specific sensitivity search did not find a complete plan that matches the nominal team's stressed objective; this does not establish stability.".to_owned(),
+                assignments: Vec::new(),
+            },
+            Vec::new(),
+        );
+    };
+    let service = workload * ((solution.quality + log_shift) / workload).exp();
+    let relative_gap = bound.map(|value| (value / service.max(f64::MIN_POSITIVE) - 1.0).max(0.0));
+    let mut assignments = Vec::new();
+    let mut changes = Vec::new();
+    for (group, choice) in result.groups.iter().zip(&solution.choices) {
+        let policy = &group.policies[*choice];
+        let scenario_utility = if incumbents.contains(&stress_identity(group.role, policy)) {
+            policy.lower_utility
+        } else {
+            policy.upper_utility
+        };
+        let pool = &pools[policy.pool];
+        assignments.push(ScenarioAssignment {
+            seat: Seat::ALL[group.role],
+            class: group.class,
+            row_index: policy.row_index,
+            attempt_limit: policy.attempt_limit,
+            provider_id: pool.provider_id.clone(),
+            plan_id: pool.plan_id.clone(),
+            native_harness: policy.native_harness.clone(),
+            utility: scenario_utility,
+        });
+        let nominal_group = nominal_groups
+            .iter()
+            .position(|nominal| nominal.role == group.role && nominal.class == group.class);
+        let Some(nominal_group) = nominal_group else {
+            continue;
+        };
+        let nominal = &nominal_groups[nominal_group].policies[nominal_choices[nominal_group]];
+        if policy_identity(group.role, policy) != policy_identity(group.role, nominal) {
+            changes.push(CloseChoice {
+                seat: Seat::ALL[group.role],
+                class: group.class,
+                nominal_row_index: nominal.row_index,
+                challenger_row_index: policy.row_index,
+                nominal_utility: nominal.lower_utility,
+                challenger_utility: scenario_utility,
+                challenger_attempt_limit: policy.attempt_limit,
+                challenger_provider_id: pool.provider_id.clone(),
+                challenger_plan_id: pool.plan_id.clone(),
+                challenger_native_harness: policy.native_harness.clone(),
+                scenario_status: if proven { "optimal" } else { "search_limit" }.to_owned(),
+                scenario_bound: bound,
+                scenario_relative_gap: relative_gap,
+                scenario_proven: proven,
+                condition: "Conditional sensitivity alternative; native capability, billing, and a fresh hold must qualify before replanning.".to_owned(),
+            });
+        }
+    }
+    (
+        CapabilityScenarioReport {
+            status: if proven { "optimal" } else { "feasible_search_limit" }.to_owned(),
+            proven,
+            quality: service,
+            baseline_quality: Some(baseline_service),
+            bound,
+            relative_gap,
+            message: "Role-specific incumbent-lower and challenger-upper endpoints form a declared sensitivity scenario, not a statistical joint confidence region. The nominal plan remains funded.".to_owned(),
+            assignments,
+        },
+        changes,
+    )
 }
 
 fn seed_class_recommendations(
@@ -1087,6 +1621,12 @@ fn seed_class_recommendations(
             rule.attempt_limit = policy.attempt_limit;
             rule.competence = Some(policy.competence);
             rule.utility = policy.utility;
+            rule.evidence_level = policy.evidence_level.clone();
+            rule.capability_sensitivity = Some(CapabilityRange {
+                nominal: policy.utility,
+                lower: policy.lower_utility,
+                upper: policy.upper_utility,
+            });
             rule.per_call_expected_usage = factor * policy.cycle.nominal_usage;
             rule.per_call_expected_hours = factor * policy.cycle.nominal_seconds / 3600.0;
             rule.per_call_reserved_usage = factor * policy.cycle.reserved_usage;
@@ -1344,7 +1884,7 @@ pub fn compare_conductors(rows: &[Row], settings: &Settings) -> Vec<ConductorTra
         scenario
             .competence_floors
             .insert(Seat::Orchestrator.name().to_owned(), Some(floor));
-        let Some(portfolio) = allocate(rows, &scenario) else {
+        let Some(portfolio) = allocate_core(rows, &scenario, false) else {
             continue;
         };
         let Some(conductor) = &portfolio.conductor else {
@@ -1383,6 +1923,14 @@ pub fn compare_conductors(rows: &[Row], settings: &Settings) -> Vec<ConductorTra
 }
 
 pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
+    allocate_core(rows, settings, true)
+}
+
+fn allocate_core(
+    rows: &[Row],
+    settings: &Settings,
+    include_sensitivity: bool,
+) -> Option<Portfolio> {
     let selected: Vec<_> = subscriptions::PROVIDERS
         .iter()
         .filter_map(|provider| {
@@ -1401,7 +1949,7 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
             .flatten()
             .unwrap_or(plan.monthly_allowance_low * 12.0 / 52.0)
     };
-    let forecast = (settings.agent_hours * settings.orchestrators as f64 / 4.0).ceil() as usize;
+    let forecast = (settings.agent_hours / 4.0).ceil() as usize;
     let sequence = sequence(forecast);
     let mut forecast_counts = [0_usize; 4];
     for class in &sequence {
@@ -1417,25 +1965,25 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
                 expected_visits: 0.0, reserved_visits: 0, expected_completions: 0.0, competence: None, utility: 0.0,
                 nominal_usage: 0.0, nominal_hours: 0.0, reserved_usage: 0.0, reserved_hours: 0.0,
                 per_call_expected_usage: 0.0, per_call_expected_hours: 0.0, per_call_reserved_usage: 0.0, per_call_reserved_hours: 0.0, provider_id: None, plan_id: None,
-                fable: false, failure_action: failure_action(seat).to_owned(), message: if seat == Seat::NetResearch { "On demand; exact research tools, source scope, role evidence, billing, and native holds must qualify for the ready job." } else { "No funded static assignment is available for this workflow." }.to_owned(),
+                fable: false, failure_action: failure_action(seat).to_owned(), message: if seat == Seat::NetResearch { "On demand; exact research tools, source scope, role evidence, billing, and native holds must qualify for the ready job." } else { "No funded static assignment is available for this workflow." }.to_owned(), evidence_level: String::new(), capability_sensitivity: None, repair_activation_proxy: None,
             }).collect(),
         }).collect(),
         pools: selected.iter().map(|(provider, plan)| PoolUsage {
             provider_id: provider.id.to_owned(), subscription_count: settings.subscription_count(provider.id), per_account_weekly_capacity: capacity(provider, plan), provider_name: provider.name.to_owned(), plan_id: plan.id.to_owned(), plan_name: plan.name.to_owned(), monthly_price: plan.monthly_price * settings.subscription_count(provider.id) as f64, price_is_estimate: plan.price_is_estimate,
-            weekly_capacity: capacity(provider, plan) * settings.subscription_count(provider.id) as f64, nominal_usage: 0.0, stress_usage: 0.0, remaining_capacity: capacity(provider, plan) * settings.subscription_count(provider.id) as f64, utilization_pct: 0.0,
-            available_hours: settings.agent_hours * settings.subscription_count(provider.id) as f64, scheduled_hours: 0.0, unused_hours: settings.agent_hours * settings.subscription_count(provider.id) as f64, reserved_usage: 0.0, reserved_hours: 0.0, remaining_reserved_capacity: capacity(provider, plan) * settings.subscription_count(provider.id) as f64, remaining_reserved_hours: settings.agent_hours * settings.subscription_count(provider.id) as f64,
-            unit: "estimated API-equivalent USD".to_owned(), source_url: plan.source_url.to_owned(), allowance_basis: if settings.vendor_overrides.get(provider.id).copied().flatten().is_some() { format!("User-defined weekly API-equivalent allowance per subscription × {} owned subscriptions", settings.subscription_count(provider.id)) } else { format!("{} Owned allowance units: {}.", plan.allowance_basis, settings.subscription_count(provider.id)) },
+            weekly_capacity: capacity(provider, plan), nominal_usage: 0.0, stress_usage: 0.0, remaining_capacity: capacity(provider, plan), utilization_pct: 0.0,
+            available_hours: settings.agent_hours, scheduled_hours: 0.0, unused_hours: settings.agent_hours, reserved_usage: 0.0, reserved_hours: 0.0, remaining_reserved_capacity: capacity(provider, plan), remaining_reserved_hours: settings.agent_hours,
+            unit: "estimated API-equivalent USD".to_owned(), source_url: plan.source_url.to_owned(), allowance_basis: if settings.vendor_overrides.get(provider.id).copied().flatten().is_some() { format!("User-defined weekly API-equivalent allowance for one bound account; {} owned subscriptions", settings.subscription_count(provider.id)) } else { format!("{} Owned subscriptions: {}; forecast uses one bound account.", plan.allowance_basis, settings.subscription_count(provider.id)) },
         }).collect(),
         limits: selected.iter().filter(|(provider, plan)| provider.id == "anthropic" && plan.id != "claude-pro").map(|(provider, plan)| PoolLimit {
-            provider_id: provider.id.to_owned(), name: "Fable: 50% of the aggregate Claude account pools".to_owned(), weekly_capacity: capacity(provider, plan) * settings.subscription_count(provider.id) as f64 * 0.5, nominal_usage: 0.0, stress_usage: 0.0, reserved_usage: 0.0, remaining_capacity: capacity(provider, plan) * settings.subscription_count(provider.id) as f64 * 0.5,
+            provider_id: provider.id.to_owned(), name: "Fable: 50% of the aggregate Claude account pools".to_owned(), weekly_capacity: capacity(provider, plan) * 0.5, nominal_usage: 0.0, stress_usage: 0.0, reserved_usage: 0.0, remaining_capacity: capacity(provider, plan) * 0.5,
         }).collect(),
         assumptions: vec![
-            "The proxy demand volume is ceil(elapsed weekly hours * concurrent project orchestrators / 4). It is a capacity scenario, not an authorized backlog or native admission. Orchestrators share every subscription allowance; the count does not multiply quota or approved worker concurrency. The 50/30/15/5% template mix and 0.25/1/2/4 proxy factors are declared conventions, not measured workload averages.".to_owned(),
-            "Each owned subscription contributes one modeled allowance and one account calendar within the same elapsed working horizon. Forecast account ordinals are scheduling slots, not native account identities, authentication, meters, or authorization. The fixed conductor remains on the first account slot.".to_owned(),
+            "The proxy demand volume is ceil(weekly hours / 4). Concurrent orchestrators share that volume and every subscription allowance; the count does not multiply quota, calendar hours, or worker concurrency. Nested prefixes of the 50/30/15/5 sequence never re-apportion. Extensive is absent below 11 jobs. The 0.25/1/2/4 factors are declared conventions.".to_owned(),
+            "The profile binds one account per provider, so the forecast uses one modeled allowance and one account calendar per provider regardless of owned subscription count. Additional subscriptions remain in purchase costs but contribute no forecast capacity. Forecast account ordinals are scheduling slots, not native account identities, authentication, meters, or authorization.".to_owned(),
             "Select workflow templates from consequence, uncertainty, coupling, reversibility, evidence need, tool risk, correlation, and deadline risk. File count is load information only and never determines the workflow.".to_owned(),
             "The full forecast uses largest-remainder class counts with canonical ties. A fixed deficit-ordered sequence supplies nested admission prefixes; reduced demand never re-apportions.".to_owned(),
-            "The API-equivalent proxy uses three stages for Focused, eight for Standard, and nine for Complex and Extensive work, with 25% expected repair incidence where checks activate repair. Each class can explicitly include one AA research-reference visit; the default coding forecast excludes it. Native tasks expand from their risk vectors and actual task evidence.".to_owned(),
-            "The Orchestrator uses one persistent model and effort for both visits across the whole plan. Its resource load is two Intelligence Index benchmark-task-equivalent units per class-weighted admitted change; every real native call is also charged once in the runtime ledger. Each worker visit uses one model and effort with 1–3 same-model attempts.".to_owned(),
+            "The API-equivalent worker proxy uses one stage for Focused, six for Standard, and seven for Complex and Extensive work. Expected repair activation uses the selected Implementer's bounded-attempt benchmark residual as an uncalibrated proxy; the full conditional repair path remains reserved. Each class can explicitly include one AA research-reference visit; the default coding forecast excludes it. Native tasks expand from their risk vectors and actual task evidence.".to_owned(),
+            "The Orchestrator uses one persistent model and effort across the whole plan. Its ongoing demand is not inferred from worker jobs. Optional USD and hour headroom is reserved once on its selected account; every actual native call is charged through the runtime ledger. Each worker visit uses one model and effort with 1–3 same-model attempts.".to_owned(),
             "Multi-criteria role utility uses each skill component once: capped completion for reference-workload evidence, static values for other skills. It is not real-job success probability. Class factors scale demand and resources, not calibrated difficulty.".to_owned(),
             "The proxy calendar places its declared stage sequence in earliest account gaps to estimate API-equivalent capacity. Native scheduling instead uses authorized ready task IDs, risk-selected DAGs, immutable artifact dependencies, current reset windows, and deadlines.".to_owned(),
             "The solver optimizes only assignments feasible under this declared scheduler. Modeled allowances and full-cap buffers do not guarantee real vendor quota or runtime; unknown actual usage requires pause and reconciliation.".to_owned(),
@@ -1443,16 +1991,18 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
         message: String::new(),
         math_audit: MathAudit {
             objective: "Multi-criteria role utility uses each competence component once: capped completion replaces reference-workload evidence, while other skill components remain static. Competence floors apply separately; this is not a calibrated probability of completing a real job.".to_owned(),
-            coordination_proxy: "Orchestration is charged two class-weighted benchmark-task-equivalent units per admitted change using the selected model's Artificial Analysis Intelligence Index cost and canonical decode-time proxy. The Intelligence Index is selection evidence, not a measured probability of orchestration success; every actual native call is charged once in the runtime ledger.".to_owned(),
+            coordination_proxy: "Persistent orchestration competence is the Intelligence Index. LCR and HLE are diagnostics and do not enter the score. Ongoing usage is unknown; optional fixed headroom is reserved once and every actual native call is charged through the runtime ledger.".to_owned(),
             ..MathAudit::default()
         },
         conductor: None,
+        close_choices: Vec::new(),
+        capability_scenario: None,
         dispatch: DispatchPlan {
             policy_version: crate::team_policy::VERSION.to_owned(),
-            forecast_changes: forecast, native_admission_changes: 0, admitted_changes: 0, deferred_changes: forecast, cadence_hours: 4.0, repair_incidence: 0.25,
+            forecast_changes: forecast, admitted_changes: 0, deferred_changes: forecast, cadence_hours: 4.0, repair_incidence: 0.0,
             classes: WorkClass::ALL.into_iter().map(|class| WorkClassDemand { class, condition: class.condition().to_owned(), resource_factor: class.resource_factor(), forecast_changes: forecast_counts[class.index()], admitted_changes: 0, research_included: settings.research_classes.get(class.name()).copied().unwrap_or(false) }).collect(),
             solver: SolverReport { status: "infeasible".to_owned(), proven_optimal: false, quality: 0.0, bound: None, relative_gap: None, nodes: 0, message: String::new() },
-            executable: false, admitted_sequence: Vec::new(), reserved_makespan_hours: 0.0, schedule: Vec::new(),
+            executable: false, admitted_sequence: Vec::new(), reserved_makespan_hours: 0.0, schedule: Vec::new(), repair_sensitivity: Vec::new(), service: TeamServiceReport::default(),
         },
     };
     if let Some(role) = portfolio
@@ -1629,7 +2179,7 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
                 continue;
             };
             let competence = if seat == Seat::Orchestrator {
-                row.smart
+                engine::orchestrator_capability(row)
             } else {
                 engine::competence(row, seat)
             };
@@ -1639,7 +2189,24 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
                 continue;
             };
             if seat == Seat::Orchestrator {
+                let fable = subscriptions::is_fable(row) && row.vendor == "anthropic";
+                if !conductor_headroom_fits(&portfolio.pools[pool], fable, settings) {
+                    continue;
+                }
                 let Some(cycle) = engine::orchestrator_dispatch_cycle(row, settings) else {
+                    continue;
+                };
+                let Some(sensitivity) = engine::orchestrator_capability_sensitivity(row, settings)
+                else {
+                    continue;
+                };
+                let Some((utility, lower_utility, upper_utility)) = sensitivity
+                    .nominal
+                    .zip(sensitivity.low)
+                    .zip(sensitivity.high)
+                    .map(|((nominal, lower), upper)| (nominal, lower, upper))
+                    .filter(|_| !sensitivity.incomplete)
+                else {
                     continue;
                 };
                 candidates[role].push(Policy {
@@ -1650,11 +2217,14 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
                         .unwrap_or_else(|| row.harness.clone()),
                     pool,
                     competence,
-                    utility: competence,
+                    utility,
                     attempt_limit: 1,
                     cycle,
-                    fable: subscriptions::is_fable(row) && row.vendor == "anthropic",
+                    fable,
                     research_class: None,
+                    lower_utility,
+                    upper_utility,
+                    evidence_level: role_evidence_level(row, seat),
                 });
                 continue;
             }
@@ -1666,7 +2236,11 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
             for (index, cycle) in cycles.iter().copied().enumerate() {
                 if cycle.success > 0.0
                     && let Some(utility) = engine::dispatch_utility(row, seat, &cycle)
+                    && let Some(sensitivity) =
+                        engine::dispatch_utility_sensitivity(row, seat, &cycle, settings)
+                    && !sensitivity.incomplete
                 {
+                    let utility = sensitivity.nominal.unwrap_or(utility);
                     candidates[role].push(Policy {
                         row_index,
                         native_harness: row.harness.clone(),
@@ -1677,6 +2251,9 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
                         cycle,
                         fable: subscriptions::is_fable(row) && row.vendor == "anthropic",
                         research_class: None,
+                        lower_utility: sensitivity.low.unwrap_or(utility),
+                        upper_utility: sensitivity.high.unwrap_or(utility),
+                        evidence_level: role_evidence_level(row, seat),
                     });
                 }
             }
@@ -1700,6 +2277,10 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
                 .unwrap_or(false)
         }) {
             for candidate in &rule.research_candidates {
+                let sensitivity = research_sensitivity(
+                    candidate,
+                    (settings.assumption_span_pct / 100.0).clamp(0.0, 1.0),
+                );
                 let Some(pool) = portfolio.pools.iter().position(|pool| {
                     pool.provider_id == candidate.provider_id && pool.plan_id == candidate.plan_id
                 }) else {
@@ -1727,209 +2308,264 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
                     fable: subscriptions::is_fable(&rows[candidate.row_index])
                         && candidate.provider_id == "anthropic",
                     research_class: Some(rule.class),
+                    lower_utility: sensitivity.lower,
+                    upper_utility: sensitivity.upper,
+                    evidence_level: research_evidence_level(&rows[candidate.row_index], rule.class),
                 });
             }
         }
     }
+    let all_candidates = candidates.clone();
     let candidates: Vec<_> = candidates
         .into_iter()
         .map(|policies| prune(policies, rows, settings.monotonic_class_competence))
         .collect();
     seed_class_recommendations(&mut portfolio, &candidates, rows, settings.agent_hours);
     let mut nodes = 0;
-    let initial = search(
-        forecast,
-        &sequence,
-        &candidates,
-        &portfolio.pools,
-        settings,
-        256,
-    );
-    nodes += initial.state.nodes();
-    let mut numerical_failure = initial.state.limitation();
-    let mut smallest_proven_infeasible = None;
-    let mut unresolved_states = Vec::new();
-    let mut best = if initial.state.has_solution() {
-        Some(initial)
-    } else {
-        if initial.state.proven() {
-            smallest_proven_infeasible = Some(forecast);
-        } else {
-            unresolved_states.push(initial);
-        }
-        None
-    };
-    if best.is_none() {
-        let mut lower = 0;
-        let mut upper = forecast;
-        while lower + 1 < upper && nodes < SEARCH_NODES {
-            let count = (lower + upper) / 2;
-            let result = search(
-                count,
-                &sequence,
-                &candidates,
-                &portfolio.pools,
-                settings,
-                (SEARCH_NODES - nodes).min(256),
-            );
-            nodes += result.state.nodes();
-            if let Some(reason) = result.state.limitation() {
-                numerical_failure.get_or_insert(reason);
-            }
-            if result.state.has_solution() {
-                lower = count;
-                best = Some(result);
-            } else {
-                if result.state.proven() {
-                    smallest_proven_infeasible = Some(
-                        smallest_proven_infeasible.map_or(count, |known: usize| known.min(count)),
-                    );
-                } else {
-                    unresolved_states.push(result);
-                }
-                upper = count;
-            }
-        }
+    let mut work_units = 0;
+    let mut searches = Vec::new();
+    let mut numerical_failure = None;
+    let mut next_count = 1;
+    while next_count <= forecast && work_units < SEARCH_NODES {
+        let result = search(
+            next_count,
+            &sequence,
+            &candidates,
+            &portfolio.pools,
+            settings,
+            1,
+            None,
+        );
+        nodes += result.state.nodes();
+        work_units += 1;
+        numerical_failure = numerical_failure.or(result.state.limitation());
+        searches.push(result);
+        next_count += 1;
     }
-    while nodes < SEARCH_NODES {
-        let admitted = best.as_ref().map_or(0, |state| state.count);
-        let upper = smallest_proven_infeasible.unwrap_or(forecast.saturating_add(1));
-        if admitted >= forecast || admitted.saturating_add(1) >= upper {
-            break;
-        }
-        unresolved_states.retain(|state| state.count > admitted && state.count < upper);
-        let existing = unresolved_states
+    while work_units < SEARCH_NODES {
+        let Some(index) = searches
             .iter()
             .enumerate()
-            .filter(|(_, state)| state.state.can_advance())
-            .min_by_key(|(_, state)| state.count)
-            .map(|(index, _)| index);
-        let (mut pending, counted) = if let Some(index) = existing {
-            (unresolved_states.remove(index), true)
-        } else {
-            let midpoint = (admitted + upper) / 2;
-            let Some(count) = (admitted + 1..upper)
-                .filter(|count| unresolved_states.iter().all(|state| state.count != *count))
-                .min_by_key(|count| (count.abs_diff(midpoint), *count))
-            else {
-                break;
-            };
-            (
-                search(
-                    count,
-                    &sequence,
-                    &candidates,
-                    &portfolio.pools,
-                    settings,
-                    (SEARCH_NODES - nodes).min(256),
-                ),
-                false,
-            )
+            .filter(|(_, search)| search.state.can_advance())
+            .max_by(|(_, left), (_, right)| {
+                search_service_bound(left)
+                    .total_cmp(&search_service_bound(right))
+                    .then_with(|| left.count.cmp(&right.count))
+            })
+            .map(|(index, _)| index)
+        else {
+            break;
         };
-        let previous_nodes = pending.state.nodes();
-        if counted {
-            solver::advance(
-                &pending.problem,
-                &mut pending.state,
-                (SEARCH_NODES - nodes).min(256),
-                true,
-                |choices| {
-                    schedule(
-                        &pending.groups,
-                        choices,
-                        &sequence[..pending.count],
-                        &portfolio.pools,
-                        settings.agent_hours,
-                        &settings.research_classes,
-                    )
-                },
-            );
-        }
-        let progressed = if counted {
-            pending.state.nodes().saturating_sub(previous_nodes)
-        } else {
-            pending.state.nodes()
-        };
-        nodes += progressed;
-        if let Some(reason) = pending.state.limitation() {
-            numerical_failure.get_or_insert(reason);
-        }
-        if pending.state.has_solution() {
-            best = Some(pending);
-        } else if pending.state.proven() {
-            smallest_proven_infeasible = Some(
-                smallest_proven_infeasible.map_or(pending.count, |known| known.min(pending.count)),
-            );
-        } else {
-            unresolved_states.push(pending);
-        }
-    }
-    let Some(mut best) = best else {
-        let unresolved = smallest_proven_infeasible != Some(1);
-        if !unresolved {
-            numerical_failure = None;
-        }
-        portfolio.dispatch.solver.nodes = nodes;
-        portfolio.dispatch.solver.status = if numerical_failure.is_some() {
-            "solver_failure"
-        } else if unresolved {
-            "search_limit"
-        } else {
-            "infeasible"
-        }
-        .to_owned();
-        portfolio.message = if let Some(reason) = numerical_failure {
-            format!(
-                "The numerical relaxation stopped: {reason}. No complete feasible policy was found; infeasibility is not proved."
-            )
-        } else if unresolved {
-            "Search limit reached without an executable complete-change plan; infeasibility is not proved.".to_owned()
-        } else {
-            "No complete forecast change can be funded with all required roles and the bounded dependency schedule.".to_owned()
-        };
-        portfolio.dispatch.solver.message = portfolio.message.clone();
-        adaptive_routes(&mut portfolio, &candidates, rows);
-        return Some(portfolio);
-    };
-    let remaining = SEARCH_NODES.saturating_sub(nodes);
-    {
-        let previous_nodes = best.state.nodes();
+        let slice = (SEARCH_NODES - work_units).min(32);
+        let search = &mut searches[index];
+        let previous_nodes = search.state.nodes();
         solver::advance(
-            &best.problem,
-            &mut best.state,
-            remaining,
+            &search.problem,
+            &mut search.state,
+            slice,
             false,
             |choices| {
                 schedule(
-                    &best.groups,
+                    &search.groups,
                     choices,
-                    &sequence[..best.count],
+                    &sequence[..search.count],
                     &portfolio.pools,
-                    settings.agent_hours,
-                    &settings.research_classes,
+                    settings,
                 )
             },
         );
-        nodes += best.state.nodes().saturating_sub(previous_nodes);
+        let progressed = search.state.nodes().saturating_sub(previous_nodes);
+        nodes += progressed;
+        work_units += slice;
+        numerical_failure = numerical_failure.or(search.state.limitation());
     }
-    let admission_proven =
-        best.count == forecast || smallest_proven_infeasible == Some(best.count.saturating_add(1));
-    let outcome = solver::finish(best.state);
-    numerical_failure = if admission_proven {
-        outcome.limitation
-    } else {
-        outcome.limitation.or(numerical_failure)
+    let selected = searches
+        .iter()
+        .enumerate()
+        .filter_map(|(index, search)| search_service(search).map(|service| (index, service)))
+        .max_by(|(left_index, left), (right_index, right)| {
+            left.total_cmp(right)
+                .then_with(|| {
+                    searches[*left_index]
+                        .count
+                        .cmp(&searches[*right_index].count)
+                })
+                .then_with(|| {
+                    let left_solution = searches[*left_index]
+                        .state
+                        .incumbent()
+                        .expect("feasible prefix");
+                    let right_solution = searches[*right_index]
+                        .state
+                        .incumbent()
+                        .expect("feasible prefix");
+                    right_solution
+                        .nominal_cost
+                        .total_cmp(&left_solution.nominal_cost)
+                        .then_with(|| {
+                            right_solution
+                                .nominal_time
+                                .total_cmp(&left_solution.nominal_time)
+                        })
+                })
+        });
+    let maximum_volume = searches
+        .iter()
+        .filter(|search| search.state.has_solution())
+        .max_by_key(|search| search.count);
+    let Some((_, _)) = selected else {
+        let worker_infeasible = next_count > forecast
+            && !searches.is_empty()
+            && searches.iter().all(|search| search.state.proven());
+        portfolio.dispatch.solver.nodes = nodes;
+        portfolio.dispatch.solver.status = if forecast == 0 {
+            "no_worker_demand"
+        } else if worker_infeasible {
+            "infeasible"
+        } else if numerical_failure.is_some() {
+            "solver_failure"
+        } else {
+            "search_limit"
+        }
+        .to_owned();
+        portfolio.message = if forecast == 0 {
+            "No worker demand is declared. Persistent Orchestrator selection remains available on demand.".to_owned()
+        } else if worker_infeasible {
+            "No complete worker plan is feasible under the declared resources. Persistent Orchestrator selection remains independent of worker demand.".to_owned()
+        } else {
+            "No complete worker plan was found within the bounded service search. Persistent Orchestrator selection remains independent of worker demand.".to_owned()
+        };
+        portfolio.dispatch.solver.message = portfolio.message.clone();
+        let orchestrator_role = Seat::ALL
+            .iter()
+            .position(|seat| *seat == Seat::Orchestrator)
+            .unwrap_or(0);
+        if let Some(policy) = candidates[orchestrator_role]
+            .iter()
+            .filter(|policy| {
+                conductor_headroom_fits(&portfolio.pools[policy.pool], policy.fable, settings)
+            })
+            .max_by(|left, right| {
+                left.utility.total_cmp(&right.utility).then_with(|| {
+                    right
+                        .cycle
+                        .nominal_usage
+                        .total_cmp(&left.cycle.nominal_usage)
+                })
+            })
+        {
+            let pool = &mut portfolio.pools[policy.pool];
+            pool.reserved_usage += settings.orchestrator_headroom_usd.unwrap_or(0.0);
+            pool.reserved_hours += settings.orchestrator_headroom_hours.unwrap_or(0.0);
+            if policy.fable {
+                for limit in portfolio
+                    .limits
+                    .iter_mut()
+                    .filter(|limit| limit.provider_id == pool.provider_id)
+                {
+                    limit.reserved_usage += settings.orchestrator_headroom_usd.unwrap_or(0.0);
+                    limit.stress_usage = limit.reserved_usage;
+                    limit.remaining_capacity =
+                        (limit.weekly_capacity - limit.reserved_usage).max(0.0);
+                }
+            }
+            portfolio.conductor = Some(ConductorAllocation {
+                row_index: policy.row_index,
+                binding_id: crate::agent_setup::binding_id_for(
+                    &policy.native_harness,
+                    &rows[policy.row_index],
+                ),
+                native_harness: policy.native_harness.clone(),
+                provider_id: pool.provider_id.clone(),
+                plan_id: pool.plan_id.clone(),
+                attempt_limit: 1,
+                competence: policy.competence,
+                utility: policy.utility,
+                persistent: true,
+                evidence_profile: "Intelligence Index".to_owned(),
+                evidence_level: policy.evidence_level.clone(),
+                capability_sensitivity: Some(CapabilityRange {
+                    nominal: policy.utility,
+                    lower: policy.lower_utility,
+                    upper: policy.upper_utility,
+                }),
+                usage_forecast: None,
+                headroom: ConductorHeadroom {
+                    usd: settings.orchestrator_headroom_usd,
+                    hours: settings.orchestrator_headroom_hours,
+                },
+                per_call_expected_usage: policy.cycle.nominal_usage,
+                per_call_expected_hours: policy.cycle.nominal_seconds / 3600.0,
+                per_call_reserved_usage: policy.cycle.reserved_usage,
+                per_call_reserved_hours: policy.cycle.reserved_seconds / 3600.0,
+                cost_basis: rows[policy.row_index]
+                    .orchestrator_cost_basis
+                    .clone()
+                    .unwrap_or_default(),
+                time_basis: rows[policy.row_index]
+                    .orchestrator_time_basis
+                    .clone()
+                    .unwrap_or_default(),
+                classes: WorkClass::ALL
+                    .into_iter()
+                    .map(|class| ConductorClassDemand {
+                        class,
+                        changes: 0,
+                        resource_factor: class.resource_factor(),
+                        visits: 0,
+                    })
+                    .collect(),
+            });
+        }
+        for pool in &mut portfolio.pools {
+            pool.stress_usage = pool.reserved_usage;
+            pool.remaining_reserved_capacity =
+                (pool.weekly_capacity - pool.reserved_usage).max(0.0);
+            pool.remaining_reserved_hours = (pool.available_hours - pool.reserved_hours).max(0.0);
+            pool.utilization_pct = if pool.weekly_capacity > 0.0 {
+                100.0 * pool.reserved_usage / pool.weekly_capacity
+            } else {
+                0.0
+            };
+        }
+        adaptive_routes(&mut portfolio, &candidates, rows);
+        fill_math_audit(&mut portfolio);
+        return Some(portfolio);
     };
+    let maximum_volume_admitted = maximum_volume.map_or(0, |search| search.count);
+    let maximum_volume_service = maximum_volume.and_then(search_service);
+    let unsearched_bound = (next_count..=forecast)
+        .map(|count| {
+            sequence[..count]
+                .iter()
+                .map(|class| class.resource_factor())
+                .sum::<f64>()
+        })
+        .reduce(f64::max)
+        .unwrap_or(0.0);
+    let global_bound = searches
+        .iter()
+        .map(search_service_bound)
+        .reduce(f64::max)
+        .unwrap_or(0.0)
+        .max(unsearched_bound);
+    let all_proven = next_count > forecast && searches.iter().all(|search| search.state.proven());
+    let (selected_index, best_service) = selected.expect("selected service");
+    let best = searches.swap_remove(selected_index);
+    let best_count = best.count;
+    let best_workload = best.workload;
+    let best_groups = best.groups;
+    let outcome = solver::finish(best.state);
     portfolio.dispatch.solver.nodes = nodes;
     let solution = outcome.solution.expect("selected dispatch solution");
-    let proven = outcome.proven && admission_proven;
-    portfolio.dispatch.admitted_changes = best.count;
-    portfolio.dispatch.deferred_changes = forecast - best.count;
+    let proven = all_proven && global_bound <= best_service + 1e-9;
+    portfolio.dispatch.admitted_changes = best_count;
+    portfolio.dispatch.deferred_changes = forecast - best_count;
     portfolio.dispatch.executable = true;
-    portfolio.dispatch.admitted_sequence = sequence[..best.count].to_vec();
+    portfolio.dispatch.admitted_sequence = sequence[..best_count].to_vec();
     portfolio.dispatch.reserved_makespan_hours = solution.payload.makespan;
     portfolio.dispatch.schedule = solution.payload.visits;
-    for class in &sequence[..best.count] {
+    for class in &sequence[..best_count] {
         portfolio.dispatch.classes[class.index()].admitted_changes += 1;
     }
     portfolio.dispatch.solver.status = if proven {
@@ -1941,21 +2577,91 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
     }
     .to_owned();
     portfolio.dispatch.solver.proven_optimal = proven;
-    portfolio.dispatch.solver.quality = solution.quality;
-    portfolio.dispatch.solver.bound = outcome.bound;
-    portfolio.dispatch.solver.relative_gap = outcome.bound.map(|bound| {
-        ((bound - solution.quality).max(0.0) / solution.quality.max(f64::MIN_POSITIVE)).max(0.0)
-    });
+    portfolio.dispatch.solver.quality = best_service;
+    portfolio.dispatch.solver.bound = Some(global_bound.max(best_service));
+    portfolio.dispatch.solver.relative_gap =
+        Some((global_bound / best_service.max(f64::MIN_POSITIVE) - 1.0).max(0.0));
     portfolio.dispatch.solver.message = if proven {
-        "Maximum complete-change admission and quality are optimal within the declared scheduler and numerical tolerances.".to_owned()
-    } else if let Some(reason) = numerical_failure {
-        format!(
-            "A feasible complete-change plan is available. The numerical relaxation stopped: {reason}; optimality is not proved."
-        )
+        "The quality-adjusted service objective is optimal across every forecast prefix within the declared scheduler and numerical tolerances.".to_owned()
     } else {
-        "A feasible complete-change plan is available; the bounded search did not prove all admission or quality decisions optimal.".to_owned()
+        "The selected worker plan has the best quality-adjusted service found across bounded prefix searches; global optimality is unresolved.".to_owned()
     };
-    for (group, choice) in best.groups.iter().zip(solution.choices) {
+    portfolio.dispatch.service = TeamServiceReport {
+        workload: best_workload,
+        team_capability: best_service / best_workload,
+        quality_adjusted_service: best_service,
+        maximum_volume_admitted,
+        maximum_volume_service,
+        proven_optimal: proven,
+        bound: Some(global_bound.max(best_service)),
+        relative_gap: portfolio.dispatch.solver.relative_gap,
+        message: "Service combines persistent coordination capability with each class's unique required worker roles; it is a policy utility index, not a task-success probability.".to_owned(),
+    };
+    if include_sensitivity {
+        let (scenario, close_choices) = capability_scenario(
+            best_count,
+            &sequence,
+            &all_candidates,
+            &portfolio.pools,
+            settings,
+            &best_groups,
+            &solution.choices,
+        );
+        portfolio.capability_scenario = Some(scenario);
+        portfolio.close_choices = close_choices;
+    }
+    let mut repair_by_class = [0.0; 4];
+    for (group, choice) in best_groups.iter().zip(&solution.choices) {
+        if Seat::ALL[group.role] == Seat::Implementer
+            && let Some(class) = group.class
+        {
+            repair_by_class[class.index()] =
+                (1.0 - group.policies[*choice].cycle.success).clamp(0.0, 1.0);
+        }
+    }
+    let repair_span = (settings.assumption_span_pct / 100.0).clamp(0.0, 1.0);
+    portfolio.dispatch.repair_sensitivity = WorkClass::ALL
+        .into_iter()
+        .filter(|class| portfolio.dispatch.classes[class.index()].admitted_changes > 0)
+        .map(|class| {
+            let nominal = if class == WorkClass::Focused {
+                0.0
+            } else {
+                repair_by_class[class.index()]
+            };
+            ClassRepairSensitivity {
+                class,
+                nominal,
+                lower: (nominal * (1.0 - repair_span)).clamp(0.0, 1.0),
+                upper: (nominal * (1.0 + repair_span)).clamp(0.0, 1.0),
+                basis: if class == WorkClass::Focused {
+                    "Focused workflow has no conditional repair stage.".to_owned()
+                } else {
+                    "Uncalibrated selected-Implementer bounded-attempt benchmark residual; full conditional repair and rechecks remain reserved.".to_owned()
+                },
+            }
+        })
+        .collect();
+    let repair_jobs: usize = portfolio
+        .dispatch
+        .classes
+        .iter()
+        .filter(|demand| demand.class != WorkClass::Focused)
+        .map(|demand| demand.admitted_changes)
+        .sum();
+    portfolio.dispatch.repair_incidence = if repair_jobs == 0 {
+        0.0
+    } else {
+        portfolio
+            .dispatch
+            .classes
+            .iter()
+            .filter(|demand| demand.class != WorkClass::Focused)
+            .map(|demand| demand.admitted_changes as f64 * repair_by_class[demand.class.index()])
+            .sum::<f64>()
+            / repair_jobs as f64
+    };
+    for (group, choice) in best_groups.iter().zip(solution.choices) {
         let policy = &group.policies[choice];
         let classes: Vec<_> = group
             .class
@@ -1963,7 +2669,7 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
         for class in classes {
             let changes = portfolio.dispatch.classes[class.index()].admitted_changes;
             let visits = if group.class.is_none() {
-                2
+                0
             } else {
                 reserved_visits(
                     class,
@@ -1976,7 +2682,7 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
                 )
             };
             let expected = if group.class.is_none() {
-                (changes * 2) as f64
+                0.0
             } else {
                 changes as f64
                     * expected_visits(
@@ -1987,6 +2693,7 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
                             .get(class.name())
                             .copied()
                             .unwrap_or(false),
+                        repair_by_class[class.index()],
                     )
             };
             let factor = class.resource_factor();
@@ -2025,6 +2732,14 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
             };
             rule.competence = Some(policy.competence);
             rule.utility = policy.utility;
+            rule.evidence_level = policy.evidence_level.clone();
+            rule.capability_sensitivity = Some(CapabilityRange {
+                nominal: policy.utility,
+                lower: policy.lower_utility,
+                upper: policy.upper_utility,
+            });
+            rule.repair_activation_proxy = (group.class.is_some() && class != WorkClass::Focused)
+                .then_some(repair_by_class[class.index()]);
             rule.nominal_usage = expected * factor * policy.cycle.nominal_usage;
             rule.nominal_hours = expected * factor * policy.cycle.nominal_seconds / 3600.0;
             rule.per_call_expected_usage = factor * policy.cycle.nominal_usage;
@@ -2051,10 +2766,12 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
             rule.calibration = "Benchmark evidence is provisional for this native harness. Native consumption, duration, and role outcomes remain uncalibrated until real-job telemetry supplies an interval and provenance.".to_owned();
             rule.fable = policy.fable;
             rule.message = String::new();
-            pool.nominal_usage += rule.nominal_usage;
-            pool.scheduled_hours += rule.nominal_hours;
-            pool.reserved_usage += rule.reserved_usage;
-            pool.reserved_hours += rule.reserved_hours;
+            if group.class.is_some() {
+                pool.nominal_usage += rule.nominal_usage;
+                pool.scheduled_hours += rule.nominal_hours;
+                pool.reserved_usage += rule.reserved_usage;
+                pool.reserved_hours += rule.reserved_hours;
+            }
             if policy.fable {
                 for limit in portfolio
                     .limits
@@ -2069,11 +2786,23 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
                 }
             }
             portfolio.roles[group.role].allocated_hours += rule.nominal_hours;
-            portfolio.roles[group.role].quality_utility += expected * factor * policy.utility;
+            portfolio.roles[group.role].quality_utility += changes as f64 * factor * policy.utility;
         }
         if group.class.is_none() {
-            let rules = &portfolio.roles[group.role].rules;
-            let pool = &portfolio.pools[policy.pool];
+            let pool = &mut portfolio.pools[policy.pool];
+            let headroom_usage = settings.orchestrator_headroom_usd.unwrap_or(0.0);
+            let headroom_hours = settings.orchestrator_headroom_hours.unwrap_or(0.0);
+            pool.reserved_usage += headroom_usage;
+            pool.reserved_hours += headroom_hours;
+            if policy.fable {
+                for limit in portfolio
+                    .limits
+                    .iter_mut()
+                    .filter(|limit| limit.provider_id == pool.provider_id)
+                {
+                    limit.reserved_usage += headroom_usage;
+                }
+            }
             portfolio.conductor = Some(ConductorAllocation {
                 row_index: policy.row_index,
                 binding_id: crate::agent_setup::binding_id_for(
@@ -2086,12 +2815,19 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
                 attempt_limit: 1,
                 competence: policy.competence,
                 utility: policy.utility,
-                expected_visits: best.count * 2,
-                reserved_visits: best.count * 2,
-                expected_usage: rules.iter().map(|rule| rule.nominal_usage).sum(),
-                expected_hours: rules.iter().map(|rule| rule.nominal_hours).sum(),
-                reserved_usage: rules.iter().map(|rule| rule.reserved_usage).sum(),
-                reserved_hours: rules.iter().map(|rule| rule.reserved_hours).sum(),
+                persistent: true,
+                evidence_profile: "Intelligence Index".to_owned(),
+                evidence_level: policy.evidence_level.clone(),
+                capability_sensitivity: Some(CapabilityRange {
+                    nominal: policy.utility,
+                    lower: policy.lower_utility,
+                    upper: policy.upper_utility,
+                }),
+                usage_forecast: None,
+                headroom: ConductorHeadroom {
+                    usd: settings.orchestrator_headroom_usd,
+                    hours: settings.orchestrator_headroom_hours,
+                },
                 per_call_expected_usage: policy.cycle.nominal_usage,
                 per_call_expected_hours: policy.cycle.nominal_seconds / 3600.0,
                 per_call_reserved_usage: policy.cycle.reserved_usage,
@@ -2110,7 +2846,7 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
                         class,
                         changes: portfolio.dispatch.classes[class.index()].admitted_changes,
                         resource_factor: class.resource_factor(),
-                        visits: portfolio.dispatch.classes[class.index()].admitted_changes * 2,
+                        visits: 0,
                     })
                     .collect(),
             });
@@ -2134,9 +2870,9 @@ pub fn allocate(rows: &[Row], settings: &Settings) -> Option<Portfolio> {
     fill_math_audit(&mut portfolio);
     portfolio.message = format!(
         "{} of {} complete changes admitted; {} deferred. Reserved dependency makespan {:.2} of {:.2} hours. {}",
-        best.count,
+        best_count,
         forecast,
-        forecast - best.count,
+        forecast - best_count,
         portfolio.dispatch.reserved_makespan_hours,
         settings.agent_hours,
         portfolio.dispatch.solver.message
@@ -2148,6 +2884,9 @@ fn fill_math_audit(portfolio: &mut Portfolio) {
     let share = |amount: f64, total: f64| if total > 0.0 { amount / total } else { 0.0 };
     for pool in &portfolio.pools {
         for role in &portfolio.roles {
+            if role.seat == Seat::Orchestrator {
+                continue;
+            }
             let rules: Vec<_> = role
                 .rules
                 .iter()
@@ -2173,6 +2912,25 @@ fn fill_math_audit(portfolio: &mut Portfolio) {
                 reserved_account_share: share(reserved_usage, pool.reserved_usage),
             });
         }
+    }
+    if let Some(conductor) = &portfolio.conductor
+        && let Some(pool) = portfolio.pools.iter().find(|pool| {
+            pool.provider_id == conductor.provider_id && pool.plan_id == conductor.plan_id
+        })
+    {
+        let reserved_usage = conductor.headroom.usd.unwrap_or(0.0);
+        let reserved_hours = conductor.headroom.hours.unwrap_or(0.0);
+        portfolio.math_audit.role_accounts.push(RoleAccountUsage {
+            seat: Seat::Orchestrator,
+            provider_id: conductor.provider_id.clone(),
+            row_indices: vec![conductor.row_index],
+            expected_usage: 0.0,
+            reserved_usage,
+            expected_hours: 0.0,
+            reserved_hours,
+            expected_account_share: 0.0,
+            reserved_account_share: share(reserved_usage, pool.reserved_usage),
+        });
     }
     let orchestrator: Vec<_> = portfolio
         .math_audit

@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -478,6 +479,11 @@ pub fn conductor_launch_failed(reservation: ConductorReservation) -> Result<()> 
 pub fn clean_command(executable: &Path, home: &Path, workspace: &Path) -> Command {
     let mut command = Command::new(executable);
     command.env_clear();
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
     for name in [
         "SystemRoot",
         "WINDIR",
@@ -582,12 +588,16 @@ pub fn conductor_arguments(
                 "permissions.aitierlist.workspace_roots={{{}=true}}",
                 serde_json::to_string(&app_directory.to_string_lossy())?
             ),
+            "--ignore-user-config".to_owned(),
+            "--ignore-rules".to_owned(),
+            "--disable".to_owned(),
+            "multi_agent".to_owned(),
         ],
         HostKind::Muse => vec![
             "--workspace".to_owned(),
             workspace.to_string_lossy().into_owned(),
         ],
-        HostKind::Grok => Vec::new(),
+        HostKind::Grok => vec!["--no-subagents".to_owned()],
         HostKind::Antigravity => vec!["--prompt-interactive".to_owned()],
         _ => anyhow::bail!("Unsupported isolated conductor"),
     };
@@ -804,12 +814,28 @@ fn commit_horizon_once(
         .cloned()
         .collect();
     let id = horizon_id(&profile_identity, ledger.revision, &tasks)?;
+    let bindings: BTreeSet<_> = fleet
+        .conductors
+        .values()
+        .filter_map(|id| {
+            fleet
+                .routes
+                .iter()
+                .find(|route| route.id == *id)
+                .map(|route| route.binding_id.clone())
+        })
+        .collect();
+    ensure!(
+        bindings.len() <= 1,
+        "Fleet conductors use different bindings"
+    );
+    let exported_conductor = bindings.into_iter().next();
     let mut horizon = crate::native_scheduler::allocate(
         &tasks,
         &fleet.routes,
         &profile,
         &ledger,
-        None,
+        exported_conductor.as_deref(),
         &id,
         4096,
     )?;
@@ -968,51 +994,40 @@ fn visit_ready(entry: &crate::agent_setup::JobLedger, ledger: &crate::agent_setu
             })
     };
     if entry.conditional && entry.seat == Some(crate::types::Seat::Debugger) {
-        let triggered = ledger.jobs.iter().any(|job| {
+        let debugger_running = ledger.jobs.iter().any(|job| {
             job.parent_task_id == entry.parent_task_id
+                && job.id != entry.id
+                && job.seat == Some(crate::types::Seat::Debugger)
+                && job.status == crate::agent_setup::JobStatus::Running
+        });
+        let initial_check_running = ledger.jobs.iter().any(|job| {
+            job.parent_task_id == entry.parent_task_id
+                && job.id.ends_with("-1")
                 && matches!(
                     job.seat,
-                    Some(
-                        crate::types::Seat::Implementer
-                            | crate::types::Seat::Reviewer
-                            | crate::types::Seat::Sanity
-                    )
+                    Some(crate::types::Seat::Reviewer | crate::types::Seat::Sanity)
                 )
-                && job.status == crate::agent_setup::JobStatus::Blocked
+                && job.status == crate::agent_setup::JobStatus::Running
         });
-        let implementation_resolved = ledger.jobs.iter().any(|job| {
+        let triggered = ledger.jobs.iter().any(|job| {
             job.parent_task_id == entry.parent_task_id
-                && job.seat == Some(crate::types::Seat::Implementer)
-                && matches!(
-                    job.status,
-                    crate::agent_setup::JobStatus::Completed
-                        | crate::agent_setup::JobStatus::Blocked
-                )
+                && job.id.ends_with("-1")
+                && match job.seat {
+                    Some(crate::types::Seat::Implementer) => {
+                        job.status == crate::agent_setup::JobStatus::Blocked
+                    }
+                    Some(crate::types::Seat::Reviewer | crate::types::Seat::Sanity) => {
+                        job.status == crate::agent_setup::JobStatus::Blocked
+                            || (job.status == crate::agent_setup::JobStatus::Completed
+                                && job
+                                    .outcome
+                                    .as_ref()
+                                    .is_some_and(|outcome| !outcome.artifact_accepted))
+                    }
+                    _ => false,
+                }
         });
-        return triggered && implementation_resolved;
-    }
-    if entry.seat == Some(crate::types::Seat::Orchestrator) && entry.id.ends_with("-orchestrator-2")
-    {
-        let repaired = ledger.jobs.iter().any(|job| {
-            job.parent_task_id == entry.parent_task_id
-                && job.seat == Some(crate::types::Seat::Debugger)
-                && job.status == crate::agent_setup::JobStatus::Completed
-        });
-        let ordinal = if repaired { "-2" } else { "-1" };
-        return [crate::types::Seat::Reviewer, crate::types::Seat::Sanity]
-            .into_iter()
-            .all(|seat| {
-                ledger.jobs.iter().any(|job| {
-                    job.parent_task_id == entry.parent_task_id
-                        && job.seat == Some(seat)
-                        && job.id.ends_with(ordinal)
-                        && job.status == crate::agent_setup::JobStatus::Completed
-                        && job
-                            .outcome
-                            .as_ref()
-                            .is_some_and(|outcome| outcome.artifact_accepted)
-                })
-            });
+        return triggered && !debugger_running && !initial_check_running;
     }
     entry
         .dependencies
@@ -1184,10 +1199,16 @@ pub fn dispatch(manifest: &Path, operation: &str, id: &str, request: Option<&Pat
             if let Some(route) = fleet.routes.first()
                 && route.collaboration_root.canonicalize()? != snapshot.shadow.canonicalize()?
             {
-                let output = Command::new(crate::host_install::git_binary()?)
+                let mut command = Command::new(crate::host_install::git_binary()?);
+                command
                     .args(["status", "--short"])
-                    .current_dir(&route.collaboration_root)
-                    .output()?;
+                    .current_dir(&route.collaboration_root);
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    command.creation_flags(0x08000000);
+                }
+                let output = command.output()?;
                 ensure!(
                     output.status.success(),
                     "Collaboration workspace status failed"
@@ -1341,25 +1362,6 @@ pub fn dispatch(manifest: &Path, operation: &str, id: &str, request: Option<&Pat
                 visit_ready(entry, &ledger),
                 "Visit branch is inactive or dependencies lack accepted immutable output"
             );
-            if assignment.visit.conditional && assignment.visit.seat == crate::types::Seat::Debugger
-            {
-                ensure!(
-                    ledger
-                        .jobs
-                        .iter()
-                        .any(|job| job.parent_task_id == plan.task_id
-                            && matches!(
-                                job.seat,
-                                Some(
-                                    crate::types::Seat::Implementer
-                                        | crate::types::Seat::Reviewer
-                                        | crate::types::Seat::Sanity
-                                )
-                            )
-                            && job.status == crate::agent_setup::JobStatus::Blocked),
-                    "Repair is inactive until implementation blocks or an initial check rejects"
-                );
-            }
             let route = fleet
                 .routes
                 .iter()

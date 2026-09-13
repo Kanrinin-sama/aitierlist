@@ -1414,8 +1414,8 @@ fn policy_files(table: &Table, directory: &Path) -> Result<Vec<StagedFile>> {
                 .rows
                 .get(conductor.row_index)
                 .context("Conductor benchmark row unavailable")?;
-            let value = serde_json::json!({"role":"Orchestrator","scope":"whole_plan","route":"conductor","binding_id":conductor.binding_id,"benchmark":{"harness":row.harness,"model":row.model,"effort":row.effort},"native_harness":conductor.native_harness,"provider":conductor.provider_id,"plan":conductor.plan_id,"attempt_limit":conductor.attempt_limit,"competence":conductor.competence,"utility":conductor.utility,"expected_visits":conductor.expected_visits,"reserved_visits":conductor.reserved_visits,"expected_usage":conductor.expected_usage,"expected_hours":conductor.expected_hours,"reserved_usage":conductor.reserved_usage,"reserved_hours":conductor.reserved_hours,"per_call_expected_usage":conductor.per_call_expected_usage,"per_call_expected_hours":conductor.per_call_expected_hours,"per_call_reserved_usage":conductor.per_call_reserved_usage,"per_call_reserved_hours":conductor.per_call_reserved_hours,"cost_basis":conductor.cost_basis,"time_basis":conductor.time_basis,"classes":conductor.classes});
-            index.push(serde_json::json!({"role":"Orchestrator","scope":"whole_plan","file":name}));
+            let value = serde_json::json!({"role":"Orchestrator","scope":"persistent_human_facing_service","route":"conductor","binding_id":conductor.binding_id,"benchmark":{"harness":row.harness,"model":row.model,"effort":row.effort,"observations":row.benchmark_observation_ids,"selected_evidence":row.benchmark_evidence},"native_harness":conductor.native_harness,"provider":conductor.provider_id,"plan":conductor.plan_id,"attempt_limit":conductor.attempt_limit,"competence":conductor.competence,"utility":conductor.utility,"persistent":conductor.persistent,"evidence_profile":conductor.evidence_profile,"evidence_level":conductor.evidence_level,"capability_sensitivity":conductor.capability_sensitivity,"usage_forecast":conductor.usage_forecast,"headroom":conductor.headroom,"qualification_proxy":{"expected_usage_per_call":conductor.per_call_expected_usage,"expected_hours_per_call":conductor.per_call_expected_hours,"reserved_usage_per_call":conductor.per_call_reserved_usage,"reserved_hours_per_call":conductor.per_call_reserved_hours,"cost_basis":conductor.cost_basis,"time_basis":conductor.time_basis},"classes":conductor.classes});
+            index.push(serde_json::json!({"role":"Orchestrator","scope":"persistent_human_facing_service","file":name}));
             files.push(StagedFile {
                 path: directory.join(name),
                 root: directory.to_path_buf(),
@@ -1456,14 +1456,14 @@ fn policy_files(table: &Table, directory: &Path) -> Result<Vec<StagedFile>> {
                             )
                     })
                     .map(|binding| crate::team_policy::route_id(&binding));
-                let research_candidates: Vec<_> = rule.research_candidates.iter().filter_map(|candidate| table.rows.get(candidate.row_index).map(|row| serde_json::json!({"route":crate::team_policy::route_id(&candidate.binding_id),"binding_id":candidate.binding_id,"primary":candidate.primary,"benchmark":{"harness":row.harness,"model":row.model,"effort":row.effort,"source":candidate.source},"native_harness":candidate.native_harness,"provider":candidate.provider_id,"plan":candidate.plan_id,"score":candidate.score,"components":{"omniscience_accuracy":{"value":candidate.accuracy,"weight":candidate.accuracy_weight},"omniscience_no_incorrect_answer":{"value":candidate.non_wrong,"weight":candidate.non_wrong_weight},"aa_lcr":{"value":candidate.lcr,"weight":candidate.lcr_weight},"hle":{"value":candidate.hle,"weight":candidate.hle_weight}},"diagnostics":{"omniscience_conditional_hallucination":candidate.conditional_hallucination,"gpqa_scientific":candidate.gpqa_diagnostic,"gdp_pdf_document":candidate.gdp_pdf_diagnostic},"api_proxy":{"expected_usd":candidate.expected_usd,"decode_hours":candidate.decode_hours},"eligibility":candidate.eligibility}))).collect();
+                let research_candidates: Vec<_> = rule.research_candidates.iter().filter_map(|candidate| table.rows.get(candidate.row_index).map(|row| serde_json::json!({"route":crate::team_policy::route_id(&candidate.binding_id),"binding_id":candidate.binding_id,"primary":candidate.primary,"benchmark":{"harness":row.harness,"model":row.model,"effort":row.effort,"source":candidate.source,"observations":row.benchmark_observation_ids,"selected_evidence":row.benchmark_evidence},"native_harness":candidate.native_harness,"provider":candidate.provider_id,"plan":candidate.plan_id,"score":candidate.score,"components":{"omniscience_accuracy":{"value":candidate.accuracy,"weight":candidate.accuracy_weight},"omniscience_no_incorrect_answer":{"value":candidate.non_wrong,"weight":candidate.non_wrong_weight},"aa_lcr":{"value":candidate.lcr,"weight":candidate.lcr_weight},"hle":{"value":candidate.hle,"weight":candidate.hle_weight}},"diagnostics":{"omniscience_conditional_hallucination":candidate.conditional_hallucination,"gpqa_scientific":candidate.gpqa_diagnostic,"gdp_pdf_document":candidate.gdp_pdf_diagnostic},"api_proxy":{"expected_usd":candidate.expected_usd,"decode_hours":candidate.decode_hours},"eligibility":candidate.eligibility}))).collect();
                 let research_included = portfolio
                     .dispatch
                     .classes
                     .iter()
                     .find(|demand| demand.class == rule.class)
                     .is_some_and(|demand| demand.research_included);
-                let value = serde_json::json!({"policy_version":crate::team_policy::VERSION,"role":role.seat.name(),"class":rule.class.name(),"condition":rule.condition,"research_reference_included":research_included,"primary":{"route":primary_route,"recommendation_only":rule.recommendation_only,"attempt_limit":rule.attempt_limit,"utility":rule.utility,"competence":rule.competence,"weekly_expected_usage":rule.nominal_usage,"weekly_expected_hours":rule.nominal_hours,"weekly_reserved_usage":rule.reserved_usage,"weekly_reserved_hours":rule.reserved_hours,"expected_usage":rule.per_call_expected_usage,"expected_hours":rule.per_call_expected_hours,"per_call_reserved_usage":rule.per_call_reserved_usage,"per_call_reserved_hours":rule.per_call_reserved_hours,"provider":rule.provider_id},"research_candidates":research_candidates,"lower_effort":rule.lower_effort.as_ref().map(adaptive),"same_account":rule.within_provider_alternatives.iter().map(adaptive).collect::<Vec<_>>(),"other_accounts":rule.surplus_alternatives.iter().map(adaptive).collect::<Vec<_>>(),"fallback":rule.fallback_policy,"calibration":rule.calibration,"failure_action":rule.failure_action});
+                let value = serde_json::json!({"policy_version":crate::team_policy::VERSION,"role":role.seat.name(),"class":rule.class.name(),"condition":rule.condition,"research_reference_included":research_included,"evidence_level":rule.evidence_level,"capability_sensitivity":rule.capability_sensitivity,"repair_activation_proxy":rule.repair_activation_proxy,"primary":{"route":primary_route,"recommendation_only":rule.recommendation_only,"attempt_limit":rule.attempt_limit,"utility":rule.utility,"competence":rule.competence,"weekly_expected_usage":rule.nominal_usage,"weekly_expected_hours":rule.nominal_hours,"weekly_reserved_usage":rule.reserved_usage,"weekly_reserved_hours":rule.reserved_hours,"expected_usage":rule.per_call_expected_usage,"expected_hours":rule.per_call_expected_hours,"per_call_reserved_usage":rule.per_call_reserved_usage,"per_call_reserved_hours":rule.per_call_reserved_hours,"provider":rule.provider_id},"research_candidates":research_candidates,"lower_effort":rule.lower_effort.as_ref().map(adaptive),"same_account":rule.within_provider_alternatives.iter().map(adaptive).collect::<Vec<_>>(),"other_accounts":rule.surplus_alternatives.iter().map(adaptive).collect::<Vec<_>>(),"fallback":rule.fallback_policy,"calibration":rule.calibration,"failure_action":rule.failure_action});
                 index.push(serde_json::json!({"role":role.seat.name(),"class":rule.class.name(),"file":name}));
                 files.push(StagedFile {
                     path: directory.join(&name),
@@ -1474,10 +1474,61 @@ fn policy_files(table: &Table, directory: &Path) -> Result<Vec<StagedFile>> {
             }
         }
     }
+    let close_choices = table.portfolio.as_ref().map_or_else(Vec::new, |portfolio| {
+        portfolio.close_choices.iter().filter_map(|choice| {
+            let nominal_row = table.rows.get(choice.nominal_row_index)?;
+            let challenger_row = table.rows.get(choice.challenger_row_index)?;
+            let nominal_harness = if choice.seat == Seat::Orchestrator {
+                portfolio.conductor.as_ref().map(|conductor| conductor.native_harness.as_str())
+            } else {
+                portfolio.roles.iter().find(|role| role.seat == choice.seat).and_then(|role| {
+                    role.rules.iter().find(|rule| choice.class.is_none_or(|class| rule.class == class)).and_then(|rule| {
+                        rule.research_candidates.iter().find(|candidate| candidate.row_index == choice.nominal_row_index).map(|candidate| candidate.native_harness.as_str())
+                    })
+                })
+            }.unwrap_or(&nominal_row.harness);
+            let nominal_binding = crate::agent_setup::binding_id_for(nominal_harness, nominal_row);
+            let challenger_binding = crate::agent_setup::binding_id_for(&choice.challenger_native_harness, challenger_row);
+            Some(serde_json::json!({
+            "seat": choice.seat,
+            "class": choice.class,
+            "nominal": {"model":nominal_row.model,"effort":nominal_row.effort,"harness":nominal_harness,"binding_id":nominal_binding,"route":crate::team_policy::route_id(&nominal_binding),"benchmark_observations":nominal_row.benchmark_observation_ids},
+            "challenger": {"model":challenger_row.model,"effort":challenger_row.effort,"harness":choice.challenger_native_harness,"binding_id":challenger_binding,"route":crate::team_policy::route_id(&challenger_binding),"benchmark_observations":challenger_row.benchmark_observation_ids},
+            "nominal_utility": choice.nominal_utility,
+            "challenger_utility": choice.challenger_utility,
+            "challenger_attempt_limit": choice.challenger_attempt_limit,
+            "challenger_provider_id": choice.challenger_provider_id,
+            "challenger_plan_id": choice.challenger_plan_id,
+            "challenger_native_harness": choice.challenger_native_harness,
+            "scenario_status": choice.scenario_status,
+            "scenario_bound": choice.scenario_bound,
+            "scenario_relative_gap": choice.scenario_relative_gap,
+            "scenario_proven": choice.scenario_proven,
+            "condition": choice.condition,
+            "funded_substitution": false,
+            "activation": "Conditional joint-plan choice only. Replan and confirm native qualification before assignment."
+        }))}).collect::<Vec<_>>()
+    });
+    let capability_scenario = table.portfolio.as_ref().and_then(|portfolio| portfolio.capability_scenario.as_ref().map(|report| {
+        let assignments = report.assignments.iter().filter_map(|assignment| {
+            let row = table.rows.get(assignment.row_index)?;
+            let binding = crate::agent_setup::binding_id_for(&assignment.native_harness, row);
+            Some(serde_json::json!({"seat":assignment.seat,"class":assignment.class,"model":row.model,"effort":row.effort,"harness":assignment.native_harness,"binding_id":binding,"route":crate::team_policy::route_id(&binding),"benchmark_observations":row.benchmark_observation_ids,"attempt_limit":assignment.attempt_limit,"provider":assignment.provider_id,"plan":assignment.plan_id,"utility":assignment.utility}))
+        }).collect::<Vec<_>>();
+        serde_json::json!({"status":report.status,"proven":report.proven,"quality":report.quality,"baseline_quality":report.baseline_quality,"bound":report.bound,"relative_gap":report.relative_gap,"message":report.message,"assignments":assignments})
+    }));
+    let policy_index = serde_json::json!({
+        "policy_version": crate::team_policy::VERSION,
+        "policies": index,
+        "capability_scenario": capability_scenario,
+        "close_choices": close_choices,
+        "repair_sensitivity": table.portfolio.as_ref().map(|portfolio| &portfolio.dispatch.repair_sensitivity).into_iter().flatten().collect::<Vec<_>>(),
+        "team_service": table.portfolio.as_ref().map(|portfolio| &portfolio.dispatch.service)
+    });
     files.push(StagedFile {
         path: directory.join("policy-index.json"),
         root: directory.to_path_buf(),
-        bytes: serde_json::to_vec_pretty(&index)?,
+        bytes: serde_json::to_vec_pretty(&policy_index)?,
         executable: false,
     });
     Ok(files)
@@ -1503,7 +1554,7 @@ pub(crate) fn required_bindings(table: &Table) -> Vec<serde_json::Value> {
             }
         }
     }
-    let mut bindings: Vec<_> = indices.into_iter().filter_map(|index|table.rows.get(index).map(|row|{let binding=agent_setup::binding_id(row);serde_json::json!({"route":crate::team_policy::route_id(&binding),"binding_id":binding,"model":row.model,"effort":row.effort,"harness":row.harness,"provider":row.vendor})})).collect();
+    let mut bindings: Vec<_> = indices.into_iter().filter_map(|index|table.rows.get(index).map(|row|{let binding=agent_setup::binding_id(row);serde_json::json!({"route":crate::team_policy::route_id(&binding),"binding_id":binding,"model":row.model,"effort":row.effort,"harness":row.harness,"provider":row.vendor,"benchmark_observations":row.benchmark_observation_ids,"selected_evidence":row.benchmark_evidence})})).collect();
     if let Some(portfolio) = &table.portfolio {
         let mut research: std::collections::BTreeSet<_> = bindings
             .iter()

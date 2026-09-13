@@ -35,18 +35,10 @@ pub(super) struct Generator {
 }
 
 impl Generator {
-    pub(super) fn new(context: egui::Context) -> Self {
-        let (tx, rx) = channel();
-        std::thread::spawn(move || {
-            let result = crate::host_install::discover(&Table::empty())
-                .map(|discovery| (None, discovery))
-                .map_err(|error| format!("{error:#}"));
-            let _ = tx.send(result);
-            context.request_repaint();
-        });
+    pub(super) fn new() -> Self {
         Self {
             open: false,
-            response: Some(rx),
+            response: None,
             discovery: None,
             markdown: None,
             table: None,

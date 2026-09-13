@@ -202,9 +202,14 @@ pub fn prepare(root: &Path) -> Result<WorkspacePaths> {
         render_research_index(&research_index).as_bytes(),
     )?;
     if !root.join(".git").exists() {
-        let status = std::process::Command::new(crate::host_install::git_binary()?)
-            .args(["init", "--quiet"])
-            .current_dir(root)
+        let mut command = std::process::Command::new(crate::host_install::git_binary()?);
+        command.args(["init", "--quiet"]).current_dir(root);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000);
+        }
+        let status = command
             .status()
             .context("starting git init for the collaboration workspace")?;
         ensure!(

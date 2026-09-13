@@ -175,7 +175,7 @@ pub fn allocate(
     let mut eligible = Vec::new();
     let mut deferred = Vec::new();
     for task in tasks {
-        match task_eligibility(task, ledger) {
+        match task_eligibility(task, ledger, profile) {
             Ok(()) => eligible.push(task),
             Err(error) => deferred.push(DeferredTask {
                 task_id: task.task_id.clone(),
@@ -259,6 +259,20 @@ pub fn allocate(
             candidate_sets.push(plans);
             candidate_limited |= limited;
         }
+        let existing_project_usage = existing_project_usage(ledger, &replaceable);
+        let mut project_weights: BTreeMap<String, f64> = profile
+            .project_policies
+            .iter()
+            .map(|policy| (policy.project_id.clone(), policy.entitlement_weight))
+            .collect();
+        for task in &eligible {
+            project_weights
+                .entry(task.project_id.clone())
+                .or_insert(project_weight(profile, task));
+        }
+        for project_id in existing_project_usage.keys() {
+            project_weights.entry(project_id.clone()).or_insert(1.0);
+        }
         let mut search = Search {
             tasks: eligible.clone(),
             candidates: candidate_sets,
@@ -269,16 +283,13 @@ pub fn allocate(
             horizon_seconds,
             human_seconds_capacity,
             active_windows: active_windows.clone(),
-            existing_project_usage: existing_project_usage(ledger, &replaceable),
+            existing_project_usage,
             planning_at: OffsetDateTime::parse(&ledger.updated_at, &Rfc3339)?,
             project_priorities: eligible
                 .iter()
                 .map(|task| (task.project_id.clone(), project_priority(profile, task)))
                 .collect(),
-            project_weights: eligible
-                .iter()
-                .map(|task| (task.project_id.clone(), project_weight(profile, task)))
-                .collect(),
+            project_weights,
             node_limit,
             nodes: 0,
             limited: false,
@@ -405,7 +416,7 @@ fn conductor_bindings(
     bindings
 }
 
-fn task_eligibility(task: &TaskRequest, ledger: &Ledger) -> Result<()> {
+fn task_eligibility(task: &TaskRequest, ledger: &Ledger, profile: &SetupProfile) -> Result<()> {
     ensure!(
         !task.task_id.is_empty() && !task.project_id.is_empty() && !task.idempotency_key.is_empty(),
         "Task identity is incomplete"
@@ -435,6 +446,10 @@ fn task_eligibility(task: &TaskRequest, ledger: &Ledger) -> Result<()> {
             "Task deadline has expired"
         );
     }
+    ensure!(
+        (task.entitlement_weight - project_weight(profile, task)).abs() <= 1e-9,
+        "Task entitlement weight does not match project policy"
+    );
     Ok(())
 }
 
@@ -1251,16 +1266,9 @@ impl Search<'_> {
 
     fn fairness_cost(&self, selection: &[Option<usize>]) -> f64 {
         let mut project_usage = self.existing_project_usage.clone();
-        let mut entitlement: BTreeMap<String, f64> = BTreeMap::new();
         for (index, choice) in selection.iter().enumerate() {
             let Some(choice) = choice else { continue };
             let task = self.tasks[index];
-            entitlement.entry(task.project_id.clone()).or_insert(
-                self.project_weights
-                    .get(&task.project_id)
-                    .copied()
-                    .unwrap_or(1.0),
-            );
             for (resource, amount) in &self.candidates[index][*choice].usage {
                 *project_usage
                     .entry(task.project_id.clone())
@@ -1272,7 +1280,7 @@ impl Search<'_> {
         project_usage
             .into_iter()
             .map(|(project, resources)| {
-                let weight = entitlement.get(&project).copied().unwrap_or(1.0);
+                let weight = self.project_weights.get(&project).copied().unwrap_or(1.0);
                 resources
                     .into_iter()
                     .map(|(resource, amount)| {
@@ -1321,15 +1329,16 @@ impl Search<'_> {
             .collect();
         work.sort_by(|(left, _, _), (right, _, _)| {
             right
-                .risk
+                .effective_risk()
                 .consequence
-                .cmp(&left.risk.consequence)
+                .cmp(&left.effective_risk().consequence)
                 .then_with(|| deadline_key(left).cmp(&deadline_key(right)))
                 .then_with(|| {
                     self.project_priorities
                         .get(&right.project_id)
                         .cmp(&self.project_priorities.get(&left.project_id))
                 })
+                .then_with(|| left.task_id.cmp(&right.task_id))
         });
         let mut cursor = self.active_windows[0].0;
         let mut window_index = 0;
@@ -1468,6 +1477,11 @@ fn schedule(
                 right_task
                     .map(|task| project_priority(profile, task))
                     .cmp(&left_task.map(|task| project_priority(profile, task)))
+            })
+            .then_with(|| {
+                left_task
+                    .map(|task| &task.task_id)
+                    .cmp(&right_task.map(|task| &task.task_id))
             })
     });
     let mut result = Vec::new();

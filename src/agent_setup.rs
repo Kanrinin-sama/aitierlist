@@ -1370,7 +1370,7 @@ pub fn load_setup_at(table: &Table, paths: &SetupPaths) -> Result<SetupState> {
         {
             issues.push("Confirm the current project orchestrator count".into());
         }
-        for pool in portfolio.pools.iter().filter(|_| false) {
+        for pool in portfolio.pools.iter() {
             let account = profile
                 .providers
                 .get(&pool.provider_id)
@@ -1396,8 +1396,7 @@ pub fn load_setup_at(table: &Table, paths: &SetupPaths) -> Result<SetupState> {
                 ));
             }
         }
-        if false
-            && let Some(conductor) = &portfolio.conductor
+        if let Some(conductor) = &portfolio.conductor
             && let Some(row) = table.rows.get(conductor.row_index)
         {
             let id = &conductor.binding_id;
@@ -1447,7 +1446,6 @@ pub fn load_setup_at(table: &Table, paths: &SetupPaths) -> Result<SetupState> {
             .roles
             .iter()
             .filter(|role| role.seat != Seat::Orchestrator)
-            .filter(|_| false)
         {
             for rule in &role.rules {
                 for (index, provider_id, primary) in rule

@@ -3,6 +3,7 @@ use crate::settings::{BestInHouseMode, Settings, load_settings, save_settings};
 use crate::types::{CacheState, Seat, Table, Tier};
 
 mod about_view;
+mod evidence_view;
 mod settings_view;
 mod setup_view;
 
@@ -53,6 +54,115 @@ fn competence_text(value: Option<f64>) -> String {
         .unwrap_or_else(|| "Unknown".to_string())
 }
 
+fn role_model_name(row: &crate::types::Row) -> String {
+    let name = row.display_name();
+    name.strip_suffix(" (benchmark proxy)")
+        .unwrap_or(&name)
+        .to_owned()
+}
+
+fn evidence_level_text(level: crate::engine::RoleEvidenceLevel) -> &'static str {
+    match level {
+        crate::engine::RoleEvidenceLevel::ExactHarness => "exact harness",
+        crate::engine::RoleEvidenceLevel::ModelLevel => "model-level",
+        crate::engine::RoleEvidenceLevel::CrossHarnessProxy => "cross-harness proxy",
+        crate::engine::RoleEvidenceLevel::Unknown => "unknown",
+    }
+}
+
+fn role_evidence_summary(row: &crate::types::Row, seat: Seat) -> String {
+    crate::engine::role_evidence(row, seat).map_or_else(
+        || "No role evidence".to_owned(),
+        |components| {
+            components
+                .into_iter()
+                .map(|component| {
+                    format!(
+                        "{} {} · {}",
+                        component.name,
+                        competence_text(component.value),
+                        evidence_level_text(component.level)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        },
+    )
+}
+
+fn role_evidence_sources(row: &crate::types::Row, seat: Seat) -> String {
+    crate::engine::role_evidence(row, seat).map_or_else(
+        || "No role-specific evidence is linked.".to_owned(),
+        |components| {
+            components
+                .into_iter()
+                .map(|component| {
+                    format!(
+                        "{}: {} · {}",
+                        component.name,
+                        evidence_level_text(component.level),
+                        component
+                            .source_id
+                            .as_deref()
+                            .unwrap_or(component.basis.as_str())
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        },
+    )
+}
+
+fn role_evidence_compact(row: &crate::types::Row, seat: Seat) -> String {
+    if seat == Seat::Orchestrator {
+        if row.smart.is_none() {
+            return "Orchestration evidence unknown".to_owned();
+        }
+        let diagnostic = crate::engine::role_evidence(row, seat)
+            .into_iter()
+            .flatten()
+            .any(|component| component.benchmark.is_some() && component.value.is_some());
+        if diagnostic {
+            return "Intelligence Index · orchestration competence · LCR/HLE diagnostic".to_owned();
+        }
+        return "Intelligence Index · orchestration competence".to_owned();
+    }
+    let Some(components) = crate::engine::role_evidence(row, seat) else {
+        return "Unknown".to_owned();
+    };
+    let mut exact = 0;
+    let mut model = 0;
+    let mut proxy = 0;
+    let mut unknown = 0;
+    for component in components {
+        match component.level {
+            crate::engine::RoleEvidenceLevel::ExactHarness => exact += 1,
+            crate::engine::RoleEvidenceLevel::ModelLevel => model += 1,
+            crate::engine::RoleEvidenceLevel::CrossHarnessProxy => proxy += 1,
+            crate::engine::RoleEvidenceLevel::Unknown => unknown += 1,
+        }
+    }
+    [
+        (exact, "exact"),
+        (model, "model-level"),
+        (proxy, "harness proxy"),
+        (unknown, "unknown"),
+    ]
+    .into_iter()
+    .filter(|(count, _)| *count > 0)
+    .map(|(count, label)| format!("{count} {label}"))
+    .collect::<Vec<_>>()
+    .join(" · ")
+}
+
+fn role_evidence_hover(row: &crate::types::Row, seat: Seat) -> String {
+    format!(
+        "{}\n{}",
+        role_evidence_summary(row, seat),
+        role_evidence_sources(row, seat)
+    )
+}
+
 fn research_route_name(row: &crate::types::Row, native_harness: &str) -> String {
     if native_harness
         .to_ascii_lowercase()
@@ -63,7 +173,7 @@ fn research_route_name(row: &crate::types::Row, native_harness: &str) -> String 
             _ => format!("AGY - {}", row.model),
         };
     }
-    row.display_name()
+    role_model_name(row)
 }
 
 type ComparisonResponse = (
@@ -74,9 +184,23 @@ type ComparisonResponse = (
     crate::comparison::CounterfactualReport,
 );
 
+enum TableResponse {
+    Primary(Box<Table>, bool, Settings),
+    Vendors(Box<[Table; 5]>, Settings),
+}
+
+fn rows_expired(fetched_at: &str, cache_hours: u32) -> bool {
+    OffsetDateTime::parse(fetched_at, &Rfc3339)
+        .map(|fetched| {
+            OffsetDateTime::now_utc() >= fetched + time::Duration::hours(i64::from(cache_hours))
+        })
+        .unwrap_or(true)
+}
+
 pub struct App {
     brand: egui::TextureHandle,
     section: Section,
+    settings_tab: usize,
     workflow_class: WorkClass,
     ranking_seat: Seat,
     ranking_tier: Tier,
@@ -87,16 +211,24 @@ pub struct App {
     selected_tab: usize,
     table_revision: u64,
     generator: Generator,
+    native_connections: crate::native_connections::NativeConnections,
+    native_connection_status: String,
+    desktop: Option<crate::desktop::Desktop>,
+    window_visible: bool,
+    hide_command_sent: bool,
+    scoring_started: bool,
+    quit_requested: bool,
     panel_widths: std::collections::HashMap<(Seat, Tier), f32>,
     rho_override_text: String,
     collaboration_root_text: String,
     subscription_count_text: std::collections::BTreeMap<String, String>,
     workspace_status: String,
+    background_status: String,
     workspace_picker: Option<Receiver<Result<Option<std::path::PathBuf>, String>>>,
     refresh_in_flight: bool,
     retry_after: Option<Instant>,
     refresh_warning: String,
-    table_rx: Receiver<(Table, [Table; 5], bool, Settings)>,
+    table_rx: Receiver<TableResponse>,
     scored_settings: Option<Settings>,
     settings_tx: Sender<(Settings, bool)>,
     engine_error_rx: Receiver<String>,
@@ -130,8 +262,10 @@ impl App {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         updater: blockitall_update::Updater,
-        health_guard: blockitall_update::HealthGuard,
+        health_guard: Option<blockitall_update::HealthGuard>,
         handoff_status: String,
+        desktop: Option<crate::desktop::Desktop>,
+        open_subscriptions: bool,
     ) -> Self {
         let (table_tx, table_rx) = channel();
         let settings = load_settings();
@@ -142,35 +276,23 @@ impl App {
         let (engine_error_tx, engine_error_rx) = channel();
         let context = cc.egui_ctx.clone();
         std::thread::spawn(move || {
-            let mut loaded = None;
+            let mut loaded: Option<(Vec<crate::types::Row>, CacheState, String)> = None;
             'requests: while let Ok((mut settings, mut force_refresh)) = settings_rx.recv() {
+                let mut published_cached = false;
                 for (pending, pending_force) in settings_rx.try_iter() {
                     settings = pending;
                     force_refresh |= pending_force;
                 }
-                let mut fetched_rows = false;
-                loop {
-                    if force_refresh || loaded.is_none() {
-                        fetched_rows = true;
-                        match crate::aa::load_rows(force_refresh, f64::from(settings.cache_hours)) {
-                            Ok(rows) => loaded = Some(rows),
-                            Err(error) => {
-                                let _ = engine_error_tx.send(format!("Engine: {error:#}"));
-                                context.request_repaint();
-                                continue 'requests;
-                            }
+                if loaded.is_none() {
+                    match crate::aa::cached_rows() {
+                        Ok(rows) => loaded = Some(rows),
+                        Err(error) => {
+                            let _ = engine_error_tx.send(format!("Engine: {error:#}"));
+                            context.request_repaint();
+                            continue 'requests;
                         }
                     }
-                    force_refresh = false;
-                    for (pending, pending_force) in settings_rx.try_iter() {
-                        settings = pending;
-                        force_refresh |= pending_force;
-                    }
-                    if !force_refresh {
-                        break;
-                    }
-                }
-                if let Some((rows, state, fetched)) = &loaded {
+                    let (rows, state, fetched) = loaded.as_ref().expect("cached rows loaded");
                     let table = crate::engine::score(
                         rows.clone(),
                         &settings,
@@ -178,6 +300,18 @@ impl App {
                         fetched.clone(),
                         None,
                     );
+                    let fresh = !rows_expired(fetched, settings.cache_hours);
+                    if table_tx
+                        .send(TableResponse::Primary(
+                            Box::new(table),
+                            fresh,
+                            settings.clone(),
+                        ))
+                        .is_err()
+                    {
+                        break;
+                    }
+                    context.request_repaint();
                     let vendor_tables = VENDOR_TABS.map(|(_, vendor)| {
                         crate::engine::score(
                             rows.clone(),
@@ -188,20 +322,95 @@ impl App {
                         )
                     });
                     if table_tx
-                        .send((table, vendor_tables, fetched_rows, settings.clone()))
+                        .send(TableResponse::Vendors(
+                            Box::new(vendor_tables),
+                            settings.clone(),
+                        ))
                         .is_err()
                     {
                         break;
                     }
                     context.request_repaint();
+                    published_cached = true;
                 }
+                let cached_stale = loaded
+                    .as_ref()
+                    .is_none_or(|(_, _, fetched)| rows_expired(fetched, settings.cache_hours))
+                    || crate::aa::upstream_stale();
+                let mut fetched_rows = force_refresh || cached_stale;
+                if fetched_rows {
+                    match crate::aa::load_rows(force_refresh, f64::from(settings.cache_hours)) {
+                        Ok(rows) => loaded = Some(rows),
+                        Err(error) => {
+                            let _ = engine_error_tx.send(format!("Engine: {error:#}"));
+                            context.request_repaint();
+                            continue 'requests;
+                        }
+                    }
+                } else if published_cached {
+                    continue;
+                }
+                let mut refresh_again = false;
+                for (pending, pending_force) in settings_rx.try_iter() {
+                    settings = pending;
+                    refresh_again |= pending_force;
+                }
+                if refresh_again && !fetched_rows {
+                    match crate::aa::load_rows(true, f64::from(settings.cache_hours)) {
+                        Ok(rows) => loaded = Some(rows),
+                        Err(error) => {
+                            let _ = engine_error_tx.send(format!("Engine: {error:#}"));
+                            context.request_repaint();
+                            continue 'requests;
+                        }
+                    }
+                    fetched_rows = true;
+                }
+                let Some((rows, state, fetched)) = &loaded else {
+                    continue;
+                };
+                let table =
+                    crate::engine::score(rows.clone(), &settings, *state, fetched.clone(), None);
+                if table_tx
+                    .send(TableResponse::Primary(
+                        Box::new(table),
+                        fetched_rows,
+                        settings.clone(),
+                    ))
+                    .is_err()
+                {
+                    break;
+                }
+                context.request_repaint();
+                let vendor_tables = VENDOR_TABS.map(|(_, vendor)| {
+                    crate::engine::score(
+                        rows.clone(),
+                        &settings,
+                        *state,
+                        fetched.clone(),
+                        Some(vendor),
+                    )
+                });
+                if table_tx
+                    .send(TableResponse::Vendors(
+                        Box::new(vendor_tables),
+                        settings.clone(),
+                    ))
+                    .is_err()
+                {
+                    break;
+                }
+                context.request_repaint();
             }
         });
-        let _ = settings_tx.send((settings.clone(), false));
-
         let mut app = Self {
             brand: crate::theme::load_brand(&cc.egui_ctx),
-            section: Section::Team,
+            section: if open_subscriptions {
+                Section::Settings
+            } else {
+                Section::Team
+            },
+            settings_tab: 0,
             workflow_class: WorkClass::Standard,
             ranking_seat: Seat::Implementer,
             ranking_tier: Tier::Api,
@@ -211,7 +420,16 @@ impl App {
             vendor_tables: std::array::from_fn(|_| Table::empty()),
             selected_tab: 0,
             table_revision: 0,
-            generator: Generator::new(cc.egui_ctx.clone()),
+            generator: Generator::new(),
+            native_connections: crate::native_connections::NativeConnections::new(
+                cc.egui_ctx.clone(),
+            ),
+            native_connection_status: String::new(),
+            desktop,
+            window_visible: true,
+            hide_command_sent: false,
+            scoring_started: false,
+            quit_requested: false,
             panel_widths: std::collections::HashMap::new(),
             rho_override_text: settings
                 .rho_override
@@ -230,6 +448,7 @@ impl App {
                 })
                 .collect(),
             workspace_status: String::new(),
+            background_status: String::new(),
             workspace_picker: None,
             refresh_in_flight: true,
             retry_after: None,
@@ -246,7 +465,7 @@ impl App {
             update_status: String::new(),
             handoff_status,
             updater: Arc::new(Mutex::new(updater)),
-            health_guard: Some(health_guard),
+            health_guard,
             close_after_handoff: false,
             update_rx: None,
             available_update: None,
@@ -319,7 +538,7 @@ impl App {
                                     .table
                                     .rows
                                     .get(point.row_index)
-                                    .map(|row| row.display_name())
+                                    .map(role_model_name)
                                     .unwrap_or_else(|| format!("Row #{}", point.row_index));
                                 if ui.button("Use minimum").clicked() {
                                     selected_floor = Some(point.competence_floor);
@@ -349,7 +568,7 @@ impl App {
                         .table
                         .rows
                         .get(excluded.row_index)
-                        .map(|row| row.display_name())
+                        .map(role_model_name)
                         .unwrap_or_else(|| format!("Row #{}", excluded.row_index));
                     ui.label(format!("{name}: {}", excluded.reason));
                 }
@@ -397,6 +616,18 @@ impl App {
                 primary.lcr,
                 primary.lcr_weight
             ));
+            ui.small(
+                "The research score is the fixed-weight geometric mean of the selected components; the weights are task-policy weights.",
+            );
+            if primary.hle_weight > 0.0 {
+                ui.label(format!(
+                    "HLE {} × {:.2}",
+                    primary
+                        .hle
+                        .map_or_else(|| "Unknown".to_owned(), |value| format!("{value:.4}")),
+                    primary.hle_weight
+                ));
+            }
             ui.label(format!(
                 "Diagnostics: GPQA {}; GDP.pdf {}",
                 primary
@@ -461,7 +692,11 @@ impl App {
 
             ui.heading("Selected policy");
             if let Some(row) = selected_row {
-                ui.label(egui::RichText::new(row.display_name()).strong().size(15.0));
+                ui.label(
+                    egui::RichText::new(role_model_name(row))
+                        .strong()
+                        .size(15.0),
+                );
                 ui.label(format!("Vendor: {} | Harness: {}", row.vendor, row.harness));
                 ui.label(row.retry.description());
             }
@@ -515,6 +750,43 @@ impl App {
             }
             selected_floor = self.frontier_content(ui, seat, tier);
 
+            if let Some(portfolio) = table.portfolio.as_ref() {
+                let choices = portfolio
+                    .close_choices
+                    .iter()
+                    .filter(|choice| choice.seat == seat)
+                    .collect::<Vec<_>>();
+                if !choices.is_empty() {
+                    egui::CollapsingHeader::new("Conditional joint-plan alternatives").show(
+                        ui,
+                        |ui| {
+                            for choice in choices {
+                                let challenger = table
+                                    .rows
+                                    .get(choice.challenger_row_index)
+                                    .map(role_model_name)
+                                    .unwrap_or_else(|| {
+                                        format!("Row #{}", choice.challenger_row_index)
+                                    });
+                                ui.label(format!(
+                                    "{}{} · scenario assignment utility {:.3}",
+                                    challenger,
+                                    choice
+                                        .class
+                                        .map(|class| format!(" / {}", class.name()))
+                                        .unwrap_or_default(),
+                                    choice.challenger_utility
+                                ));
+                                ui.small(format!(
+                                    "Conditional on the complete-plan scenario; native qualification is required. {}",
+                                    choice.condition
+                                ));
+                            }
+                        },
+                    );
+                }
+            }
+
             ui.add_space(10.0);
             ui.heading("Role competence and reference workload");
             ui.add(egui::Label::new(
@@ -525,21 +797,102 @@ impl App {
                     "Fixed role competence: {}",
                     competence_text(pick.competence)
                 ));
-                if let Some(components) = crate::engine::competence_components(row, seat) {
+                if let Some(components) = crate::engine::role_evidence(row, seat) {
                     egui::Grid::new(("competence_grid", seat, tier))
                         .striped(true)
                         .show(ui, |ui| {
                             ui.strong("Capability");
                             ui.strong("Score");
                             ui.strong("Fixed weight");
+                            ui.strong("Evidence");
                             ui.end_row();
-                            for (name, score, weight) in components {
-                                ui.label(name);
-                                ui.label(format!("{score:.3}"));
-                                ui.label(format!("{:.1}%", weight * 100.0));
+                            for component in components {
+                                ui.label(component.name);
+                                ui.label(competence_text(component.value));
+                                ui.label(format!("{:.1}%", component.weight * 100.0));
+                                ui.label(evidence_level_text(component.level))
+                                    .on_hover_text(format!(
+                                        "{}\n{}\n{}\n{}",
+                                        component.basis,
+                                        component
+                                            .benchmark
+                                            .map(|benchmark| benchmark.name())
+                                            .unwrap_or("Composite model evidence"),
+                                        component
+                                            .source_id
+                                            .as_deref()
+                                            .unwrap_or("No linked source"),
+                                        component
+                                            .observation_id
+                                            .as_deref()
+                                            .unwrap_or("No linked observation")
+                                    ));
                                 ui.end_row();
                             }
                         });
+                    ui.small(
+                        "The role score is the fixed-weight geometric mean of these components. Unknown components do not become zero-valued evidence.",
+                    );
+                }
+                if self.settings.best_in_house_mode == BestInHouseMode::PerPlan {
+                    let selected_capability = pick.competence.unwrap_or(0.0);
+                    let incomplete = table
+                        .rows
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, candidate)| {
+                            let relevant = index != pick.row_index
+                                && crate::aa::vendor_key(&candidate.harness, &candidate.model)
+                                    .is_some_and(|provider| {
+                                        self.settings.subscriptions.contains_key(provider)
+                                    })
+                                && crate::engine::role_evidence(candidate, seat).is_some_and(
+                                    |components| {
+                                        components.iter().any(|component| component.value.is_none())
+                                    },
+                                );
+                            let sensitivity = relevant.then(|| {
+                                crate::engine::competence_sensitivity(
+                                    candidate,
+                                    seat,
+                                    &self.settings,
+                                )
+                            })?;
+                            sensitivity
+                                .is_none_or(|scenario| {
+                                    scenario.high.is_none_or(|high| high >= selected_capability)
+                                })
+                                .then_some((candidate, sensitivity))
+                        })
+                        .collect::<Vec<_>>();
+                    if !incomplete.is_empty() {
+                        egui::CollapsingHeader::new(format!(
+                            "Subscribed routes with missing role evidence ({})",
+                            incomplete.len()
+                        ))
+                        .show(ui, |ui| {
+                            for (candidate, sensitivity) in incomplete {
+                                ui.label(format!(
+                                    "{} · Unranked—missing evidence",
+                                    role_model_name(candidate)
+                                ));
+                                ui.small(sensitivity.map_or_else(
+                                    || {
+                                        "No score range is available because the role component weights or task counts are unavailable."
+                                            .to_owned()
+                                    },
+                                    |scenario| match (scenario.low, scenario.high) {
+                                        (Some(low), Some(high)) => format!(
+                                            "Declared capability scenario {low:.3}–{high:.3}; this is not a confidence interval. {}",
+                                            role_evidence_summary(candidate, seat)
+                                        ),
+                                        _ => "No score range is available because the role component weights or task counts are unavailable."
+                                            .to_owned(),
+                                    },
+                                ));
+                            }
+                        });
+                    }
                 }
                 ui.add_space(6.0);
                 ui.label(format!(
@@ -617,7 +970,7 @@ impl App {
                         .unwrap_or_else(|| "Unknown".into()),
                 ))
                 .on_hover_text(
-                    "Normalized intelligence index; contributes half of Orchestrator competence. It is not a success probability.",
+                    "Normalized Intelligence Index (AA score / 100). Orchestrator competence is this index. It is not a success probability. LCR and HLE are diagnostics only.",
                 );
 
                 if self.settings.show_hallucination {
@@ -650,7 +1003,7 @@ impl App {
                         .show(ui, |ui| {
                         for scenario in &pick.scenarios {
                             let leader = table.rows.get(scenario.row_index)
-                                .map(|row| row.display_name())
+                                .map(role_model_name)
                                 .unwrap_or_else(|| format!("Row #{}", scenario.row_index));
                             ui.label(format!(
                                 "{}: autonomous-capacity leader {} MAX {} at {:.1}; selected policy {:.1} agent completions/week ({:.1}% shortfall)",
@@ -769,7 +1122,7 @@ impl App {
         let Some(row) = table.rows.get(pick.row_index) else {
             return;
         };
-        ui.heading(row.display_name());
+        ui.heading(role_model_name(row));
         ui.add(
             egui::Label::new(
                 "Best nominal reference capacity after the selected competence and scenario constraints.",
@@ -814,47 +1167,6 @@ impl App {
         }
     }
 
-    fn research_evidence_content(&self, ui: &mut egui::Ui, tier: Tier) {
-        let table = self.selected_table();
-        let Some(primary) = table
-            .research_tiers
-            .iter()
-            .find(|pick| pick.tier == tier)
-            .and_then(|pick| pick.primary.as_ref())
-        else {
-            ui.label("No eligible research evidence for this tier.");
-            return;
-        };
-        ui.label(format!("Accuracy: {:.4}", primary.accuracy));
-        ui.label(format!(
-            "No incorrect answer (all questions): {:.4}",
-            primary.non_wrong
-        ));
-        ui.label(format!(
-            "AA conditional hallucination diagnostic: {:.4}",
-            primary.conditional_hallucination
-        ));
-        ui.label(format!("Long-context reasoning: {:.4}", primary.lcr));
-        ui.label(format!(
-            "Reference cost: {}",
-            primary
-                .expected_usd
-                .map_or_else(|| "Unknown".to_owned(), |value| format!("${value:.4}"))
-        ));
-        ui.label(format!(
-            "Decode time: {}",
-            primary.decode_hours.map_or_else(
-                || "Unknown".to_owned(),
-                |value| format!("{:.2} min", value * 60.0)
-            )
-        ));
-        ui.label(&primary.source);
-        ui.hyperlink_to(
-            "Artificial Analysis methodology",
-            AA_INTELLIGENCE_METHODOLOGY_URL,
-        );
-    }
-
     fn counterfactual_content(&mut self, ui: &mut egui::Ui, seat: Seat, tier: Tier) {
         let table = if self.selected_tab == 0 {
             &self.table
@@ -888,7 +1200,7 @@ impl App {
         let selected_name = table
             .rows
             .get(*choice)
-            .map(|row| row.display_name())
+            .map(role_model_name)
             .unwrap_or_else(|| format!("Row #{}", *choice));
         egui::ComboBox::from_id_salt(("comparison_choice", seat, tier))
             .selected_text(selected_name)
@@ -897,7 +1209,7 @@ impl App {
                     let name = table
                         .rows
                         .get(row_index)
-                        .map(|row| row.display_name())
+                        .map(role_model_name)
                         .unwrap_or_else(|| format!("Row #{row_index}"));
                     ui.selectable_value(choice, row_index, name);
                 }
@@ -908,8 +1220,7 @@ impl App {
         let score_is_current = self
             .scored_settings
             .as_ref()
-            .is_some_and(|scored| scored.scoring_matches(&self.settings))
-            && !self.refresh_in_flight;
+            .is_some_and(|scored| scored.scoring_matches(&self.settings));
         if ui
             .add_enabled(
                 !pending && score_is_current,
@@ -1019,13 +1330,20 @@ impl App {
             .unwrap_or(true)
     }
 
+    fn source_refresh_delay(&self) -> Option<Duration> {
+        let fetched = OffsetDateTime::parse(&self.table.source_fetched_at, &Rfc3339).ok()?;
+        let deadline = fetched + time::Duration::hours(i64::from(self.settings.cache_hours));
+        let remaining = deadline - OffsetDateTime::now_utc();
+        (remaining > time::Duration::ZERO)
+            .then(|| Duration::from_nanos(remaining.whole_nanoseconds() as u64))
+    }
+
     fn start_refresh(&mut self) {
         if self.refresh_in_flight {
             return;
         }
         if self.settings_tx.send((self.settings.clone(), true)).is_ok() {
             self.invalidate_comparisons();
-            self.scored_settings = None;
             self.refresh_in_flight = true;
             self.refresh_clicked_at = Some(Instant::now());
             self.engine_status = "Refreshing…".to_string();
@@ -1108,9 +1426,22 @@ impl App {
             }
         }
         self.generator.pump();
-        while let Ok((new_table, vendor_tables, fetched_rows, scored_settings)) =
-            self.table_rx.try_recv()
-        {
+        while let Ok(response) = self.table_rx.try_recv() {
+            let (new_table, fetched_rows, scored_settings) = match response {
+                TableResponse::Primary(table, fetched_rows, settings) => {
+                    (table, fetched_rows, settings)
+                }
+                TableResponse::Vendors(vendor_tables, settings) => {
+                    if settings.scoring_matches(&self.settings) {
+                        self.vendor_tables = *vendor_tables;
+                        if !self.refresh_in_flight {
+                            self.engine_status.clear();
+                        }
+                    }
+                    continue;
+                }
+            };
+            let new_table = *new_table;
             if fetched_rows {
                 self.refresh_in_flight = false;
                 if new_table.cache_state == CacheState::Live {
@@ -1140,11 +1471,16 @@ impl App {
             self.invalidate_comparisons();
             self.table_revision = self.table_revision.wrapping_add(1);
             self.table = new_table;
-            self.vendor_tables = vendor_tables;
+            self.vendor_tables = std::array::from_fn(|_| Table::empty());
             self.conductor_comparison.clear();
             self.conductor_comparison_pending = false;
             self.comparison_choice.clear();
             self.scored_settings = Some(scored_settings);
+            self.engine_status = if self.refresh_in_flight {
+                "Refreshing vendor views…".to_owned()
+            } else {
+                "Scoring vendor views…".to_owned()
+            };
             if !self.refresh_in_flight {
                 self.engine_status.clear();
             }
@@ -1216,6 +1552,11 @@ impl App {
         self.engine_status = "Scoring…".to_owned();
     }
 
+    fn save_desktop_settings(&mut self) -> Result<(), String> {
+        self.settings = self.settings.clone().normalize();
+        save_settings(&self.settings).map_err(|error| format!("Saving settings failed: {error:#}"))
+    }
+
     fn team_content(&mut self, ui: &mut egui::Ui) {
         Self::section_heading(
             ui,
@@ -1248,6 +1589,39 @@ impl App {
                             )
                             .changed();
                     });
+                    ui.horizontal_wrapped(|ui| {
+                        let mut reserve_usd = self.settings.orchestrator_headroom_usd.is_some();
+                        if ui
+                            .checkbox(&mut reserve_usd, "Reserve Orchestrator USD headroom")
+                            .changed()
+                        {
+                            self.settings.orchestrator_headroom_usd = reserve_usd.then_some(0.0);
+                            changed = true;
+                        }
+                        if let Some(value) = &mut self.settings.orchestrator_headroom_usd {
+                            changed |= ui
+                                .add(egui::DragValue::new(value).range(0.0..=1_000_000.0).prefix("$"))
+                                .changed();
+                        }
+                        let mut reserve_hours =
+                            self.settings.orchestrator_headroom_hours.is_some();
+                        if ui
+                            .checkbox(&mut reserve_hours, "Reserve Orchestrator hours")
+                            .changed()
+                        {
+                            self.settings.orchestrator_headroom_hours =
+                                reserve_hours.then_some(0.0);
+                            changed = true;
+                        }
+                        if let Some(value) = &mut self.settings.orchestrator_headroom_hours {
+                            changed |= ui
+                                .add(egui::DragValue::new(value).range(0.0..=1680.0).suffix(" h"))
+                                .changed();
+                        }
+                    });
+                    ui.small(
+                        "Optional fixed Orchestrator headroom is reserved once for persistent coordination and does not scale with worker jobs.",
+                    );
                     if changed {
                         self.apply_settings_change();
                     }
@@ -1259,11 +1633,10 @@ impl App {
                 });
             return;
         }
-        if self.refresh_in_flight
-            || !self
-                .scored_settings
-                .as_ref()
-                .is_some_and(|scored| scored.scoring_matches(&self.settings))
+        if !self
+            .scored_settings
+            .as_ref()
+            .is_some_and(|scored| scored.scoring_matches(&self.settings))
         {
             if !self.refresh_warning.is_empty() {
                 ui.colored_label(crate::theme::ERROR, &self.refresh_warning);
@@ -1356,11 +1729,6 @@ impl App {
                 ),
                 "Allowance and working time".to_owned(),
             ),
-            (
-                "NATIVE ADMITTED".to_owned(),
-                dispatch.native_admission_changes.to_string(),
-                "Authorized task IDs".to_owned(),
-            ),
         ];
         let card_columns = if ui.available_width() >= 900.0 { 4 } else { 2 };
         for row in cards.chunks(card_columns) {
@@ -1388,6 +1756,60 @@ impl App {
             });
             ui.add_space(8.0);
         }
+        let service = &dispatch.service;
+        egui::CollapsingHeader::new("Quality-adjusted worker service")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label(format!(
+                    "Plan score {:.3} · weighted workload {:.3} · team capability {:.3}",
+                    service.quality_adjusted_service,
+                    service.workload,
+                    service.team_capability
+                ))
+                .on_hover_text(
+                    "Plan score Q is quality-adjusted worker service. W is weighted admitted workload. Team capability is exp(L/W), the workload-weighted geometric capability term.",
+                );
+                ui.label(format!(
+                    "Chosen admitted jobs: {} · largest worker plan found: {} jobs / {} plan score",
+                    dispatch.admitted_changes,
+                    service.maximum_volume_admitted,
+                    service.maximum_volume_service.map_or_else(
+                        || "Unknown".to_owned(),
+                        |value| format!("{value:.3}")
+                    )
+                ));
+                ui.label(format!(
+                    "Worker-service objective bound: {}",
+                    service
+                        .bound
+                        .map_or_else(|| "Unknown".to_owned(), |bound| format!("{bound:.3}"))
+                ));
+                ui.label(service.relative_gap.map_or_else(
+                    || {
+                        if service.proven_optimal {
+                            "Worker-service objective proved for the declared search.".to_owned()
+                        } else {
+                            "Worker-service search unresolved; objective gap is unknown."
+                                .to_owned()
+                        }
+                    },
+                    |gap| {
+                        format!(
+                            "Worker-service search gap {:.1}%{}",
+                            gap * 100.0,
+                            if service.proven_optimal {
+                                " · proved"
+                            } else {
+                                " · unresolved"
+                            }
+                        )
+                    },
+                ));
+                ui.small(
+                    "Quality-adjusted service is a policy utility from the geometric team profile, not a probability of task success. The worker plan is conditional on persistent human-facing coordination.",
+                );
+                ui.small(&service.message);
+            });
         ui.add_space(18.0);
         if !dispatch.executable || portfolio.conductor.is_none() {
             let status = if !portfolio.message.is_empty() {
@@ -1446,7 +1868,7 @@ impl App {
                             self.table
                                 .rows
                                 .get(point.row_index)
-                                .map_or_else(|| "Unknown".to_owned(), |row| row.display_name()),
+                                .map_or_else(|| "Unknown".to_owned(), role_model_name),
                         );
                         ui.label(point.admitted_changes.to_string());
                         ui.label(format!("{:.3}", point.quality));
@@ -1480,10 +1902,12 @@ impl App {
                 self.engine_status = "Scoring…".to_owned();
             }
         }
-        ui.strong("Role assignments");
+        ui.strong("Role assignment previews");
         ui.label(
-            egui::RichText::new("Orchestrator stays fixed; class applies to all six workers.")
-                .color(crate::theme::MUTED),
+            egui::RichText::new(
+                "Select a class to preview its seven seat assignments. Generate Orchestrator includes all four class policies and classifies each actual task automatically.",
+            )
+            .color(crate::theme::MUTED),
         );
         ui.horizontal_wrapped(|ui| {
             for class in WorkClass::ALL {
@@ -1505,6 +1929,7 @@ impl App {
                             "Model / effort",
                             "Subscription",
                             "Competence",
+                            "Role evidence",
                             "Visits",
                         ] {
                             ui.label(
@@ -1539,11 +1964,43 @@ impl App {
                                         .strong(),
                                 );
                             });
-                            ui.label(row.display_name());
+                            ui.label(role_model_name(row));
                             ui.label(&conductor.provider_id)
                                 .on_hover_text(&conductor.plan_id);
                             ui.label(competence_text(Some(conductor.competence)));
-                            ui.label(conductor.expected_visits.to_string());
+                            ui.label(format!(
+                                "{} · {}",
+                                conductor.evidence_profile, conductor.evidence_level
+                            ))
+                                .on_hover_text(role_evidence_hover(row, Seat::Orchestrator));
+                            let usage = conductor.usage_forecast.as_ref().map_or_else(
+                                || "Usage forecast: Unknown / on demand".to_owned(),
+                                |forecast| {
+                                    format!(
+                                        "Usage forecast: {} calls · {:.3} USD · {:.3} h",
+                                        forecast.visits, forecast.usage, forecast.hours
+                                    )
+                                },
+                            );
+                            let headroom = format!(
+                                "Fixed headroom: {} USD · {} h",
+                                conductor
+                                    .headroom
+                                    .usd
+                                    .map_or_else(|| "unspecified".to_owned(), |value| format!("{value:.3}")),
+                                conductor
+                                    .headroom
+                                    .hours
+                                    .map_or_else(|| "unspecified".to_owned(), |value| format!("{value:.3}"))
+                            );
+                            ui.label(if conductor.persistent {
+                                "Persistent / On demand"
+                            } else {
+                                "On demand"
+                            })
+                            .on_hover_text(format!(
+                                "Human-facing coordination service. Calls are independent of worker-job counts and actual native use is governed by ledger holds.\n{usage}\n{headroom}"
+                            ));
                             ui.end_row();
                         }
                         for seat in crate::orchestration::ROLE_ORDER
@@ -1581,7 +2038,7 @@ impl App {
                             } else if let Some(row) =
                                 rule.row_index.and_then(|index| self.table.rows.get(index))
                             {
-                                ui.label(row.display_name());
+                                ui.label(role_model_name(row));
                                 ui.label(rule.provider_id.as_deref().unwrap_or("Unknown"));
                             } else {
                                 ui.label("No qualified model");
@@ -1592,6 +2049,32 @@ impl App {
                                     .map(|candidate| candidate.score)
                                     .or(rule.competence),
                             ));
+                            if let Some(primary) = research_primary {
+                                let component_count = 3 + usize::from(primary.hle_weight > 0.0);
+                                ui.label(format!("{component_count} model-level components"))
+                                    .on_hover_text(format!(
+                                        "Accuracy {:.3}; non-wrong {:.3}; LCR {:.3}; HLE {}\n{}",
+                                        primary.accuracy,
+                                        primary.non_wrong,
+                                        primary.lcr,
+                                        if primary.hle_weight > 0.0 {
+                                            primary.hle.map_or_else(
+                                                || "selected but unknown".to_owned(),
+                                                |value| format!("{value:.3}")
+                                            )
+                                        } else {
+                                            "not used for this class".to_owned()
+                                        },
+                                        primary.source
+                                    ));
+                            } else if let Some(row) =
+                                rule.row_index.and_then(|index| self.table.rows.get(index))
+                            {
+                                ui.label(role_evidence_compact(row, seat))
+                                    .on_hover_text(role_evidence_hover(row, seat));
+                            } else {
+                                ui.label("Unknown");
+                            }
                             ui.label(if research_primary.is_some() && rule.planned_jobs == 0 {
                                 "On demand".to_owned()
                             } else {
@@ -1601,10 +2084,163 @@ impl App {
                         }
                     });
             });
+        if let Some(sensitivity) = portfolio
+            .dispatch
+            .repair_sensitivity
+            .iter()
+            .find(|sensitivity| sensitivity.class == self.workflow_class)
+        {
+            ui.label(format!(
+                "{} repair activation: {:.1}% nominal · scenario {:.1}%–{:.1}%",
+                self.workflow_class.name(),
+                sensitivity.nominal * 100.0,
+                sensitivity.lower * 100.0,
+                sensitivity.upper * 100.0
+            ))
+            .on_hover_text(format!(
+                "Declared assumption scenario, not a confidence interval. {}",
+                sensitivity.basis
+            ));
+        }
+        if let Some(report) = &portfolio.capability_scenario {
+            let choices = portfolio
+                .close_choices
+                .iter()
+                .filter(|choice| {
+                    choice.class.is_none() || choice.class == Some(self.workflow_class)
+                })
+                .collect::<Vec<_>>();
+            egui::CollapsingHeader::new("Conditional capability scenario")
+                .default_open(!choices.is_empty())
+                .show(ui, |ui| {
+                    ui.label(format!(
+                        "Joint complete-plan scenario: {} · plan objective {:.3} versus chosen team under the same assumptions {}",
+                        report.status,
+                        report.quality,
+                        report
+                            .baseline_quality
+                            .map_or_else(|| "Unknown".to_owned(), |value| format!("{value:.3}"))
+                    ));
+                    ui.label(report.bound.map_or_else(
+                        || "Scenario objective bound: Unknown".to_owned(),
+                        |bound| format!("Scenario objective bound: {bound:.3}"),
+                    ));
+                    ui.label(report.relative_gap.map_or_else(
+                        || {
+                            if report.proven {
+                                "Scenario result proved for the declared search.".to_owned()
+                            } else {
+                                "Scenario comparison unresolved; no stability claim is available."
+                                    .to_owned()
+                            }
+                        },
+                        |gap| {
+                            format!(
+                                "Scenario search gap {:.1}%{}",
+                                gap * 100.0,
+                                if report.proven { " · proved" } else { " · unresolved" }
+                            )
+                        },
+                    ));
+                    ui.small(&report.message);
+                    if choices.is_empty() {
+                        ui.label(if report.proven {
+                            "No selected-class assignment changes in this declared joint scenario."
+                        } else {
+                            "No selected-class alternative is established by the unresolved search."
+                        });
+                    }
+                    for choice in choices {
+                        let nominal = self
+                            .table
+                            .rows
+                            .get(choice.nominal_row_index)
+                            .map(role_model_name)
+                            .unwrap_or_else(|| format!("Row #{}", choice.nominal_row_index));
+                        let challenger = self
+                            .table
+                            .rows
+                            .get(choice.challenger_row_index)
+                            .map(role_model_name)
+                            .unwrap_or_else(|| format!("Row #{}", choice.challenger_row_index));
+                        ui.label(format!(
+                            "{}{}: {nominal} → {challenger} · assignment utility {:.3} → {:.3}",
+                            choice.seat.name(),
+                            choice
+                                .class
+                                .map(|class| format!(" / {}", class.name()))
+                                .unwrap_or_default(),
+                            choice.nominal_utility,
+                            choice.challenger_utility
+                        ));
+                        ui.small(format!(
+                            "Conditional joint-plan alternative; native qualification is required for {} / {} / {} with up to {} attempts. Scenario {} · bound {} · {}. {}",
+                            choice.challenger_provider_id,
+                            choice.challenger_plan_id,
+                            choice.challenger_native_harness,
+                            choice.challenger_attempt_limit,
+                            choice.scenario_status,
+                            choice.scenario_bound.map_or_else(
+                                || "Unknown".to_owned(),
+                                |bound| format!("{bound:.3}")
+                            ),
+                            choice.scenario_relative_gap.map_or_else(
+                                || if choice.scenario_proven { "proved".to_owned() } else { "gap unknown; unresolved".to_owned() },
+                                |gap| format!("gap {:.1}%{}", gap * 100.0, if choice.scenario_proven { " · proved" } else { " · unresolved" })
+                            ),
+                            choice.condition
+                        ));
+                    }
+                    egui::CollapsingHeader::new(format!(
+                        "All scenario assignments ({})",
+                        report.assignments.len()
+                    ))
+                    .show(ui, |ui| {
+                        for assignment in &report.assignments {
+                            let model = self
+                                .table
+                                .rows
+                                .get(assignment.row_index)
+                                .map(role_model_name)
+                                .unwrap_or_else(|| format!("Row #{}", assignment.row_index));
+                            ui.label(format!(
+                                "{}{} · {} · {} / {} · up to {} attempts · assignment utility {:.3}",
+                                assignment.seat.name(),
+                                assignment
+                                    .class
+                                    .map(|class| format!(" / {}", class.name()))
+                                    .unwrap_or_default(),
+                                model,
+                                assignment.provider_id,
+                                assignment.plan_id,
+                                assignment.attempt_limit,
+                                assignment.utility
+                            ))
+                            .on_hover_text(&assignment.native_harness);
+                        }
+                    });
+                });
+        }
         ui.add_space(12.0);
         egui::CollapsingHeader::new("Budget, timing, and assumptions")
             .default_open(false)
             .show(ui, |ui| {
+                if let Some(conductor) = &portfolio.conductor {
+                    ui.label(format!(
+                        "Orchestrator headroom reserved once: {} USD · {} h",
+                        conductor
+                            .headroom
+                            .usd
+                            .map_or_else(|| "unspecified".to_owned(), |value| format!("{value:.3}")),
+                        conductor
+                            .headroom
+                            .hours
+                            .map_or_else(|| "unspecified".to_owned(), |value| format!("{value:.3}"))
+                    ));
+                    ui.small(
+                        "This optional fixed reserve is independent of worker-job counts. On-demand native calls use ledger holds; no call volume is forecast when usage is unknown.",
+                    );
+                }
                 ui.label(&portfolio.math_audit.objective);
                 ui.label(&portfolio.math_audit.coordination_proxy);
                 egui::ScrollArea::horizontal()
@@ -1652,7 +2288,7 @@ impl App {
                 if ui
                     .add_enabled(
                         executable && self.generator.install_rx.is_none(),
-                        egui::Button::new("Generate orchestrator")
+                        egui::Button::new("Generate Orchestrator")
                             .fill(crate::theme::BLUE)
                             .stroke(egui::Stroke::new(1.0, crate::theme::BLUE)),
                     )
@@ -1738,6 +2374,7 @@ impl App {
                                 "Model",
                                 "Provider",
                                 "Research score",
+                                "Role evidence",
                                 "Modeled cost",
                             ] {
                                 ui.label(
@@ -1773,6 +2410,26 @@ impl App {
                                 }
                                 ui.label(&candidate.provider_id);
                                 ui.label(format!("{:.3}", candidate.score));
+                                let component_count = 3 + usize::from(candidate.hle_weight > 0.0);
+                                ui.label(format!("{component_count} model-level components"))
+                                    .on_hover_text(format!(
+                                        "Accuracy {:.3} × {:.2}; non-wrong {:.3} × {:.2}; LCR {:.3} × {:.2}; HLE {}\n{}",
+                                        candidate.accuracy,
+                                        candidate.accuracy_weight,
+                                        candidate.non_wrong,
+                                        candidate.non_wrong_weight,
+                                        candidate.lcr,
+                                        candidate.lcr_weight,
+                                        if candidate.hle_weight > 0.0 {
+                                            candidate.hle.map_or_else(
+                                                || format!("unknown × {:.2}", candidate.hle_weight),
+                                                |value| format!("{value:.3} × {:.2}", candidate.hle_weight)
+                                            )
+                                        } else {
+                                            "diagnostic, not used for this class".to_owned()
+                                        },
+                                        candidate.source
+                                    ));
                                 ui.label(candidate.expected_usd.map_or_else(
                                     || "Unknown".to_owned(),
                                     |cost| format!("${cost:.2}"),
@@ -1814,6 +2471,7 @@ impl App {
                             "Model",
                             "Provider",
                             "Competence",
+                            "Role evidence",
                             "Ref. tasks/week",
                             "Cost/reference",
                         ] {
@@ -1834,12 +2492,14 @@ impl App {
                                 (rank + 1).to_string()
                             };
                             if ui.selectable_label(false, rank_label).clicked()
-                                || ui.selectable_label(false, row.display_name()).clicked()
+                                || ui.selectable_label(false, role_model_name(row)).clicked()
                             {
                                 clicked_candidate = Some((candidate.row_index, rank == 0));
                             }
                             ui.label(&row.vendor);
                             ui.label(competence_text(candidate.competence));
+                            ui.label(role_evidence_compact(row, self.ranking_seat))
+                                .on_hover_text(role_evidence_hover(row, self.ranking_seat));
                             ui.label(format!("{:.1}", candidate.tasks_per_week))
                                 .on_hover_text(
                                     "Modeled reference-task throughput, not forecast job demand.",
@@ -1932,11 +2592,71 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.pump_channels();
+        self.native_connections.pump();
         let ctx = ui.ctx().clone();
-        self.sidebar(ui);
-        if self.close_after_handoff {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        let mut reveal_window = false;
+        while let Some(event) = self
+            .desktop
+            .as_ref()
+            .and_then(|desktop| desktop.next_event())
+        {
+            match event {
+                crate::desktop::DesktopEvent::Open => {
+                    self.window_visible = true;
+                    self.hide_command_sent = false;
+                    reveal_window = true;
+                }
+                crate::desktop::DesktopEvent::Subscriptions => {
+                    self.window_visible = true;
+                    self.hide_command_sent = false;
+                    reveal_window = true;
+                    self.section = Section::Settings;
+                    self.settings_tab = 0;
+                }
+                crate::desktop::DesktopEvent::Quit => {
+                    self.quit_requested = true;
+                }
+            }
         }
+        if let Some(guard) = self.health_guard.take()
+            && let Err(error) = guard.confirm_healthy()
+        {
+            self.update_status = format!("Update health confirmation failed: {error:#}");
+            self.close_after_handoff = true;
+        }
+        if self.close_after_handoff || self.quit_requested {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        if ctx.input(|input| input.viewport().close_requested())
+            && self.desktop.is_some()
+            && self.settings.close_to_tray
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.window_visible = false;
+            self.hide_command_sent = true;
+        }
+        if !self.window_visible {
+            if !self.hide_command_sent {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                self.hide_command_sent = true;
+            }
+            return;
+        }
+        reveal_window |= !self.scoring_started;
+        if reveal_window {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+        if !self.scoring_started {
+            self.scoring_started = self
+                .settings_tx
+                .send((self.settings.clone(), false))
+                .is_ok();
+        }
+        self.sidebar(ui);
         if !self.refresh_in_flight
             && self.source_expired()
             && self
@@ -1945,7 +2665,22 @@ impl eframe::App for App {
         {
             self.start_refresh();
         }
-        ctx.request_repaint_after(Duration::from_secs(1));
+        if let Some(deadline) = self.retry_after
+            && deadline > Instant::now()
+        {
+            ctx.request_repaint_after(deadline.saturating_duration_since(Instant::now()));
+        }
+        if let Some(clicked_at) = self.refresh_clicked_at {
+            let deadline = clicked_at + Duration::from_secs(REFRESH_COOLDOWN_SECONDS);
+            if deadline > Instant::now() {
+                ctx.request_repaint_after(deadline.saturating_duration_since(Instant::now()));
+            }
+        }
+        if !self.refresh_in_flight
+            && let Some(delay) = self.source_refresh_delay()
+        {
+            ctx.request_repaint_after(delay);
+        }
 
         egui::Panel::bottom("source_status").show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -1996,7 +2731,6 @@ impl eframe::App for App {
         if t > 0.001
             && let Some((seat, tier)) = self.selected_seat_tier
         {
-            let mut selected_floor = None;
             let maximum = (ui.max_rect().width() * 0.45).max(1.0);
             let panel_width = self
                 .detail_width(ui, seat, tier)
@@ -2078,25 +2812,27 @@ impl eframe::App for App {
                                 DetailTab::Alternatives => {
                                     self.research_alternatives_content(ui, tier);
                                 }
-                                DetailTab::Evidence if seat == Seat::NetResearch => {
-                                    self.research_evidence_content(ui, tier);
-                                }
                                 DetailTab::Evidence => {
-                                    selected_floor = self.detail_content(ui, seat, tier);
+                                    let table = self.selected_table();
+                                    let row = if seat == Seat::NetResearch {
+                                        table
+                                            .research_tiers
+                                            .iter()
+                                            .find(|pick| pick.tier == tier)
+                                            .and_then(|pick| pick.primary.as_ref())
+                                            .and_then(|candidate| {
+                                                table.rows.get(candidate.row_index)
+                                            })
+                                    } else {
+                                        table
+                                            .get_pick(seat, tier)
+                                            .and_then(|pick| table.rows.get(pick.row_index))
+                                    };
+                                    evidence_view::show(ui, table, row);
                                 }
                             });
                     }
                 });
-            if let Some(floor) = selected_floor {
-                self.settings
-                    .competence_floors
-                    .insert(seat.name().to_string(), Some(floor));
-                self.settings = self.settings.clone().normalize();
-                let _ = save_settings(&self.settings);
-                self.invalidate_comparisons();
-                let _ = self.settings_tx.send((self.settings.clone(), false));
-                self.engine_status = "Scoring…".to_string();
-            }
         }
 
         egui::CentralPanel::default()
@@ -2106,11 +2842,12 @@ impl eframe::App for App {
                     .inner_margin(24),
             )
             .show(ui, |ui| {
-                ui.set_max_width(ui.available_width().min(1400.0));
                 if self.section == Section::Settings {
                     egui::ScrollArea::vertical()
                         .id_salt("settings_page_scroll")
+                        .auto_shrink([false, false])
                         .show(ui, |ui| {
+                            ui.set_max_width(ui.available_width().min(1400.0));
                             Self::section_heading(ui, "Settings", "");
                             if self.settings_content(ui) {
                                 self.apply_settings_change();
@@ -2121,16 +2858,19 @@ impl eframe::App for App {
                 if self.section == Section::About {
                     egui::ScrollArea::vertical()
                         .id_salt("about_page_scroll")
-                        .show(ui, |ui| self.about_content(ui, &ctx));
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_max_width(ui.available_width().min(1400.0));
+                            self.about_content(ui, &ctx);
+                        });
                     return;
                 }
                 if self.section == Section::Setup {
                     Self::section_heading(ui, "Setup", "");
-                    let score_current = !self.refresh_in_flight
-                        && self
-                            .scored_settings
-                            .as_ref()
-                            .is_some_and(|scored| scored.scoring_matches(&self.settings));
+                    let score_current = self
+                        .scored_settings
+                        .as_ref()
+                        .is_some_and(|scored| scored.scoring_matches(&self.settings));
                     if !self.generator.open {
                         let executable = self.table.portfolio.as_ref().is_some_and(|portfolio| {
                             portfolio.dispatch.executable && portfolio.conductor.is_some()
@@ -2173,22 +2913,23 @@ impl eframe::App for App {
                     self.settings.best_in_house_mode = BestInHouseMode::PerPlan;
                     egui::ScrollArea::vertical()
                         .id_salt("team_page_scroll")
-                        .show(ui, |ui| self.team_content(ui));
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_max_width(ui.available_width().min(1400.0));
+                            self.team_content(ui);
+                        });
                 } else {
                     if self.settings.best_in_house_mode == BestInHouseMode::PerPlan {
                         self.settings.best_in_house_mode = BestInHouseMode::Absolute;
                     }
                     egui::ScrollArea::vertical()
                         .id_salt("rankings_page_scroll")
-                        .show(ui, |ui| self.rankings_content(ui));
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_max_width(ui.available_width().min(1400.0));
+                            self.rankings_content(ui);
+                        });
                 }
             });
-        if let Some(guard) = self.health_guard.take()
-            && let Err(error) = guard.confirm_healthy()
-        {
-            self.update_status = format!("Update health confirmation failed: {error:#}");
-            self.close_after_handoff = true;
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-        }
     }
 }

@@ -135,47 +135,38 @@ pub fn visits(task: &TaskRequest) -> Vec<Visit> {
             criteria: criteria.iter().map(|value| (*value).to_owned()).collect(),
         });
     };
-    add(
-        Seat::Orchestrator,
-        1,
-        Vec::new(),
-        false,
-        &["scope", "risk", "acceptance"],
-    );
     if research {
         add(
             Seat::NetResearch,
             1,
-            vec![format!("{}-orchestrator-1", task.task_id)],
+            Vec::new(),
             false,
             &["source_retrieval", "citation_accuracy"],
         );
     }
     if comprehension {
-        let dependency = if research {
-            "net-research"
-        } else {
-            "orchestrator"
-        };
         add(
             Seat::Comprehension,
             1,
-            vec![format!("{}-{dependency}-1", task.task_id)],
+            if research {
+                vec![format!("{}-net-research-1", task.task_id)]
+            } else {
+                Vec::new()
+            },
             false,
             &["repository_comprehension"],
         );
     }
-    let implementation_dependency = if comprehension {
-        "comprehension"
-    } else if research {
-        "net-research"
-    } else {
-        "orchestrator"
-    };
     add(
         Seat::Implementer,
         1,
-        vec![format!("{}-{implementation_dependency}-1", task.task_id)],
+        if comprehension {
+            vec![format!("{}-comprehension-1", task.task_id)]
+        } else if research {
+            vec![format!("{}-net-research-1", task.task_id)]
+        } else {
+            Vec::new()
+        },
         false,
         &["patch_generation", "terminal_execution"],
     );
@@ -197,7 +188,11 @@ pub fn visits(task: &TaskRequest) -> Vec<Visit> {
         add(
             Seat::Debugger,
             1,
-            vec![format!("{}-implementer-1", task.task_id)],
+            vec![
+                format!("{}-implementer-1", task.task_id),
+                format!("{}-reviewer-1", task.task_id),
+                format!("{}-sanity-1", task.task_id),
+            ],
             true,
             &["fault_localization", "repair"],
         );
@@ -216,21 +211,6 @@ pub fn visits(task: &TaskRequest) -> Vec<Visit> {
             &["repair_acceptance_execution"],
         );
     }
-    let final_dependencies = if checks {
-        vec![
-            format!("{}-reviewer-1", task.task_id),
-            format!("{}-sanity-1", task.task_id),
-        ]
-    } else {
-        vec![format!("{}-implementer-1", task.task_id)]
-    };
-    add(
-        Seat::Orchestrator,
-        2,
-        final_dependencies,
-        false,
-        &["artifact_reconciliation"],
-    );
     result
 }
 

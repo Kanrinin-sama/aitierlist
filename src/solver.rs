@@ -14,6 +14,7 @@ pub struct Problem {
     pub capacities: Vec<f64>,
 }
 
+#[derive(Clone)]
 pub struct Solution<T> {
     pub choices: Vec<usize>,
     pub quality: f64,
@@ -26,7 +27,6 @@ pub struct Outcome<T> {
     pub solution: Option<Solution<T>>,
     pub bound: Option<f64>,
     pub proven: bool,
-    pub limitation: Option<&'static str>,
 }
 
 pub struct SolverState<T> {
@@ -59,6 +59,20 @@ impl<T> SolverState<T> {
 
     pub fn can_advance(&self) -> bool {
         !self.pending.is_empty()
+    }
+
+    pub fn incumbent(&self) -> Option<&Solution<T>> {
+        self.incumbent.as_ref()
+    }
+
+    pub fn bound(&self) -> Option<f64> {
+        self.pending
+            .peek()
+            .map(|node| node.node.bound)
+            .into_iter()
+            .chain(self.numerical_limit)
+            .chain(self.incumbent.as_ref().map(|solution| solution.quality))
+            .reduce(f64::max)
     }
 }
 
@@ -822,9 +836,6 @@ pub fn advance<T>(
             }) {
                 state.incumbent = Some(solution);
             }
-            if fractional.is_none() {
-                continue;
-            }
         } else if fractional.is_none() {
             state.cuts.push(choices);
             state.pending.push(QueuedNode {
@@ -838,7 +849,24 @@ pub fn advance<T>(
             state.next_order += 1;
             continue;
         }
-        let Some(group) = fractional else { continue };
+        let still_better = state.incumbent.as_ref().is_none_or(|best| {
+            better(
+                relaxation.quality,
+                relaxation.nominal_time,
+                relaxation.nominal_cost,
+                best,
+            )
+        });
+        if fractional.is_none() && !still_better {
+            continue;
+        }
+        let Some(group) = fractional.or_else(|| {
+            still_better
+                .then(|| node.fixed.iter().position(Option::is_none))
+                .flatten()
+        }) else {
+            continue;
+        };
         let mut candidates: Vec<_> = (0..problem.groups[group].len()).collect();
         candidates.sort_by(|left, right| {
             relaxation.fractions[group][*right]
@@ -879,6 +907,5 @@ pub fn finish<T>(state: SolverState<T>) -> Outcome<T> {
         solution: state.incumbent,
         bound,
         proven,
-        limitation: state.limitation,
     }
 }

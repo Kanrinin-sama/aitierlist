@@ -33,6 +33,9 @@ pub enum BestInHouseMode {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub start_at_login: bool,
+    pub start_minimized: bool,
+    pub close_to_tray: bool,
     pub subscriptions: BTreeMap<String, String>,
     pub subscription_counts: BTreeMap<String, usize>,
     pub best_in_house_mode: BestInHouseMode,
@@ -41,6 +44,8 @@ pub struct Settings {
     pub rho_override: Option<f64>,
     pub agent_hours: f64,
     pub orchestrators: usize,
+    pub orchestrator_headroom_usd: Option<f64>,
+    pub orchestrator_headroom_hours: Option<f64>,
     pub collaboration_root: Option<PathBuf>,
     pub draws: u32,
     pub assumption_span_pct: f64,
@@ -51,6 +56,7 @@ pub struct Settings {
     pub show_hallucination: bool,
     pub research_classes: BTreeMap<String, bool>,
     pub monotonic_class_competence: bool,
+    pub allow_cross_harness_benchmark_proxies: bool,
 }
 
 impl Default for Settings {
@@ -80,6 +86,9 @@ impl Default for Settings {
             .map(|seat| (seat.name().to_string(), None))
             .collect();
         Self {
+            start_at_login: false,
+            start_minimized: false,
+            close_to_tray: true,
             subscriptions: BTreeMap::new(),
             subscription_counts: BTreeMap::new(),
             best_in_house_mode: BestInHouseMode::Absolute,
@@ -88,6 +97,8 @@ impl Default for Settings {
             rho_override: None,
             agent_hours: 40.0,
             orchestrators: 1,
+            orchestrator_headroom_usd: None,
+            orchestrator_headroom_hours: None,
             collaboration_root: None,
             draws: 4000,
             assumption_span_pct: 25.0,
@@ -101,6 +112,7 @@ impl Default for Settings {
                 .map(|class| (class.name().to_owned(), false))
                 .collect(),
             monotonic_class_competence: false,
+            allow_cross_harness_benchmark_proxies: true,
         }
     }
 }
@@ -108,6 +120,9 @@ impl Default for Settings {
 impl Settings {
     pub fn scoring_matches(&self, other: &Self) -> bool {
         let mut scoring_settings = self.clone();
+        scoring_settings.start_at_login = other.start_at_login;
+        scoring_settings.start_minimized = other.start_minimized;
+        scoring_settings.close_to_tray = other.close_to_tray;
         scoring_settings.best_in_house_mode = other.best_in_house_mode;
         scoring_settings.collaboration_root = other.collaboration_root.clone();
         scoring_settings == *other
@@ -139,6 +154,12 @@ impl Settings {
             .map(|value| value.clamp(0.0, 0.999));
         self.agent_hours = finite(self.agent_hours, defaults.agent_hours).clamp(1.0, 1680.0);
         self.orchestrators = self.orchestrators.clamp(1, 64);
+        self.orchestrator_headroom_usd = self
+            .orchestrator_headroom_usd
+            .filter(|value| value.is_finite() && *value >= 0.0);
+        self.orchestrator_headroom_hours = self
+            .orchestrator_headroom_hours
+            .filter(|value| value.is_finite() && *value >= 0.0);
         self.collaboration_root = self.collaboration_root.filter(|path| path.is_absolute());
         self.draws = self.draws.clamp(1, 20000);
         self.assumption_span_pct =

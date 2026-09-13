@@ -55,30 +55,293 @@ fn pass(row: &Row, benchmark: Benchmark) -> Option<f64> {
         .then(|| row.retry.adjusted_pass(benchmark, value))
 }
 
-pub fn competence(row: &Row, seat: Seat) -> Option<f64> {
-    let value = competence_components(row, seat)?
-        .iter()
-        .map(|(_, score, weight)| score * weight)
-        .sum::<f64>();
-    (value.is_finite() && (0.0..=1.0).contains(&value)).then_some(value)
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RoleEvidenceLevel {
+    ExactHarness,
+    ModelLevel,
+    CrossHarnessProxy,
+    Unknown,
 }
 
-pub fn competence_components(row: &Row, seat: Seat) -> Option<Vec<(&'static str, f64, f64)>> {
+pub struct RoleEvidenceComponent {
+    pub name: &'static str,
+    pub benchmark: Option<Benchmark>,
+    pub value: Option<f64>,
+    pub weight: f64,
+    pub level: RoleEvidenceLevel,
+    pub source_id: Option<String>,
+    pub observation_id: Option<String>,
+    pub basis: String,
+}
+
+#[derive(Clone, Copy)]
+pub struct ScoreSensitivity {
+    pub nominal: Option<f64>,
+    pub low: Option<f64>,
+    pub high: Option<f64>,
+    pub incomplete: bool,
+}
+
+pub(crate) fn weighted_geometric(values: &[(f64, f64)]) -> Option<f64> {
+    if values.iter().any(|(value, weight)| {
+        !value.is_finite() || !(0.0..=1.0).contains(value) || !weight.is_finite() || *weight < 0.0
+    }) {
+        return None;
+    }
+    if values
+        .iter()
+        .any(|(value, weight)| *weight > 0.0 && *value == 0.0)
+    {
+        return Some(0.0);
+    }
+    let mut logarithm = 0.0;
+    let mut total_weight = 0.0;
+    for &(value, weight) in values {
+        if weight == 0.0 {
+            continue;
+        }
+        logarithm += weight * value.ln();
+        total_weight += weight;
+    }
+    (total_weight > 0.0).then(|| (logarithm / total_weight).exp())
+}
+
+pub fn orchestrator_capability(row: &Row) -> Option<f64> {
+    let intelligence = row.smart?;
+    weighted_geometric(&[(intelligence, 1.0)])
+}
+
+pub fn competence(row: &Row, seat: Seat) -> Option<f64> {
     if seat == Seat::Orchestrator {
-        let smart = row.smart?;
-        return (smart.is_finite() && (0.0..=1.0).contains(&smart)).then_some(vec![(
-            "Intelligence Index",
-            smart,
-            1.0,
-        )]);
+        return orchestrator_capability(row);
     }
     if seat == Seat::NetResearch {
         return None;
     }
-    competence_profile(row, seat)?
+    let values = competence_profile(row, seat)?
+        .into_iter()
+        .map(|(benchmark, weight)| Some((pass(row, benchmark)?, weight)))
+        .collect::<Option<Vec<_>>>()?;
+    weighted_geometric(&values)
+}
+
+pub fn role_evidence(row: &Row, seat: Seat) -> Option<Vec<RoleEvidenceComponent>> {
+    if seat == Seat::NetResearch {
+        return None;
+    }
+    let profile: Vec<(Option<Benchmark>, &'static str, Option<f64>, f64)> =
+        if seat == Seat::Orchestrator {
+            return orchestrator_role_evidence(row);
+        } else {
+            competence_profile(row, seat)?
+                .into_iter()
+                .map(|(benchmark, weight)| {
+                    (
+                        Some(benchmark),
+                        benchmark.name(),
+                        pass(row, benchmark),
+                        weight,
+                    )
+                })
+                .collect()
+        };
+    Some(
+        profile
+            .into_iter()
+            .map(|(benchmark, name, value, weight)| {
+                let family = benchmark
+                    .map(benchmark_family)
+                    .unwrap_or("intelligence-index");
+                let projection = row
+                    .benchmark_evidence
+                    .iter()
+                    .find(|projection| projection.family == family);
+                let level = projection.map_or(RoleEvidenceLevel::Unknown, |projection| {
+                    match projection.transfer {
+                        crate::evidence::TransferKind::ExactHarness => {
+                            RoleEvidenceLevel::ExactHarness
+                        }
+                        crate::evidence::TransferKind::ModelLevel => RoleEvidenceLevel::ModelLevel,
+                        crate::evidence::TransferKind::CrossHarnessProxy => {
+                            RoleEvidenceLevel::CrossHarnessProxy
+                        }
+                    }
+                });
+                RoleEvidenceComponent {
+                    name,
+                    benchmark,
+                    value: value.filter(|value| value.is_finite() && (0.0..=1.0).contains(value)),
+                    weight,
+                    level,
+                    source_id: projection.map(|projection| projection.source.source_id.clone()),
+                    observation_id: projection.map(|projection| projection.observation_id.clone()),
+                    basis: projection.map_or_else(
+                        || "No linked benchmark observation".to_owned(),
+                        |projection| projection.source.url.clone(),
+                    ),
+                }
+            })
+            .collect(),
+    )
+}
+
+pub fn orchestrator_role_evidence(row: &Row) -> Option<Vec<RoleEvidenceComponent>> {
+    let components = vec![
+        (None, "Intelligence Index", row.smart, 1.0),
+        (
+            Some(Benchmark::Lcr),
+            Benchmark::Lcr.name(),
+            pass(row, Benchmark::Lcr),
+            0.0,
+        ),
+        (
+            Some(Benchmark::Hle),
+            Benchmark::Hle.name(),
+            pass(row, Benchmark::Hle),
+            0.0,
+        ),
+    ];
+    Some(
+        components
+            .into_iter()
+            .map(|(benchmark, name, value, weight)| {
+                let family = benchmark
+                    .map(benchmark_family)
+                    .unwrap_or("intelligence-index");
+                let projection = row
+                    .benchmark_evidence
+                    .iter()
+                    .find(|projection| projection.family == family);
+                RoleEvidenceComponent {
+                    name,
+                    benchmark,
+                    value: value.filter(|value| value.is_finite() && (0.0..=1.0).contains(value)),
+                    weight,
+                    level: if benchmark.is_none() && value.is_some() {
+                        RoleEvidenceLevel::ModelLevel
+                    } else {
+                        projection.map_or(RoleEvidenceLevel::Unknown, |projection| match projection
+                            .transfer
+                        {
+                            crate::evidence::TransferKind::ExactHarness => {
+                                RoleEvidenceLevel::ExactHarness
+                            }
+                            crate::evidence::TransferKind::ModelLevel => {
+                                RoleEvidenceLevel::ModelLevel
+                            }
+                            crate::evidence::TransferKind::CrossHarnessProxy => {
+                                RoleEvidenceLevel::CrossHarnessProxy
+                            }
+                        })
+                    },
+                    source_id: projection.map(|projection| projection.source.source_id.clone()),
+                    observation_id: projection.map(|projection| projection.observation_id.clone()),
+                    basis: if benchmark.is_none() {
+                        "Orchestration competence score (Intelligence Index)".to_owned()
+                    } else {
+                        projection.map_or_else(
+                            || "No linked benchmark observation".to_owned(),
+                            |projection| projection.source.url.clone(),
+                        )
+                    },
+                }
+            })
+            .collect(),
+    )
+}
+
+pub fn competence_sensitivity(
+    row: &Row,
+    seat: Seat,
+    settings: &Settings,
+) -> Option<ScoreSensitivity> {
+    let components = role_evidence(row, seat)?;
+    component_sensitivity(&components, settings)
+}
+
+pub fn orchestrator_capability_sensitivity(
+    row: &Row,
+    settings: &Settings,
+) -> Option<ScoreSensitivity> {
+    let components = orchestrator_role_evidence(row)?;
+    component_sensitivity(&components, settings)
+}
+
+fn component_sensitivity(
+    components: &[RoleEvidenceComponent],
+    settings: &Settings,
+) -> Option<ScoreSensitivity> {
+    let span = (settings.assumption_span_pct / 100.0).clamp(0.0, 1.0);
+    let incomplete = components
         .iter()
-        .map(|(benchmark, weight)| Some((benchmark.name(), pass(row, *benchmark)?, *weight)))
-        .collect()
+        .any(|component| component.weight > 0.0 && component.value.is_none());
+    let nominal = (!incomplete)
+        .then(|| {
+            let values: Vec<_> = components
+                .iter()
+                .map(|component| (component.value.unwrap_or_default(), component.weight))
+                .collect();
+            weighted_geometric(&values)
+        })
+        .flatten();
+    if incomplete {
+        return Some(ScoreSensitivity {
+            nominal: None,
+            low: None,
+            high: None,
+            incomplete: true,
+        });
+    }
+    let low_values: Vec<_> = components
+        .iter()
+        .map(|component| {
+            let value = component.value.unwrap_or_default() * (1.0 - span);
+            (value, component.weight)
+        })
+        .collect();
+    let high_values: Vec<_> = components
+        .iter()
+        .map(|component| {
+            (
+                (component.value.unwrap_or_default() * (1.0 + span)).min(1.0),
+                component.weight,
+            )
+        })
+        .collect();
+    let low = weighted_geometric(&low_values)?;
+    let high = weighted_geometric(&high_values)?;
+    Some(ScoreSensitivity {
+        nominal,
+        low: Some(low),
+        high: Some(high),
+        incomplete,
+    })
+}
+
+pub fn weakest_evidence_level(components: &[RoleEvidenceComponent]) -> RoleEvidenceLevel {
+    components
+        .iter()
+        .filter(|component| component.weight > 0.0)
+        .map(|component| component.level)
+        .min_by_key(|level| match level {
+            RoleEvidenceLevel::Unknown => 0,
+            RoleEvidenceLevel::CrossHarnessProxy => 1,
+            RoleEvidenceLevel::ModelLevel => 2,
+            RoleEvidenceLevel::ExactHarness => 3,
+        })
+        .unwrap_or(RoleEvidenceLevel::Unknown)
+}
+
+fn benchmark_family(benchmark: Benchmark) -> &'static str {
+    match benchmark {
+        Benchmark::Swe => "swe",
+        Benchmark::Terminal => "terminal",
+        Benchmark::Qna => "qna",
+        Benchmark::Gpqa => "gpqa",
+        Benchmark::Hle => "hle",
+        Benchmark::Lcr => "lcr",
+        Benchmark::Omniscience => "omniscience",
+    }
 }
 
 fn competence_profile(row: &Row, seat: Seat) -> Option<Vec<(Benchmark, f64)>> {
@@ -318,7 +581,7 @@ fn cycles_for(
     {
         64
     } else {
-        1
+        3
     };
     let mut totals = vec![Cycle::default(); limit];
     for &(benchmark, weight) in mix {
@@ -433,6 +696,11 @@ pub(crate) fn dispatch_utility(row: &Row, seat: Seat, cycle: &DispatchCycle) -> 
     if seat == Seat::Orchestrator {
         return competence(row, seat);
     }
+    let values = dispatch_components(row, seat, cycle)?;
+    weighted_geometric(&values)
+}
+
+fn dispatch_components(row: &Row, seat: Seat, cycle: &DispatchCycle) -> Option<Vec<(f64, f64)>> {
     let workload = reference_workload(row, seat)?;
     competence_profile(row, seat)?
         .iter()
@@ -447,9 +715,37 @@ pub(crate) fn dispatch_utility(row: &Row, seat: Seat, cycle: &DispatchCycle) -> 
             } else {
                 pass(row, *benchmark)?
             };
-            Some(value * weight)
+            Some((value, *weight))
         })
-        .sum()
+        .collect()
+}
+
+pub(crate) fn dispatch_utility_sensitivity(
+    row: &Row,
+    seat: Seat,
+    cycle: &DispatchCycle,
+    settings: &Settings,
+) -> Option<ScoreSensitivity> {
+    if seat == Seat::Orchestrator {
+        return competence_sensitivity(row, seat, settings);
+    }
+    let values = dispatch_components(row, seat, cycle)?;
+    let nominal = weighted_geometric(&values)?;
+    let span = (settings.assumption_span_pct / 100.0).clamp(0.0, 1.0);
+    let low_values: Vec<_> = values
+        .iter()
+        .map(|(value, weight)| (value * (1.0 - span), *weight))
+        .collect();
+    let high_values: Vec<_> = values
+        .iter()
+        .map(|(value, weight)| ((value * (1.0 + span)).min(1.0), *weight))
+        .collect();
+    Some(ScoreSensitivity {
+        nominal: Some(nominal),
+        low: Some(weighted_geometric(&low_values)?),
+        high: Some(weighted_geometric(&high_values)?),
+        incomplete: false,
+    })
 }
 
 pub(crate) fn dispatch_cycles(
@@ -458,15 +754,7 @@ pub(crate) fn dispatch_cycles(
     settings: &Settings,
 ) -> Option<Vec<DispatchCycle>> {
     let workload = reference_workload(row, seat)?;
-    let limit = if settings.rho_override.is_some()
-        || workload
-            .iter()
-            .all(|(benchmark, _)| row.retry.repeat_evidence(*benchmark).is_some())
-    {
-        3
-    } else {
-        1
-    };
+    let limit = 3;
     let mut nominal = vec![Cycle::default(); limit];
     let mut reference_completion = vec![[None; 3]; limit];
     let mut full_usage = 0.0;
@@ -1154,6 +1442,8 @@ pub fn score(
     source_fetched_at: String,
     vendor_filter: Option<&str>,
 ) -> Table {
+    let evidence_catalog =
+        crate::upstream::project(&mut rows, settings.allow_cross_harness_benchmark_proxies);
     if let Some(vendor) = vendor_filter {
         rows.retain(|row| row.vendor == vendor);
     }
@@ -1195,6 +1485,7 @@ pub fn score(
         frontiers,
         rows,
         research_tiers,
+        evidence_catalog,
         generated_at: OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .unwrap_or_default(),

@@ -97,6 +97,8 @@ pub struct TaskMetric {
     pub usd: f64,
     pub time_basis: String,
     pub cost_basis: String,
+    #[serde(default)]
+    pub canonical_resources: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,6 +158,8 @@ pub struct Row {
     pub orchestrator_seconds: Option<f64>,
     pub orchestrator_cost_basis: Option<String>,
     pub orchestrator_time_basis: Option<String>,
+    pub benchmark_observation_ids: Vec<String>,
+    pub benchmark_evidence: Vec<crate::evidence::EvidenceProjection>,
 }
 
 impl Row {
@@ -169,6 +173,13 @@ impl Row {
         self.task_metric(benchmark)
             .map(|metric| metric.task_count)
             .filter(|count| *count > 0)
+            .or_else(|| {
+                self.benchmark_evidence
+                    .iter()
+                    .find(|projection| projection.family == benchmark_key(benchmark))
+                    .and_then(|projection| projection.series.task_count)
+                    .filter(|count| *count > 0)
+            })
     }
 
     pub fn benchmark_dataset(&self, benchmark: Benchmark) -> Option<&str> {
@@ -314,6 +325,8 @@ pub struct Table {
     pub rows: Vec<Row>,
     #[serde(default)]
     pub research_tiers: Vec<crate::portfolio::ResearchTierPick>,
+    #[serde(default)]
+    pub evidence_catalog: crate::evidence::EvidenceCatalog,
     pub generated_at: String,
     pub source_fetched_at: String,
     pub cache_state: CacheState,
@@ -335,9 +348,22 @@ impl Table {
             plan_comparisons: Vec::new(),
             rows: Vec::new(),
             research_tiers: Vec::new(),
+            evidence_catalog: crate::evidence::EvidenceCatalog::default(),
             generated_at: String::new(),
             source_fetched_at: String::new(),
             cache_state: CacheState::Baked,
         }
+    }
+}
+
+fn benchmark_key(benchmark: Benchmark) -> &'static str {
+    match benchmark {
+        Benchmark::Swe => "swe",
+        Benchmark::Terminal => "terminal",
+        Benchmark::Qna => "qna",
+        Benchmark::Gpqa => "gpqa",
+        Benchmark::Hle => "hle",
+        Benchmark::Lcr => "lcr",
+        Benchmark::Omniscience => "omniscience",
     }
 }

@@ -238,6 +238,11 @@ fn read_file(path: &Path) -> Result<Option<Vec<u8>>> {
 fn git_command(snapshot: &Snapshot, cwd: &Path) -> Command {
     let mut command = Command::new(&snapshot.git);
     command.env_clear().current_dir(cwd);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
     for name in ["SystemRoot", "WINDIR", "TEMP", "TMP"] {
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);

@@ -21,7 +21,7 @@ pub fn isolated_protocol(table: &Table, paths: &crate::agent_setup::SetupPaths) 
     );
     output.push_str(&format!("Read the compact approved profile at `{}` and live ledger at `{}` only as needed. If missing, incomplete, changed, or moved to another machine, consult the profile schema `{}` and ledger schema `{}` from disk; do not paste schemas into routine prompts. Verify isolated CLI/model/effort, accounts, subscription connectors, native quota/reset windows, work periods, and lifecycle controls. Batch missing facts for approval; reuse unchanged facts and scoped overrides. Installation proves neither auth nor approval. Inspect captured hosts, use fleet login <host-id> before finalization when authentication is needed, confirm authentication/profile facts, save approved profile/ledger, then finalize routes. Missing tools require manual or tool-enabled setup.\n\n", paths.profile.display(), paths.ledger.display(), paths.profile_schema.display(), paths.ledger_schema.display()));
     if let Some(portfolio) = &table.portfolio {
-        output.push_str(&format!("Planning snapshot: {} concurrent project orchestrators, one conductor per project; {:.1} weekly wall-clock hours, {:.1} aggregate project-demand hours. Forecasts and weekly route reservations are aggregate across projects. All projects share the same account budgets and per-account work window; this count grants no extra worker concurrency. Confirm workflow.orchestrators separately from worker concurrency before spending.\n\n", portfolio.orchestrators, portfolio.available_hours_per_provider, portfolio.available_hours_per_provider * portfolio.orchestrators as f64));
+        output.push_str(&format!("Planning snapshot: {} concurrent project orchestrators, one conductor per project; {:.1} weekly wall-clock hours per account. Forecasts and weekly route reservations are aggregate across projects. All projects share the same account budgets and per-account work window; this count grants no extra worker concurrency. Confirm workflow.orchestrators separately from worker concurrency before spending.\n\n", portfolio.orchestrators, portfolio.available_hours_per_provider));
     }
     if let Some(rule) = recommended_route(table) {
         output.push_str(&format!("Recommend {} / {} as the fixed conductor allocation. A different host must preserve the exact model, effort, provider, plan, and account binding; otherwise replan before spending.\n", rule.provider_id, rule.plan_id));
@@ -310,17 +310,15 @@ pub fn render_with_discovery(
     output.push_str(CONDUCTOR);
     writeln!(
         output,
-        "\n## Planning snapshot\n\nPolicy `{}` from aitierlist {}. Benchmark snapshot {} ({}). Model-estimate working window {:.1} hours per account; {} concurrent project orchestrators with {:.1} aggregate project-demand hours. One conductor per project shares all account balances and worker gates. The proxy forecast contains {} integer jobs and the proxy solver fits {} under API-equivalent assumptions. Native admission is {} until exact ready job IDs, bindings, account windows, and holds are verified. The proxy allocation is not runtime launch permission or a calendar.\n",
+        "\n## Planning snapshot\n\nPolicy `{}` from aitierlist {}. Benchmark snapshot {} ({}). Model-estimate working window {:.1} hours per account; {} concurrent project orchestrators. One conductor per project shares all account balances and worker gates. The proxy forecast contains {} integer jobs and the proxy solver fits {} under API-equivalent assumptions. The proxy allocation is not runtime launch permission or a calendar.\n",
         portfolio.dispatch.policy_version,
         env!("CARGO_PKG_VERSION"),
         table.source_fetched_at,
         table.cache_state.name(),
         portfolio.available_hours_per_provider,
         portfolio.orchestrators,
-        portfolio.available_hours_per_provider * portfolio.orchestrators as f64,
         portfolio.dispatch.forecast_changes,
-        portfolio.dispatch.admitted_changes,
-        portfolio.dispatch.native_admission_changes
+        portfolio.dispatch.admitted_changes
     )?;
     if let Some(gap) = portfolio.dispatch.solver.relative_gap {
         writeln!(
@@ -431,15 +429,49 @@ pub fn render_with_discovery(
             cell(&conductor.binding_id)
         )?;
     }
-    output.push_str("\n## Fixed orchestrator\n\nThe same exact model and effort coordinates all concurrent projects and work classes. Its calls consume the shared account allocation once. Coordination visits count two stages per admitted change; proxy cost and decode time additionally apply each class's declared resource factor. Neither quantity caps native turns. Debit startup, resumption, compaction, planning, tool, and reconciliation calls against the same real account meter; calibrate native quota units during onboarding and from the live ledger. Benchmark provenance and native launch binding remain explicit.\n\n| Scope | Model ID | Benchmark source | Account / plan | Cap | Competence | Utility | Coordination visits | Expected / reserved proxy USD | Expected / reserved decode h |\n|---|---|---|---|---:|---:|---:|---:|---:|---:|\n");
+    output.push_str("\n## Persistent orchestrator\n\nThe same exact model and effort provides a persistent human-facing coordination service across concurrent projects and work classes. Worker jobs do not create forecast coordination visits. When no usage forecast is declared, native calls are on demand and governed by ledger holds. Optional USD and hour headroom is reserved once, independently of worker-job counts. Per-call resource values are qualification proxies, not a forecast or native quota claim. Benchmark provenance and native launch binding remain explicit.\n\n| Service | Model ID | Benchmark source | Account / plan | Cap | Capability | Utility | Evidence profile | II / LCR / HLE | Usage forecast | Fixed headroom USD / h | Per-call qualification proxy USD / h |\n|---|---|---|---|---:|---:|---:|---|---|---|---|---|\n");
     if let Some(conductor) = &portfolio.conductor {
         let benchmark = table
             .rows
             .get(conductor.row_index)
             .context("Conductor benchmark row unavailable")?;
+        let forecast = conductor.usage_forecast.as_ref().map_or_else(
+            || "On demand / unknown".to_owned(),
+            |forecast| {
+                format!(
+                    "{} calls / {:.6} USD / {:.6} h",
+                    forecast.visits, forecast.usage, forecast.hours
+                )
+            },
+        );
+        let headroom = format!(
+            "{} / {}",
+            conductor
+                .headroom
+                .usd
+                .map_or_else(|| "unspecified".to_owned(), |value| format!("{value:.6}")),
+            conductor
+                .headroom
+                .hours
+                .map_or_else(|| "unspecified".to_owned(), |value| format!("{value:.6}"))
+        );
+        let component = |value: Option<f64>| {
+            value.map_or_else(|| "Unknown".to_owned(), |value| format!("{value:.3}"))
+        };
+        let evidence_components = format!(
+            "{} / {} / {}",
+            component(benchmark.smart),
+            component(benchmark.lcr),
+            component(benchmark.hle)
+        );
         writeln!(
             output,
-            "| Whole plan | conductor | {} / {} / {} | {} / {} | {} | {:.3} | {:.4} | {} / {} | {:.6} / {:.6} | {:.6} / {:.6} |",
+            "| {} | conductor | {} / {} / {} | {} / {} | {} | {:.3} | {:.4} | {} | {} | {} | {} | {:.6} / {:.6} |",
+            if conductor.persistent {
+                "Persistent / On demand"
+            } else {
+                "On demand"
+            },
             cell(&benchmark.harness),
             cell(&benchmark.model),
             cell(benchmark.effort.as_deref().unwrap_or("unspecified")),
@@ -448,16 +480,42 @@ pub fn render_with_discovery(
             conductor.attempt_limit,
             conductor.competence,
             conductor.utility,
-            conductor.expected_visits,
-            conductor.reserved_visits,
-            conductor.expected_usage,
-            conductor.reserved_usage,
-            conductor.expected_hours,
-            conductor.reserved_hours
+            cell(&conductor.evidence_profile),
+            cell(&evidence_components),
+            cell(&forecast),
+            cell(&headroom),
+            conductor.per_call_expected_usage,
+            conductor.per_call_expected_hours
         )?;
     } else {
-        output.push_str("| Whole plan | Unfunded | - | - | - | - | - | - | - | - |\n");
+        output.push_str("| On demand | Unfunded | - | - | - | - | - | - | - | - | - | - |\n");
     }
+    let service = &portfolio.dispatch.service;
+    writeln!(
+        output,
+        "\n## Quality-adjusted worker service\n\nThe chosen worker plan provides {:.6} quality-adjusted service over workload W {:.6}, with geometric team capability exp(L/W) {:.6}. It admits {} jobs; the largest worker plan found admits {} jobs and provides {} service. The objective is policy utility, not a probability of task success. The worker plan is conditional on the persistent human-facing orchestrator service.\n\nSearch status: {}. Objective bound: {}. Relative gap: {}. {}\n",
+        service.quality_adjusted_service,
+        service.workload,
+        service.team_capability,
+        portfolio.dispatch.admitted_changes,
+        service.maximum_volume_admitted,
+        service
+            .maximum_volume_service
+            .map_or_else(|| "Unknown".to_owned(), |value| format!("{value:.6}")),
+        if service.proven_optimal {
+            "proved"
+        } else {
+            "unresolved"
+        },
+        service
+            .bound
+            .map_or_else(|| "Unknown".to_owned(), |value| format!("{value:.6}")),
+        service.relative_gap.map_or_else(
+            || "Unknown".to_owned(),
+            |value| format!("{:.2}%", value * 100.0)
+        ),
+        service.message
+    )?;
     output.push_str("\n## Conditional worker policy\n\nEach seat has four workflow rows. A row names one default exact binding, its planned integer proxy volume, and its account claim. Expand its fallback only when the stated eligibility or native-window condition occurs; never round-robin among routes. Caps bound attempts for one distinct assignment and stop on acceptance.\n\n| Policy ID | Role | Template | Planned jobs | Route ID | Exact account claim | Cap | Evidence status | Proxy USD per visit | Proxy h per visit |\n|---|---|---|---:|---|---|---:|---|---:|---:|\n");
     for seat in ROLE_ORDER
         .into_iter()
@@ -537,7 +595,7 @@ pub fn render_with_discovery(
             }
         }
     }
-    output.push_str("\n## Net Research ranking policy\n\nEach template ranks routes by `score = accuracy × weight + no incorrect answer (all questions) × weight + LCR × weight + HLE × weight`. The funded default is the route selected by the joint schedule; without funded research, the highest score leads the conditional recommendations. Weights are task-policy preferences, not probabilities. GPQA and GDP.pdf are diagnostics. Expected USD and decode hours are AA reference-workload proxies, not native research latency, budget, quota, or holds. Every route remains conditional on task-specific tools, permissions, source scope, billing, and a native hold.\n\n| Template | Rank | Route | Native harness | Account / plan | Score | Weighted components | Diagnostics | AA proxy USD / decode h | Eligibility | Source |\n|---|---:|---|---|---|---:|---|---|---|---|---|\n");
+    output.push_str("\n## Net Research ranking policy\n\nEach template ranks routes by `score = (accuracy^w_accuracy × no incorrect answer (all questions)^w_non_wrong × LCR^w_LCR × HLE^w_HLE)^(1 / sum(weights)), omitting zero-weight components`. The funded default is the route selected by the joint schedule; without funded research, the highest score leads the conditional recommendations. Weights are task-policy preferences, not probabilities. GPQA and GDP.pdf are diagnostics. Expected USD and decode hours are AA reference-workload proxies, not native research latency, budget, quota, or holds. Every route remains conditional on task-specific tools, permissions, source scope, billing, and a native hold.\n\n| Template | Rank | Route | Native harness | Account / plan | Score | Weighted components | Diagnostics | AA proxy USD / decode h | Eligibility | Source |\n|---|---:|---|---|---|---:|---|---|---|---|---|\n");
     if let Some(role) = portfolio
         .roles
         .iter()
@@ -662,18 +720,16 @@ pub fn render_with_discovery(
             usage.reserved_hours
         )?;
     }
-    output.push_str("\n## Shared account planning inputs\n\nAPI-equivalent USD below is a model input, never a native quota meter. Onboarding must resolve real account aliases, entitlement, meter units, resets, and remaining working window before using them operationally.\n\n");
+    output.push_str("\n## Shared account planning inputs\n\nAPI-equivalent USD below is a model input, never a native quota meter. The profile binds one account per provider; only that account contributes forecast allowance and calendar hours, even when more subscriptions are owned. Onboarding must resolve real account aliases, entitlement, meter units, resets, and remaining working window before using them operationally.\n\n");
     for pool in &portfolio.pools {
         writeln!(
             output,
-            "- {} / {} × {} owned subscriptions: modeled {:.4} USD/week aggregate ({:.4} each) and {:.1} aggregate provider-hours across distinct {:.1}-hour account lanes; [plan source]({}). {}",
+            "- {} / {}: one bound account contributes modeled {:.4} USD/week and {:.1} hours/week; {} owned subscriptions count toward monthly purchase cost only and add no forecast capacity; [plan source]({}). {}",
             pool.provider_id,
             pool.plan_id,
-            pool.subscription_count,
-            pool.weekly_capacity,
             pool.per_account_weekly_capacity,
             pool.available_hours,
-            portfolio.available_hours_per_provider,
+            pool.subscription_count,
             pool.source_url,
             pool.allowance_basis
         )?;
@@ -750,7 +806,7 @@ pub fn render_with_discovery(
     Ok(output)
 }
 
-const CONDUCTOR: &str = r#"You are the user's human-facing conductor. Understand the requested outcome, keep decisions and progress legible, delegate concrete implementation, and reconcile the result. Speak directly and briefly. Ask only questions that materially change the work. User instructions and applicable repository or global instructions outrank this document. Use the actual machine profile and repository verification policy. Do not authorize commits, publication, deployment, remote sessions, or new purchases without their required authorization.
+const CONDUCTOR: &str = r#"You are the user's human-facing conductor. Understand the requested outcome, keep decisions and progress legible, delegate concrete implementation, and reconcile the result. Speak directly and briefly. Ask only questions that materially change the work. Do not import ambient user, project, or global instructions, skills, plugins, MCP, hooks, or configuration. This generated protocol, the current user request, and fixed dispatcher routes outrank other documents. Native platform permissions and explicit user authority still apply. Use the actual machine profile and repository verification policy. Do not authorize commits, publication, deployment, remote sessions, or new purchases without their required authorization.
 
 ## Conduct the work
 

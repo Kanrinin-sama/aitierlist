@@ -71,7 +71,7 @@ pub fn family_key(harness: &str, model_key: &str) -> String {
     )
 }
 
-fn effort_of(model_key: &str) -> Option<String> {
+pub(crate) fn effort_of(model_key: &str) -> Option<String> {
     regex(r"\((max|xhigh|high|medium|low|minimal|none)\)$")
         .captures(model_key)
         .map(|capture| capture[1].to_owned())
@@ -352,11 +352,73 @@ async fn fetch_manifest_payload(
 }
 
 pub fn fetch_payloads(cached: &Value) -> Result<Value> {
-    tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
-        let client = Client::builder().user_agent("Mozilla/5.0").timeout(std::time::Duration::from_secs(90)).build()?;
-        let (agents, evaluation, catalog) = tokio::try_join!(fetch_agent_rows(&client, cached), fetch_manifest_payload(&client, "/evaluations/livecodebench", cached, "evaluation"), fetch_manifest_payload(&client, "/models", cached, "catalog"))?;
-        Ok(json!({"fetchedAt":OffsetDateTime::now_utc().format(&Rfc3339)?,"agents":agents.0,"evaluation":evaluation.0,"catalog":catalog.0,"http":{"agents":agents.1,"evaluation":evaluation.1,"catalog":catalog.1}}))
-    })
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(async {
+            let client = Client::builder()
+                .user_agent("Mozilla/5.0")
+                .timeout(std::time::Duration::from_secs(90))
+                .build()?;
+            let aa = async {
+                tokio::try_join!(
+                    fetch_agent_rows(&client, cached),
+                    fetch_manifest_payload(
+                        &client,
+                        "/evaluations/livecodebench",
+                        cached,
+                        "evaluation"
+                    ),
+                    fetch_manifest_payload(&client, "/models", cached, "catalog")
+                )
+            };
+            let (aa, upstream) = tokio::join!(
+                aa,
+                crate::upstream::refresh(&client, &cached["upstreamSnapshots"])
+            );
+            let upstream_attempted_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
+            match aa {
+                Ok((agents, evaluation, catalog)) => Ok(json!({
+                    "fetchedAt": OffsetDateTime::now_utc().format(&Rfc3339)?,
+                    "agents": agents.0,
+                    "evaluation": evaluation.0,
+                    "catalog": catalog.0,
+                    "upstreamSnapshots": upstream,
+                    "upstreamRefreshAttemptAt": upstream_attempted_at,
+                    "http": {
+                        "agents": agents.1,
+                        "evaluation": evaluation.1,
+                        "catalog": catalog.1
+                    },
+                    "aaRefreshError": Value::Null
+                })),
+                Err(error) => {
+                    let mut payloads = cached.clone();
+                    payloads["upstreamSnapshots"] = serde_json::to_value(upstream)?;
+                    payloads["upstreamRefreshAttemptAt"] = json!(upstream_attempted_at);
+                    payloads["aaRefreshError"] = json!(format!("{error:#}"));
+                    let _ = cache::save(&payloads);
+                    Ok(payloads)
+                }
+            }
+        })
+}
+
+fn refresh_upstream_payloads(mut cached: Value) -> Result<Value> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(async {
+            let client = Client::builder()
+                .user_agent("Mozilla/5.0")
+                .timeout(std::time::Duration::from_secs(90))
+                .build()?;
+            cached["upstreamSnapshots"] = serde_json::to_value(
+                crate::upstream::refresh(&client, &cached["upstreamSnapshots"]).await,
+            )?;
+            cached["upstreamRefreshAttemptAt"] = json!(OffsetDateTime::now_utc().format(&Rfc3339)?);
+            Ok(cached)
+        })
 }
 
 fn model_prices(item: &Value, hosts: &[&Value]) -> Option<(f64, f64, f64, f64)> {
@@ -740,9 +802,17 @@ pub fn model_row(item: &Value, hosts: &[&Value]) -> Value {
                 canonical_resources(item, token_key, tasks, Some(prices), speed)
             {
                 terminal_proxy = Some((seconds, usd));
-                metrics.push(task_metric("terminal", (dataset_id, tasks as usize), pass, seconds, usd,
+                let mut metric = task_metric(
+                    "terminal",
+                    (dataset_id, tasks as usize),
+                    pass,
+                    seconds,
+                    usd,
                     "Canonical output decode estimate per benchmark task",
-                    "Canonical token-price estimate per benchmark task; cache misses priced as writes"));
+                    "Canonical token-price estimate per benchmark task; cache misses priced as writes",
+                );
+                metric["canonicalResources"] = json!(true);
+                metrics.push(metric);
                 break;
             }
         }
@@ -769,7 +839,7 @@ pub fn model_row(item: &Value, hosts: &[&Value]) -> Value {
             if let Some((Some(seconds), Some(usd))) =
                 canonical_resources(item, token_key, tasks, Some(prices), speed)
             {
-                metrics.push(task_metric(
+                let mut metric = task_metric(
                     benchmark,
                     (dataset_id, tasks as usize),
                     pass,
@@ -777,7 +847,9 @@ pub fn model_row(item: &Value, hosts: &[&Value]) -> Value {
                     usd,
                     "Canonical output decode estimate per benchmark task",
                     "Canonical token-price estimate per benchmark task; cache misses priced as writes",
-                ));
+                );
+                metric["canonicalResources"] = json!(true);
+                metrics.push(metric);
             } else if let Some((seconds, usd)) = terminal_proxy {
                 metrics.push(task_metric(
                     benchmark,
@@ -842,6 +914,7 @@ fn disambiguate(rows: &mut [Value]) {
 }
 
 pub fn rows_from_payloads(payloads: &Value) -> Result<Vec<Row>> {
+    crate::upstream::load(payloads);
     let agents = payloads["agents"]
         .as_array()
         .context("missing agents array")?;
@@ -944,13 +1017,42 @@ pub fn load_rows(force_refresh: bool, cache_hours: f64) -> Result<(Vec<Row>, Cac
         .map(|stamp| (OffsetDateTime::now_utc() - stamp).as_seconds_f64());
     let (payloads, state) =
         if !force_refresh && age.is_some_and(|age| age >= 0.0 && age < cache_hours * 3600.0) {
-            (cached, state)
+            if crate::upstream::is_stale(6.0) {
+                match refresh_upstream_payloads(cached.clone()) {
+                    Ok(fresh) => {
+                        let _ = cache::save(&fresh);
+                        (fresh, state)
+                    }
+                    Err(_) => (cached, state),
+                }
+            } else {
+                (cached, state)
+            }
         } else {
             match cache::fetch_live() {
                 Ok(fresh) => fresh,
-                Err(_) => (cached, state),
+                Err(_) => match refresh_upstream_payloads(cached.clone()) {
+                    Ok(fresh) => {
+                        let _ = cache::save(&fresh);
+                        (fresh, state)
+                    }
+                    Err(_) => (cached, state),
+                },
             }
         };
+    parsed_rows(payloads, state)
+}
+
+pub fn cached_rows() -> Result<(Vec<Row>, CacheState, String)> {
+    let (payloads, state) = cache::load_payloads()?;
+    parsed_rows(payloads, state)
+}
+
+pub fn upstream_stale() -> bool {
+    crate::upstream::is_stale(6.0)
+}
+
+fn parsed_rows(payloads: Value, state: CacheState) -> Result<(Vec<Row>, CacheState, String)> {
     match rows_from_payloads(&payloads) {
         Ok(rows) => Ok((rows, state, label(&payloads["fetchedAt"]).to_owned())),
         Err(_) if state == CacheState::Disk => {
